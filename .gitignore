@@ -1,0 +1,59 @@
+__pycache__/
+*.py[cod]
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+nxmndr.egg-info/
+.eggs/
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Coverage / testing
+.coverage
+coverage.xml
+htmlcov/
+.pytest_cache/
+
+# Type checker / lint caches
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.tox/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE / editor
+.vscode/
+.idea/
+
+# Lock / metadata (optional; keep uv.lock if you choose to track it)
+/*.lock
+Pipfile.lock
+
+# Logs
+*.log
+
+# Credentials
+creds
+
+*.pth
+*.onnx
+*.bin
+*.safetensors
+*.tif
+*.tif.aux.xml
+
+dev/
+dev_outputs/

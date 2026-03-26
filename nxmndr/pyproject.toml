@@ -1,0 +1,120 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nxmndr"
+# Version is single-sourced from package __init__ using dynamic
+dynamic = ["version"]
+description = "Multi-format vision inference (PyTorch, ONNX, HuggingFace, gRPC, Torch RPC, Azure/OpenAI proxy)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {file = "LICENSE"}
+authors = [
+  {name = "Microsoft Corporation"},
+]
+keywords = ["inference", "onnx", "pytorch", "grpc", "vision", "azure", "openai", "ml", "geospatial"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "License :: OSI Approved :: MIT License"
+]
+
+# Core (lean) dependencies – minimal to import & use core inference classes
+dependencies = [
+  "numpy==2.4.3",
+  "torch==2.11.0",
+  "onnxruntime==1.24.4",
+  "transformers==5.3.0",
+  "grpcio==1.78.0",
+  "protobuf==6.33.6",
+  "Pillow==12.1.1",
+  "scikit-image==0.26.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/microsoft/nxmndr"
+Repository = "https://github.com/microsoft/nxmndr"
+Documentation = "https://github.com/microsoft/nxmndr#readme"
+Issues = "https://github.com/microsoft/nxmndr/issues"
+
+[project.optional-dependencies]
+# Extra for running the unified server with HTTP + Azure proxy endpoints
+server = [
+  "aiohttp==3.13.3",
+  "azure-identity==1.25.3",
+  "openai==2.29.0",
+]
+# Extra for development (linting, testing, proto generation)
+dev = [
+  "grpcio-tools==1.78.0",
+  "pytest==9.0.2",
+  "pytest-cov==7.1.0",
+  "ruff==0.15.7",
+  "black==26.3.1",
+  "isort==8.0.1",
+  "mypy==1.19.1",
+  "types-requests==2.32.4.20260324",
+  "pytest-benchmark==5.2.3",
+  "jupyter==1.1.1",
+  "ipykernel==7.2.0",
+  "pip-audit==2.10.0",
+  "onnxscript==0.2.5",
+]
+
+[project.scripts]
+# Console entry points (only server retained; client moved to examples)
+nxmndr-server = "nxmndr.server.server:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["nxmndr*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "nxmndr.__version__"}
+
+[tool.ruff]
+line-length = 100
+exclude = [
+  "src/nxmndr/inference/inference_pb2.py",
+  "src/nxmndr/inference/inference_pb2_grpc.py",
+]
+format = { quote-style = "double", indent-style = "space", line-ending = "auto" }
+target-version = "py39"
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+addopts = "-ra -q"
+testpaths = ["tst"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+
+[tool.uv]
+# UV-specific guidance: uv respects standard PEP 621 metadata above.
+# Developers can run `uv sync --all-extras` to create the environment.
+# Optionally pin versions via `uv lock` producing a lockfile for reproducible installs.
+dev-dependencies = [
+  "pytest",
+  "pytest-cov",
+  "ruff",
+  "black",
+  "isort",
+  "mypy",
+  "grpcio-tools",
+  "types-requests",
+  "pytest-benchmark",
+  "jupyter",
+  "ipykernel",
+  "pip-audit",
+]
+

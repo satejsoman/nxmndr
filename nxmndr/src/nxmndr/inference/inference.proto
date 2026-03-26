@@ -1,0 +1,247 @@
+syntax = "proto3";
+
+package inference;
+
+// High-level model types and task types
+enum ModelFormat {
+  MODEL_FORMAT_UNSPECIFIED = 0;
+  PYTORCH = 1;
+  ONNX = 2;
+  HUGGINGFACE = 3;
+  TORCHHUB = 4;
+}
+
+enum TaskType {
+  TASK_TYPE_UNSPECIFIED = 0;
+  CLASSIFICATION = 1;
+  SEGMENTATION = 2;
+  OBJECT_DETECTION = 3;
+  EMBEDDING = 4;
+  CUSTOM = 100;
+}
+
+// Generic key-value metadata
+message MetadataEntry { string key = 1; string value = 2; }
+
+// Transformation specification (basic set; can be extended)
+message TransformSpec {
+  string name = 1;                 // e.g., "resize", "normalize", "center_crop", "to_tensor"
+  map<string, string> params = 2;  // parameter map (stringly typed for flexibility)
+}
+
+// Model specification (control plane)
+message ModelSpec {
+  string model_id = 1;                 // Client-supplied or empty for server-generated
+  ModelFormat format = 2;              // Model format
+  string name = 3;                     // Friendly name
+  string source = 4;                   // Path, repo id, or hub repo
+  string model_class = 5;              // Optional for PyTorch
+  TaskType task = 6;                   // Task type
+  repeated TransformSpec preprocessing = 7; // Client-declared preprocessing pipeline
+  repeated TransformSpec postprocessing = 8; // Optional postprocessing
+  repeated MetadataEntry metadata = 9;       // Arbitrary metadata
+  string checksum = 10;                // Optional SHA256/MD5 of artifact
+  string version = 11;                 // Semantic version or tag
+  string artifact_mime_type = 12;      // e.g., application/onnx, application/pytorch-state-dict
+  bytes artifact = 13;                 // Serialized artifact (ONNX file, etc.)
+  bool lazy_load = 14;                 // If true, defer heavy weight initialization
+  string token = 15;                   // Authentication token (e.g., HuggingFace access token)
+}
+
+message LoadModelRequest { ModelSpec spec = 1; bool overwrite = 2; }
+
+message LoadModelResponse {
+  bool success = 1;
+  string model_id = 2;     // Final resolved ID
+  string message = 3;      // Human readable
+  repeated MetadataEntry effective_metadata = 4; // Server augmented metadata
+}
+
+message UnloadModelRequest { string model_id = 1; }
+message UnloadModelResponse { bool success = 1; string message = 2; }
+
+message ListModelsRequest {}
+message ModelInfo {
+  string model_id = 1;
+  string name = 2;
+  ModelFormat format = 3;
+  TaskType task = 4;
+  string device = 5;
+  bool loaded = 6;
+}
+message ListModelsResponse { repeated ModelInfo models = 1; }
+
+// Persistent model registry management
+message ListModelRegistryRequest {
+  string provider_id = 1;  // Optional scoping identifier
+}
+
+message ModelRegistryEntry {
+  string entry_id = 1;             // Unique registry entry identifier
+  string model_id = 2;             // Underlying model identifier if loaded
+  string display_name = 3;         // Human friendly name
+  string source = 4;               // Repo, path, or origin metadata
+  string task = 5;                 // Task label (e.g., segmentation)
+  string format = 6;               // Provider-specific format label
+  int64 last_used_epoch_ms = 7;    // Epoch timestamp in milliseconds
+  map<string, string> metadata = 8;// Additional provider-defined metadata
+}
+
+message ListModelRegistryResponse {
+  repeated ModelRegistryEntry entries = 1;
+}
+
+message EvictModelRegistryRequest {
+  string entry_id = 1;
+  string provider_id = 2;
+}
+
+message EvictModelRegistryResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// Single batch prediction (NCHW or task specific)
+message PredictRequest {
+  string model_id = 1;
+  bytes input = 2;            // Raw bytes of tensor data
+  repeated int64 shape = 3;   // Shape (first dim = batch size)
+  string dtype = 4;           // e.g., float32
+  map<string, string> options = 5; // Optional per-request options (e.g., top_k)
+}
+
+message PredictResponse {
+  bytes output = 1;
+  repeated int64 shape = 2;
+  string dtype = 3;
+  map<string, string> metadata = 4; // e.g., latency_ms, device
+}
+
+// Streaming prediction (client-stream of batches) -> stream of outputs
+message StreamPredictRequest {
+  string model_id = 1;
+  bytes chunk = 2;             // Raw bytes for a single batch or partial sample
+  repeated int64 shape = 3;    // Shape of the chunk
+  string dtype = 4;            // Data type
+  bool end_of_sequence = 5;    // Signals logical end of a sequence (for stateful models)
+  map<string, string> context = 6; // Arbitrary context (sequence IDs, etc.)
+}
+
+message StreamPredictResponse {
+  bytes output = 1;
+  repeated int64 shape = 2;
+  string dtype = 3;
+  bool end_of_sequence = 4;
+  map<string, string> metadata = 5;
+}
+
+// Capability & health
+message CapabilitiesRequest {}
+message CapabilityInfo {
+  string key = 1; string value = 2; }
+message CapabilitiesResponse {
+  repeated CapabilityInfo capabilities = 1;
+}
+
+message HealthRequest {}
+message HealthResponse { bool ready = 1; string message = 2; }
+
+// --- Session-oriented streaming (control plane only; service wiring pending) ---
+message DeviceInfo {
+  string id = 1;          // e.g., "cuda:0" or "cpu:0"
+  string type = 2;        // gpu | cpu
+  int32 ordinal = 3;      // device index
+  int32 weight = 4;       // optional weight for load balancing
+}
+
+message TileManifest {
+  int32 total_tiles = 1;
+  int32 tile_h = 2;
+  int32 tile_w = 3;
+  int32 stride_h = 4;
+  int32 stride_w = 5;
+  int32 window_h = 6;
+  int32 window_w = 7;
+  repeated double geotransform = 8;
+  string crs = 9;
+}
+
+message TransportCaps {
+  bool streaming = 1;
+  bool compression = 2;
+  string compression_algo = 3; // e.g., lz4, zstd
+  int32 max_inflight = 4;
+  int32 chunk_bytes = 5;
+}
+
+message OpenSessionRequest {
+  string session_id = 1;
+  ModelSpec spec = 2;
+  TileManifest manifest = 3;
+  map<string, string> options = 4;
+  TransportCaps transport = 5;
+}
+
+message OpenSessionResponse {
+  string session_id = 1;
+  repeated DeviceInfo device_plan = 2;
+  bool model_cache_hit = 3;
+  int32 max_inflight = 4;
+  int32 max_tile_bytes = 5;
+  string status = 6;
+  string error = 7;
+}
+
+message SessionSummary {
+  string session_id = 1;
+  int32 ok_tiles = 2;
+  int32 failed_tiles = 3;
+  int64 duration_ms = 4;
+  repeated string errors = 5;
+}
+
+message CloseSessionRequest {
+  string session_id = 1;
+  bool force = 2;
+}
+
+message CloseSessionResponse {
+  string status = 1;
+  string error = 2;
+  SessionSummary summary = 3;
+}
+
+message CancelSessionRequest {
+  string session_id = 1;
+  string reason = 2;
+}
+
+message CancelSessionResponse {
+  string status = 1;
+  string error = 2;
+}
+
+// Error model (can be reused inside envelopes if needed later)
+message ErrorStatus { int32 code = 1; string message = 2; string details = 3; }
+
+service InferenceService {
+  // Lifecycle
+  rpc LoadModel(LoadModelRequest) returns (LoadModelResponse);
+  rpc UnloadModel(UnloadModelRequest) returns (UnloadModelResponse);
+  rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
+  rpc ListModelRegistry(ListModelRegistryRequest) returns (ListModelRegistryResponse);
+  rpc EvictModelRegistryEntry(EvictModelRegistryRequest) returns (EvictModelRegistryResponse);
+
+  // Prediction
+  rpc Predict(PredictRequest) returns (PredictResponse);
+  rpc StreamPredict(stream StreamPredictRequest) returns (stream StreamPredictResponse);
+
+  // Session control plane
+  rpc OpenSession(OpenSessionRequest) returns (OpenSessionResponse);
+  rpc CloseSession(CloseSessionRequest) returns (CloseSessionResponse);
+  rpc CancelSession(CancelSessionRequest) returns (CancelSessionResponse);
+
+  // Introspection
+  rpc Capabilities(CapabilitiesRequest) returns (CapabilitiesResponse);
+  rpc Health(HealthRequest) returns (HealthResponse);
+}

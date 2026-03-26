@@ -1,0 +1,12 @@
+{
+  "auto_map": {
+    "AutoImageProcessor": "modeling_exampleconv.ExampleImageProcessor",
+    "AutoProcessor": "modeling_exampleconv.ExampleImageProcessor"
+  },
+  "processor_class": "ExampleImageProcessor",
+  "do_normalize": false,
+  "do_resize": false,
+  "image_mean": [0.0, 0.0, 0.0],
+  "image_std": [1.0, 1.0, 1.0],
+  "size": 32
+}

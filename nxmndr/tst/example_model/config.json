@@ -1,0 +1,16 @@
+{
+  "model_type": "exampleconv",
+  "architectures": ["ExampleConvModel"],
+  "num_channels": 3,
+  "image_size": 32,
+  "hidden_channels": 16,
+  "num_labels": 10,
+  "auto_map": {
+    "AutoConfig": "modeling_exampleconv.ExampleConvConfig",
+    "AutoModel": "modeling_exampleconv.ExampleConvModel",
+    "AutoModelForImageClassification": "modeling_exampleconv.ExampleConvModel",
+    "AutoImageProcessor": "modeling_exampleconv.ExampleImageProcessor",
+    "AutoProcessor": "modeling_exampleconv.ExampleImageProcessor"
+  },
+  "torch_dtype": "float32"
+}

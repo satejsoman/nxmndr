@@ -1,0 +1,112 @@
+THIRD-PARTY SOFTWARE NOTICES AND INFORMATION
+
+This project incorporates components from the projects listed below. The
+original copyright notices and the licenses under which Microsoft received
+such components are set forth below. Microsoft reserves all rights not
+expressly granted herein, whether by implication, estoppel or otherwise.
+
+────────────────────────────────────────────────────────────────────────────────
+
+1.  numpy (BSD-3-Clause)
+    https://github.com/numpy/numpy
+    Copyright (c) 2005-2025 NumPy Developers.
+
+2.  torch / PyTorch (BSD-3-Clause)
+    https://github.com/pytorch/pytorch
+    Copyright (c) 2016- Facebook, Inc. (Meta Platforms, Inc.)
+
+3.  onnxruntime (MIT)
+    https://github.com/microsoft/onnxruntime
+    Copyright (c) Microsoft Corporation.
+
+5.  transformers (Apache-2.0)
+    https://github.com/huggingface/transformers
+    Copyright (c) 2018- Hugging Face, Inc.
+
+6.  grpcio (Apache-2.0)
+    https://github.com/grpc/grpc
+    Copyright (c) The gRPC Authors.
+
+7.  grpcio-tools (Apache-2.0)
+    https://github.com/grpc/grpc
+    Copyright (c) The gRPC Authors.
+
+8.  protobuf (BSD-3-Clause)
+    https://github.com/protocolbuffers/protobuf
+    Copyright (c) Google LLC.
+
+9.  Pillow (MIT)
+    https://github.com/python-pillow/Pillow
+    Copyright (c) 1995-2025 Fredrik Lundh, Alex Clark, and contributors.
+
+10. scikit-image (BSD-3-Clause)
+    https://github.com/scikit-image/scikit-image
+    Copyright (c) 2009-2025 the scikit-image team.
+
+11. aiohttp (Apache-2.0)
+    https://github.com/aio-libs/aiohttp
+    Copyright (c) aio-libs contributors.
+
+12. azure-identity (MIT)
+    https://github.com/Azure/azure-sdk-for-python
+    Copyright (c) Microsoft Corporation.
+
+13. openai (Apache-2.0)
+    https://github.com/openai/openai-python
+    Copyright (c) OpenAI.
+
+14. rasterio (BSD-3-Clause)
+    https://github.com/rasterio/rasterio
+    Copyright (c) 2013- Mapbox, Inc.
+
+15. onnxscript (MIT)
+    https://github.com/microsoft/onnxscript
+    Copyright (c) Microsoft Corporation.
+
+16. pytest (MIT)
+    https://github.com/pytest-dev/pytest
+    Copyright (c) 2004 Holger Krekel and others.
+
+17. pytest-cov (MIT)
+    https://github.com/pytest-dev/pytest-cov
+    Copyright (c) 2010 Meme Dough.
+
+18. pytest-benchmark (BSD-2-Clause)
+    https://github.com/ionelmc/pytest-benchmark
+    Copyright (c) 2014-2022 Ionel Cristian Maries.
+
+19. ruff (MIT)
+    https://github.com/astral-sh/ruff
+    Copyright (c) 2022- Charles Marsh / Astral.
+
+20. black (MIT)
+    https://github.com/psf/black
+    Copyright (c) 2018- Lukasz Langa and contributors.
+
+21. isort (MIT)
+    https://github.com/PyCQA/isort
+    Copyright (c) 2013- Timothy Crosley and contributors.
+
+22. mypy (MIT)
+    https://github.com/python/mypy
+    Copyright (c) Jukka Lehtosalo and contributors.
+
+23. types-requests (Apache-2.0)
+    https://github.com/python/typeshed
+    Copyright (c) typeshed contributors.
+
+24. jupyter (BSD-3-Clause)
+    https://github.com/jupyter/jupyter
+    Copyright (c) Jupyter Development Team.
+
+25. ipykernel (BSD-3-Clause)
+    https://github.com/ipython/ipykernel
+    Copyright (c) IPython Development Team.
+
+26. pip-audit (Apache-2.0)
+    https://github.com/pypa/pip-audit
+    Copyright (c) 2021 Trail of Bits, Inc.
+
+────────────────────────────────────────────────────────────────────────────────
+
+Full license texts are available in each project's repository linked above.

@@ -1,0 +1,8 @@
+# Server deployment dependencies (pinned to tested versions).
+# Includes core + server extras.
+
+-r requirements.txt
+
+aiohttp==3.13.3
+azure-identity==1.25.3
+openai==2.29.0
