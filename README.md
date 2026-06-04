@@ -2,6 +2,8 @@
 
 A high-performance geospatial AI inference server supporting PyTorch, ONNX, and HuggingFace models via gRPC, Torch RPC, and an optional Azure OpenAI proxy.
 
+![Field delineation demo](fotw_delineate.gif)
+
 ## Features
 
 - **Multi-format model support**: PyTorch, ONNX, HuggingFace, TorchHub
