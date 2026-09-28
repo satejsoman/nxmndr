@@ -168,3 +168,49 @@ def test_the_worker_registry_refuses_a_second_model_under_one_id(tmp_path):
         assert rpc_worker._rpc_unload("unit-m1") is False
     finally:
         rpc_worker._rpc_unload("unit-m1")
+
+
+def _listener():
+    import socket
+
+    listener = socket.create_server(("127.0.0.1", 0))
+    listener.settimeout(0.1)
+    return listener, listener.getsockname()[1]
+
+
+def test_the_ready_handshake_accepts_only_its_child_and_keeps_its_deadline():
+    import socket
+    import threading
+    import time
+
+    listener, port = _listener()
+    proc = _Proc()
+    stop = threading.Event()
+
+    def stray():  # a local process that keeps connecting with the wrong line
+        while not stop.is_set():
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=1) as conn:
+                    conn.sendall(b"ready 1\n")
+            except OSError:
+                pass
+            time.sleep(0.01)
+
+    thread = threading.Thread(target=stray, daemon=True)
+    thread.start()
+    try:
+        started = time.monotonic()
+        with pytest.raises(managers.RpcWorkerStartError, match="within 0.5 s"):
+            managers.RpcWorkerManager._await_ready(proc, listener, 0.5)
+        assert time.monotonic() - started < 2.0
+    finally:
+        stop.set()
+        thread.join(timeout=5)
+
+    with socket.create_connection(("127.0.0.1", port), timeout=1) as conn:
+        conn.sendall(f"ready {proc.pid}\n".encode("ascii"))
+        managers.RpcWorkerManager._await_ready(proc, listener, 5.0)  # returns: its own child
+    proc.alive = False
+    with pytest.raises(managers.RpcWorkerStartError, match="exited with code None"):
+        managers.RpcWorkerManager._await_ready(proc, listener, 5.0)
+    listener.close()

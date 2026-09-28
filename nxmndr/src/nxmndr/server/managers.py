@@ -408,19 +408,20 @@ class RpcWorkerManager:
 
         deadline = time.monotonic() + timeout
         while True:
+            # Checked on every pass, so a stray local connection cannot extend the wait.
+            if not proc.is_alive():
+                raise RpcWorkerStartError(
+                    f"the PyTorch RPC worker exited with code {proc.exitcode} before it "
+                    "was ready to join its RPC group"
+                )
+            if time.monotonic() >= deadline:
+                raise RpcWorkerStartError(
+                    f"the PyTorch RPC worker was not ready to join its RPC group within "
+                    f"{timeout:g} s"
+                )
             try:
                 conn, _ = listener.accept()
             except socket.timeout:
-                if not proc.is_alive():
-                    raise RpcWorkerStartError(
-                        f"the PyTorch RPC worker exited with code {proc.exitcode} before it "
-                        "was ready to join its RPC group"
-                    ) from None
-                if time.monotonic() >= deadline:
-                    raise RpcWorkerStartError(
-                        f"the PyTorch RPC worker was not ready to join its RPC group within "
-                        f"{timeout:g} s"
-                    ) from None
                 continue
             with conn:
                 conn.settimeout(max(0.1, deadline - time.monotonic()))
