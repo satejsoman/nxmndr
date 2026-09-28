@@ -73,7 +73,8 @@ def test_the_routes_module_imports_nothing_heavy():
         "print(json.dumps(sorted(m for m in ('aiohttp', 'openai', 'torch', 'numpy', 'nxmndr.server.server', "
         "'nxmndr.server.azure_openai_proxy', 'nxmndr.gpt') if m in sys.modules)))"
     )
-    out = subprocess.run([sys.executable, "-c", probe], env={"PYTHONPATH": str(SRC), "PATH": "/usr/bin:/bin"},
+    env = {"PYTHONPATH": str(SRC), "PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"}
+    out = subprocess.run([sys.executable, "-c", probe], env=env,
                          capture_output=True, text=True, timeout=60, check=False)
     assert out.returncode == 0, out.stderr
     assert json.loads(out.stdout) == []
