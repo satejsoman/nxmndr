@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import multiprocessing
 import time
-import uuid
 from functools import partial
 from types import SimpleNamespace
 from typing import Callable, Dict, List, Optional
@@ -148,40 +147,6 @@ class ModelManager(ModelCache):
             session_ttl_s=session_ttl_s,
             clock=clock,
         )
-
-    # ---- Deprecated pre-lease entry points -------------------------------
-    # server.py on the rebuild baseline still calls these. Chunk 1 replaces them
-    # with load()/acquire_execution(); remove them once server.py no longer does.
-
-    def load_spec(
-        self,
-        model_spec,
-        metadata: Optional[Dict[str, object]] = None,
-        device_plan: Optional[List[Dict[str, str]]] = None,
-    ) -> str:
-        """Deprecated: load under a fresh model_id, as before the cache existed.
-
-        The key is unique per call, so nothing is reused; the record still takes a
-        cache slot and can be evicted when unpinned.
-        """
-        key = ModelCacheKey(format=type(model_spec).__name__, source=f"legacy:{uuid.uuid4().hex}")
-        return self.load(model_spec, key=key, metadata=metadata, device_plan=device_plan).model_id
-
-    def get_model_for_device(self, model_id: str, device_id: str) -> Optional[object]:
-        """Deprecated: peek at a model without pinning it; use an ExecutionLease.
-
-        Falls back to primary model if device-specific instance not available.
-        """
-        record = self.get(model_id)
-        if record is None:
-            return None
-
-        # Try device-specific model first
-        if record.device_models and device_id in record.device_models:
-            return record.device_models[device_id]
-
-        # Fall back to primary model
-        return record.model
 
 
 class RpcWorkerManager:

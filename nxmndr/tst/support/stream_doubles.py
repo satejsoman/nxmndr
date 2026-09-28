@@ -256,6 +256,7 @@ class CountingVariantLoader:
         self.log = log
         self.calls: Counter = Counter()
         self.disposals: Counter = Counter()
+        self.tokens: List[object] = []  # the token argument of every call
         self.lock = threading.Lock()
 
     def __call__(self, variant, capability, device, token=None):
@@ -264,6 +265,7 @@ class CountingVariantLoader:
         key = (variant, str(device))
         with self.lock:
             self.calls[key] += 1
+            self.tokens.append(token)
         loader = self
 
         class _Counted(sam_support.SamVariantResource):

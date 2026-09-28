@@ -10,13 +10,6 @@ checked into git.
 
 from pathlib import Path
 
-from tst.support import lease_api_shim
-
-# server.py codes against chunk 1a's frozen lease API in nxmndr.server.managers.
-# Until that implementation merges, the tests supply an in-test fake of it; once the
-# real names exist this is a no-op.
-lease_api_shim.install()
-
 
 def pytest_configure(config):
     """Generate test model artifacts if they are missing."""

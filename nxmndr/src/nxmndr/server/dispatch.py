@@ -335,7 +335,9 @@ def _sam_variant_getter(lease, capability, device_id: str, torch_device: str):
         if variant == capability.record_variant:
             model_obj = lease.model_for_device(device_id)
             return model_obj.model, model_obj.processor
-        token = getattr(lease.record.spec, "token", None)
+        # The record's credential (ModelRecord.auth_token, set by the model cache from
+        # the load request); never taken from metadata, which holds no token.
+        token = lease.record.auth_token or None
 
         def factory():
             return sam_support.load_sam_variant(variant, capability, torch_device, token=token)

@@ -396,8 +396,10 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
                 "repo_id": spec_msg.source,
                 "name": spec_msg.name or spec_msg.source,
             }
-            if spec_msg.version:
-                spec_dict["revision"] = spec_msg.version
+            # Same normalization as cache_key_from_spec, so the key and the load agree.
+            revision = (spec_msg.version or "").strip()
+            if revision:
+                spec_dict["revision"] = revision
             token = (
                 spec_msg.token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
             )
@@ -994,7 +996,13 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
                         if callable(is_active) and not is_active():
                             return  # the client is gone: do not run inference for nobody
                         if session_id:
-                            self.model_manager.touch_session(session_id)
+                            try:
+                                self.model_manager.touch_session(session_id)
+                            except (managers.SessionClosedError, managers.UnknownSessionError):
+                                # Closed or cancelled after the check above: no dispatch.
+                                outcome = "failed"
+                                yield self._session_closed_error(book, session_id, corr_id)
+                                return
                         yield self._run_tile(lease, book, session_id, tile, corr_id)
                     tile = None
 
