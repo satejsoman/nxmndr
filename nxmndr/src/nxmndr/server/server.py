@@ -1506,7 +1506,7 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
             format_label = str(metadata.get("format") or "")
             meta_payload = {}
             for key, value in metadata.items():
-                if value is None:
+                if value is None or key == "token":  # never persist credentials to the registry file
                     continue
                 try:
                     meta_payload[str(key)] = str(value)
@@ -1719,6 +1719,33 @@ async def run_unified_server(
         await runner.cleanup()
 
 
+def _configure_cudnn() -> None:
+    """Disable cuDNN when the bundled cuDNN cannot serve the attached GPUs.
+
+    torch >= 2.9 ships cuDNN >= 9.11, which has no kernels for SM < 7.5 (Volta and older);
+    convolutions then fail with "unable to find an engine". Falling back to the native CUDA
+    kernels keeps inference on the GPU. Override with NXMNDR_CUDNN=0|1.
+    """
+    override = os.environ.get("NXMNDR_CUDNN")
+    if override is not None:
+        torch.backends.cudnn.enabled = override.strip() not in {"0", "false", "no", "off"}
+        logger.info("cuDNN %s by NXMNDR_CUDNN", "enabled" if torch.backends.cudnn.enabled else "disabled")
+        return
+    try:
+        if not torch.cuda.is_available():
+            return
+        compiled = torch._C._cudnn.getCompileVersion() if hasattr(torch._C, "_cudnn") else None
+        min_cc = min(torch.cuda.get_device_capability(i) for i in range(torch.cuda.device_count()))
+        if compiled and (compiled[0], compiled[1]) >= (9, 11) and min_cc < (7, 5):
+            torch.backends.cudnn.enabled = False
+            logger.warning(
+                "cuDNN %s does not support SM %d.%d GPUs; cuDNN disabled, using native CUDA kernels",
+                ".".join(str(v) for v in compiled), min_cc[0], min_cc[1],
+            )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("cuDNN capability check skipped: %s", exc)
+
+
 def main():
     """Main CLI entry point. Defaults to gRPC; Azure proxy HTTP server is opt-in."""
     import argparse
@@ -1769,6 +1796,8 @@ def main():
     # Set log level
     logging.getLogger().setLevel(getattr(logging, args.log_level))
     logger.setLevel(getattr(logging, args.log_level))
+
+    _configure_cudnn()
 
     if args.azure_proxy:
         # Run both gRPC and HTTP servers

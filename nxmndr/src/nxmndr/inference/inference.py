@@ -724,6 +724,13 @@ def load_huggingface(spec: HuggingFaceModelSpec, provider, session):
                 "Loaded HuggingFace model from locally cached weights: %s",
                 weight_candidate,
             )
+        # Place the model on the provider's device (from_pretrained loads on CPU); HuggingFaceModel
+        # derives its own .device from the parameters, so inputs follow the move.
+        target_device = provider.device if provider.device != "auto" else (
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+        model.to(target_device)
+        logger.info("HuggingFace model %s placed on %s", spec.repo_id, target_device)
         return HuggingFaceModel(model, processor, provider, repo_path=str(repo_path))
     elif isinstance(provider, RemoteInferenceProvider):
         return RemoteModel(provider)

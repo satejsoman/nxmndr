@@ -147,6 +147,7 @@ def handle_sam_inference(
             device=device,
             threshold=conf_threshold,
             mask_threshold=mask_threshold,
+            logger=logger,
         )
 
         if logger:
@@ -184,6 +185,7 @@ def run_sam3_text_inference(
     device: str = "cuda",
     threshold: float = 0.5,
     mask_threshold: float = 0.5,
+    logger=None,
 ) -> Dict[str, Any]:
     """
     Run SAM3 text-based inference.
@@ -213,11 +215,15 @@ def run_sam3_text_inference(
         target_sizes=inputs.get("original_sizes").tolist(),
     )[0]
 
-    return {
-        "masks": results["masks"].cpu().numpy() if len(results["masks"]) > 0 else np.array([]),
-        "boxes": results["boxes"].cpu().numpy() if len(results["boxes"]) > 0 else np.array([]),
-        "scores": results["scores"].cpu().numpy() if len(results["scores"]) > 0 else np.array([]),
-    }
+    masks = results["masks"].cpu().numpy() if len(results["masks"]) > 0 else np.array([])
+    boxes = results["boxes"].cpu().numpy() if len(results["boxes"]) > 0 else np.array([])
+    scores = results["scores"].cpu().numpy() if len(results["scores"]) > 0 else np.array([])
+    if len(masks) > 1:
+        # drop whole-region "group" masks that contain other instances (see drop_group_masks)
+        kept = drop_group_masks(masks, logger=logger)
+        masks, boxes, scores = masks[kept], boxes[kept], scores[kept]
+
+    return {"masks": masks, "boxes": boxes, "scores": scores}
 
 
 def run_sam3_tracker_inference(
@@ -283,6 +289,94 @@ def run_sam3_tracker_inference(
     return {
         "masks": np.array(all_masks) if all_masks else np.array([]),
     }
+
+
+def drop_group_masks(
+    masks: np.ndarray,
+    min_contained: int = 2,
+    overlap: float = 0.8,
+    mask_logits: Optional[np.ndarray] = None,
+    logger=None,
+) -> np.ndarray:
+    """Indices of masks to keep after dropping "group" masks that contain other instances.
+
+    For a concept like "field", SAM 3 returns both per-parcel instances and a whole-region mask
+    (the union of all parcels). The region mask has the HIGHEST concept score, so it cannot be
+    removed by score; it is identified structurally: a mask is dropped when at least
+    ``min_contained`` other masks lie inside it (``overlap`` fraction of their pixels). On the
+    case-study chips the region mask contained 4 to 56 parcels and covered 100% of the chip,
+    parcels contained none (mean in-mask logit 1.3-1.5 for the region vs 1.7-5.5 for parcels).
+
+    Args:
+        masks: (N, H, W) binary masks (bool or 0/1).
+        min_contained: drop a mask that contains at least this many other masks.
+        overlap: fraction of the contained mask's pixels that must lie inside the container.
+        mask_logits: optional (N, H, W) mask logits, only used to log the in-mask mean logit.
+    A contained mask that itself covers >= ``overlap`` of the container is treated as a duplicate
+    rather than a group member, so the smallest non-empty mask is never dropped.
+    Returns:
+        1-D array of kept indices (in the original order).
+    """
+    n = len(masks)
+    if n < 2:
+        return np.arange(n)
+    binm = [np.asarray(m) > 0.5 for m in masks]
+    areas = np.array([int(b.sum()) for b in binm])
+    keep = np.ones(n, dtype=bool)
+    for i in range(n):
+        if areas[i] == 0:
+            continue
+        contained = 0
+        for j in range(n):
+            if j == i or areas[j] == 0 or areas[j] > areas[i]:
+                continue
+            inter = np.logical_and(binm[i], binm[j]).sum()
+            # j inside i, but i not inside j: mutual containment is a duplicate detection, not a group
+            if inter >= overlap * areas[j] and inter < overlap * areas[i]:
+                contained += 1
+                if contained >= min_contained:
+                    break
+        if contained >= min_contained:
+            keep[i] = False
+            if logger:
+                extra = ""
+                if mask_logits is not None:
+                    extra = f", mean in-mask logit {float(np.asarray(mask_logits[i])[binm[i]].mean()):.2f}"
+                logger.info(
+                    "SAM3: dropping group mask %d (area %.2f of chip, contains >=%d instances%s)",
+                    i, areas[i] / binm[i].size, contained, extra,
+                )
+    return np.flatnonzero(keep)
+
+
+def select_masks_by_area_and_iou(
+    masks: np.ndarray,
+    order: np.ndarray,
+    min_area: float = 0.001,
+    max_area: float = 0.5,
+    iou: float = 0.5,
+) -> List[int]:
+    """Score-free instance selection: walk ``masks`` in ``order`` (best first), drop masks whose
+    area fraction is outside [min_area, max_area] (specks and whole-chip masks) and masks with
+    IoU > ``iou`` against an already kept mask. Returns the kept indices in ``order``.
+    """
+    binm = [np.asarray(m) > 0.5 for m in masks]
+    total = float(binm[0].size) if len(binm) else 1.0
+    kept: List[int] = []
+    for i in order:
+        a = binm[i].sum() / total
+        if a < min_area or a > max_area:
+            continue
+        ok = True
+        for j in kept:
+            inter = np.logical_and(binm[i], binm[j]).sum()
+            union = np.logical_or(binm[i], binm[j]).sum()
+            if union and inter / union > iou:
+                ok = False
+                break
+        if ok:
+            kept.append(int(i))
+    return kept
 
 
 def filter_overlapping_masks(masks: np.ndarray, keep_smaller: bool = True) -> np.ndarray:
