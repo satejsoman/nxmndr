@@ -169,3 +169,89 @@ def test_misaligned_tile_ids_are_an_explicit_error(stubbed):
         list(client.stream_predict(model_id="m", samples=[np.zeros(2)] * 2, tile_ids=["only-one"]))
     with pytest.raises(ValueError, match="fewer entries"):
         list(client.stream_predict(model_id="m", samples=[np.zeros(2)] * 2, tile_options=[{}]))
+
+
+# ------------------------------------------ one tile iterable (wave2-chunk-3.md [6](3))
+
+
+def _stream_both_ways(client, stub, chips, ids, opts):
+    list(client.stream_predict(session_id="s1", samples=chips, tile_ids=ids, tile_options=opts,
+                               options={"task_type": "segmentation"}, chunk_bytes=3))
+    aligned = [(dict(r.context), r.chunk, r.end_of_sequence) for r in stub.requests]
+    stub.requests.clear()
+    pulled = []
+
+    def tiles():
+        for item in zip(ids, chips, opts):
+            pulled.append(item[0])
+            yield item
+
+    list(client.stream_predict(session_id="s1", tiles=tiles(), options={"task_type": "segmentation"},
+                               chunk_bytes=3))
+    one_iterable = [(dict(r.context), r.chunk, r.end_of_sequence) for r in stub.requests]
+    return aligned, one_iterable, pulled
+
+
+def test_one_tile_iterable_sends_exactly_what_three_aligned_iterables_send(stubbed):
+    client, stub = stubbed
+    chips = [np.arange(8, dtype=np.uint8), np.arange(8, 16, dtype=np.uint8), np.zeros(4, np.uint8)]
+    ids = ["r0_c0", "r0_c1", "r1_c0"]
+    opts = [{"sam_text_prompt": "field"}, None, {"return_confidence": "true"}]
+    aligned, one_iterable, pulled = _stream_both_ways(client, stub, chips, ids, opts)
+    assert one_iterable == aligned
+    assert pulled == ids  # one pull per tile, in order
+    firsts = [ctx for ctx, _, _ in one_iterable if any(k.startswith("opt.") for k in ctx)]
+    assert [c["tile_id"] for c in firsts] == ids
+    assert firsts[0]["opt.sam_text_prompt"] == "field" and "opt.sam_text_prompt" not in firsts[1]
+
+
+def test_tiles_cannot_be_mixed_with_the_aligned_iterables(stubbed):
+    client, _ = stubbed
+    item = [("t", np.zeros(2), None)]
+    for extra in ({"samples": [np.zeros(2)]}, {"tile_ids": ["t"]}, {"tile_options": [None]}):
+        with pytest.raises(ValueError, match="not both"):
+            client.stream_predict(model_id="m", tiles=item, **extra)
+    with pytest.raises(ValueError, match="samples or tiles"):
+        client.stream_predict(model_id="m")
+    with pytest.raises(ValueError, match=r"tiles\[1\] must be"):
+        list(client.stream_predict(model_id="m", tiles=[("a", np.zeros(2), None), ("b", np.zeros(2))]))
+
+
+# ------------------------------------------ LoadModel effective metadata ([6](4))
+
+
+class _LoadStub:
+    def __init__(self):
+        self.requests = []
+
+    def LoadModel(self, request, timeout=None):
+        self.requests.append(request)
+        return inference_pb2.LoadModelResponse(
+            success=True,
+            model_id="srv-1",
+            message="loaded",
+            effective_metadata=[
+                inference_pb2.MetadataEntry(key="model_cache_hit", value="false"),
+                inference_pb2.MetadataEntry(key="capability.sam", value="sam3"),
+            ],
+        )
+
+
+def test_load_model_result_returns_the_effective_metadata(monkeypatch):
+    client = InferenceGrpcClient("localhost:0", max_attempts=1)
+    stub = _LoadStub()
+    monkeypatch.setattr(client, "_get_stub", lambda: stub)
+    result = client.load_model_result("m", {"format": "huggingface", "source": "org/sam"})
+    assert result.model_id == "srv-1" and result.message == "loaded"
+    assert dict(result.effective_metadata) == {"model_cache_hit": "false", "capability.sam": "sam3"}
+    assert client.load_model("m", {"format": "huggingface", "source": "org/sam"}) == "srv-1"
+
+    spec = inference_pb2.ModelSpec(format=inference_pb2.HUGGINGFACE, source="org/sam", version="rev-2",
+                                   model_id="from-spec")
+    spec.metadata.add(key="k", value="v")
+    client.load_model_result("", spec)
+    client.load_model_result("override", spec)
+    sent = [r.spec for r in stub.requests[2:]]
+    assert [s.model_id for s in sent] == ["from-spec", "override"]
+    assert all(s.version == "rev-2" and s.metadata[0].key == "k" for s in sent)
+    assert spec.model_id == "from-spec"  # the caller's message is not modified

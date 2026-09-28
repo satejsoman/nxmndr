@@ -19,7 +19,7 @@ import sys
 import threading
 import uuid
 from dataclasses import dataclass
-from typing import Callable, Dict, Iterable, Iterator, Mapping, Optional, Sequence
+from typing import Callable, Dict, Iterable, Iterator, Mapping, Optional, Sequence, Tuple
 
 import grpc
 import numpy as np
@@ -149,6 +149,21 @@ class PredictResult:
 
 
 @dataclass
+class LoadModelResult:
+    """A LoadModel answer: the model ID and the server's effective metadata.
+
+    ``effective_metadata`` holds, for example, ``model_cache_hit``, ``capability.sam``
+    (SAM 3 models) and ``capability.instances`` / ``capability.window`` (instance
+    models such as ``ultralytics_yolo``), so a host can check prompts or tiling against
+    the loaded model before it streams.
+    """
+
+    model_id: str
+    effective_metadata: Mapping[str, str]
+    message: str = ""
+
+
+@dataclass
 class ModelRegistryEntry:
     """Container for model registry entries returned by the inference service."""
 
@@ -253,6 +268,15 @@ class InferenceGrpcClient:
         model_id: str,
         spec: Mapping[str, str],
     ) -> str:
+        """Load a model; return the server-assigned model_id (see :meth:`load_model_result`)."""
+
+        return self.load_model_result(model_id, spec).model_id
+
+    def load_model_result(
+        self,
+        model_id: str,
+        spec,
+    ) -> LoadModelResult:
         """Load a model on the remote inference service.
 
         Args:
@@ -262,10 +286,19 @@ class InferenceGrpcClient:
                 - source: Model source (repo_id for huggingface, path for others)
                 - task: Task type (segmentation, detection, classification, etc)
                 - name: Display name for the model
+                or an ``inference_pb2.ModelSpec``, sent as given except that a
+                non-empty ``model_id`` replaces its ``model_id``.
 
         Returns:
-            Server-assigned model_id for use in predict calls
+            A :class:`LoadModelResult`: the server-assigned model_id for use in
+            predict calls, and the server's ``effective_metadata``.
         """
+        if isinstance(spec, inference_pb2.ModelSpec):
+            given = inference_pb2.ModelSpec()
+            given.CopyFrom(spec)
+            if model_id:
+                given.model_id = str(model_id)
+            return self._load_model_request(inference_pb2.LoadModelRequest(spec=given))
         if not model_id:
             raise ValueError("model_id is required")
         if not spec:
@@ -310,8 +343,9 @@ class InferenceGrpcClient:
         if token_value:
             model_spec.token = token_value
 
-        request = inference_pb2.LoadModelRequest(spec=model_spec)
+        return self._load_model_request(inference_pb2.LoadModelRequest(spec=model_spec))
 
+    def _load_model_request(self, request: inference_pb2.LoadModelRequest) -> LoadModelResult:
         def _call():
             stub = self._get_stub()
             return stub.LoadModel(request, timeout=self._timeout)
@@ -321,7 +355,11 @@ class InferenceGrpcClient:
         if not response.success:
             raise InferenceGrpcError(f"LoadModel failed: {response.message}")
 
-        return response.model_id
+        return LoadModelResult(
+            model_id=response.model_id,
+            effective_metadata={str(e.key): str(e.value) for e in response.effective_metadata},
+            message=str(response.message or ""),
+        )
 
     def predict(
         self,
@@ -437,7 +475,8 @@ class InferenceGrpcClient:
         self,
         *,
         model_id: str = "",
-        samples: Iterable[np.ndarray],
+        samples: Optional[Iterable[np.ndarray]] = None,
+        tiles: Optional[Iterable[Tuple[str, np.ndarray, Optional[Mapping[str, object]]]]] = None,
         session_id: Optional[str] = None,
         tile_ids: Optional[Iterable[str]] = None,
         tile_options: Optional[Iterable[Optional[Mapping[str, object]]]] = None,
@@ -456,6 +495,9 @@ class InferenceGrpcClient:
             model_id: model identifier; required without ``session_id`` (for a session
                 stream the server uses the session's model).
             samples: iterable of numpy arrays, one per tile (consumed lazily).
+            tiles: instead of ``samples``/``tile_ids``/``tile_options``, one iterable of
+                ``(tile_id, sample, tile_options_or_None)``, consumed lazily, one item
+                per tile, so ids and options cannot fall out of step with samples.
             session_id: session opened with :meth:`open_session`.
             tile_ids: tile ids aligned with samples (default ``tile-<index>``).
             tile_options: per-tile option mappings aligned with samples (``None`` for none).
@@ -479,6 +521,11 @@ class InferenceGrpcClient:
         model_id = str(model_id or "")
         if not model_id and not session_id:
             raise ValueError("model_id or session_id is required")
+        if tiles is not None:
+            if samples is not None or tile_ids is not None or tile_options is not None:
+                raise ValueError("pass tiles, or samples with tile_ids/tile_options, not both")
+        elif samples is None:
+            raise ValueError("samples or tiles is required")
         if max_inflight is not None and int(max_inflight) < 1:
             raise ValueError("max_inflight must be >= 1")
         if chunk_bytes is not None and int(chunk_bytes) < 0:
@@ -487,6 +534,7 @@ class InferenceGrpcClient:
             self,
             model_id=model_id,
             samples=samples,
+            tiles=tiles,
             session_id=str(session_id or ""),
             tile_ids=tile_ids,
             tile_options=tile_options,
@@ -601,7 +649,7 @@ class StreamPredictCall:
         client: "InferenceGrpcClient",
         *,
         model_id: str,
-        samples: Iterable[np.ndarray],
+        samples: Optional[Iterable[np.ndarray]],
         session_id: str,
         tile_ids: Optional[Iterable[str]],
         tile_options: Optional[Iterable[Optional[Mapping[str, object]]]],
@@ -613,10 +661,12 @@ class StreamPredictCall:
         on_response,
         on_error,
         on_tile_start,
+        tiles=None,
     ) -> None:
         self._client = client
         self._model_id = model_id
         self._samples = samples
+        self._tiles = tiles
         self._session_id = session_id
         self._tile_ids = tile_ids
         self._tile_options = tile_options
@@ -660,16 +710,29 @@ class StreamPredictCall:
                 pass
         return False
 
+    def _tile_items(self) -> Iterator[tuple]:
+        """``(tile_id, sample, per_tile_options)`` per tile, pulled lazily."""
+        if self._tiles is not None:
+            for index, item in enumerate(self._tiles):
+                try:
+                    tile_id, sample, per_tile = item
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"tiles[{index}] must be (tile_id, sample, options)") from exc
+                yield tile_id, sample, per_tile
+            return
+        id_iter = iter(self._tile_ids) if self._tile_ids is not None else None
+        opt_iter = iter(self._tile_options) if self._tile_options is not None else None
+        missing = object()
+        for index, sample in enumerate(self._samples):
+            tile_id = next(id_iter, missing) if id_iter is not None else f"tile-{index}"
+            per_tile = next(opt_iter, missing) if opt_iter is not None else None
+            if tile_id is missing or per_tile is missing:
+                raise ValueError(f"tile_ids/tile_options have fewer entries than samples ({index + 1})")
+            yield tile_id, sample, per_tile
+
     def _requests(self) -> Iterator[inference_pb2.StreamPredictRequest]:
         try:
-            id_iter = iter(self._tile_ids) if self._tile_ids is not None else None
-            opt_iter = iter(self._tile_options) if self._tile_options is not None else None
-            missing = object()
-            for index, sample in enumerate(self._samples):
-                tile_id = next(id_iter, missing) if id_iter is not None else f"tile-{index}"
-                per_tile = next(opt_iter, missing) if opt_iter is not None else None
-                if tile_id is missing or per_tile is missing:
-                    raise ValueError(f"tile_ids/tile_options have fewer entries than samples ({index + 1})")
+            for tile_id, sample, per_tile in self._tile_items():
                 tile_id = str(tile_id)
                 tile_opts = dict(self._options)
                 tile_opts.update(per_tile or {})
@@ -775,6 +838,7 @@ class StreamPredictCall:
 
 __all__ = [
     "InferenceGrpcClient",
+    "LoadModelResult",
     "PredictResult",
     "InferenceGrpcError",
     "ModelRegistryEntry",
