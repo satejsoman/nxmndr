@@ -1,0 +1,1067 @@
+# Copyright (c) Microsoft Corporation. All rights reserved.
+# Licensed under the MIT License.
+
+"""Bounded LRU cache of loaded models with session and execution leases.
+
+This module implements the chunk 1a lease API frozen in the rebuild contracts
+(docs/rebuild/CONTRACTS.md section 3 on branch rebuild/chunk-0). The server imports
+these names from ``nxmndr.server.managers``; ``ModelManager`` there adds the default
+model loader. This module imports only the standard library.
+
+Rules the implementation keeps:
+
+* ``resident + reserved <= capacity`` at all times. Device replicas and aux
+  resources are part of their record and do not use capacity.
+* A record is pinned while an open session is bound to it or an execution lease
+  on it is unreleased. Pinned records are never evicted, unloaded or overwritten.
+  Holding a Python reference to a record is not a pin.
+* A distinct load at full capacity evicts the least recently used unpinned
+  record. If every slot is pinned or reserved it raises ``CacheExhaustedError``
+  before it loads or evicts anything.
+* The loader, ``ModelRecord.dispose`` and aux resource factories never run while
+  the global lock is held.
+* Each record is disposed exactly once.
+
+Sessions come only from ``open_session``. ``acquire_execution(session_id=...)``
+with an ID that was never opened raises ``UnknownSessionError`` and creates
+nothing, so the server rejects a ``StreamPredict`` that names an unknown session
+(plan item 14; contracts decision 8) instead of fabricating a session.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import os
+import re
+import secrets
+import threading
+import time
+import uuid
+from collections import OrderedDict
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+
+from ..logging import get_logger
+
+logger = get_logger(__name__)
+
+SESSION_CLOSE_REASONS = ("closed", "cancelled", "expired", "failed", "disconnected", "shutdown")
+
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+# Per-process key for auth scopes: equal tokens map to equal scopes inside this
+# process, and the scope cannot be reversed or correlated across processes.
+_AUTH_SCOPE_KEY = secrets.token_bytes(32)
+# A metadata key is treated as a credential if one of its words (split on
+# non-alphanumerics) is in this set, or if it contains one of the fragments.
+_SECRET_WORDS = frozenset(
+    {
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "apikey",
+        "credential",
+        "credentials",
+        "authorization",
+        "bearer",
+    }
+)
+_SECRET_FRAGMENTS = ("api_key", "private_key", "access_key")
+
+
+# ---------------------------------------------------------------------------
+# Errors
+# ---------------------------------------------------------------------------
+
+
+class ModelCacheError(RuntimeError):
+    """Base class of every model cache and lease error."""
+
+    # KeyError subclasses below would otherwise quote their message.
+    __str__ = RuntimeError.__str__
+
+
+class CacheExhaustedError(ModelCacheError):
+    """Every cache slot is pinned or reserved. Retry after a session or call ends."""
+
+    retryable = True
+
+
+class ModelInUseError(ModelCacheError):
+    """Unload or overwrite of a record that is pinned."""
+
+
+class UnknownModelError(ModelCacheError, KeyError):
+    """The model ID is not resident (never loaded, unloaded or evicted)."""
+
+
+class UnknownSessionError(ModelCacheError, KeyError):
+    """The session ID was never opened here, or its tombstone has expired."""
+
+
+class SessionConflictError(ModelCacheError):
+    """The session ID is already bound to another model."""
+
+
+class SessionClosedError(ModelCacheError):
+    """The session was closed, cancelled, expired, failed, disconnected or shut down."""
+
+
+class ModelLoadError(ModelCacheError):
+    """The loader raised. ``__cause__`` is the original exception."""
+
+
+class CacheShutdownError(ModelCacheError):
+    """The cache is shutting down or has shut down."""
+
+
+# ---------------------------------------------------------------------------
+# Keys
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ModelCacheKey:
+    """Canonical identity of a loaded model. Holds no credential value."""
+
+    format: str
+    source: str
+    revision: str = ""
+    checksum: str = ""
+    model_class: str = ""
+    task: str = ""
+    load_options: Tuple[Tuple[str, str], ...] = ()
+    auth_scope: str = ""
+
+    def __post_init__(self) -> None:
+        for name in (
+            "format",
+            "source",
+            "revision",
+            "checksum",
+            "model_class",
+            "task",
+            "auth_scope",
+        ):
+            if not isinstance(getattr(self, name), str):
+                raise TypeError(f"ModelCacheKey.{name} must be a str")
+        raw = self.load_options
+        items = raw.items() if isinstance(raw, Mapping) else raw
+        options = tuple(sorted((str(k), str(v)) for k, v in items))
+        names = [k for k, _ in options]
+        if len(names) != len(set(names)):
+            raise ValueError("ModelCacheKey.load_options has a duplicate option name")
+        object.__setattr__(self, "load_options", options)
+
+
+def _enum_name(spec: Any, field_name: str) -> str:
+    number = int(getattr(spec, field_name))
+    enum_type = spec.DESCRIPTOR.fields_by_name[field_name].enum_type
+    value = enum_type.values_by_number.get(number)
+    if value is None:
+        return str(number)
+    if value.name.endswith("_UNSPECIFIED"):
+        return ""
+    return value.name.lower()
+
+
+def _auth_scope(token: str) -> str:
+    if not token:
+        return ""
+    digest = hmac.new(_AUTH_SCOPE_KEY, token.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"hmac-sha256:{digest[:32]}"
+
+
+def cache_key_from_spec(spec: Any, *, artifact_sha256: str = "") -> ModelCacheKey:
+    """Derive the cache key of an ``inference_pb2.ModelSpec``.
+
+    Fields read: ``format``, ``source``, ``artifact``, ``version`` (the revision),
+    ``checksum``, ``model_class``, ``task``, ``lazy_load``, ``name`` (TorchHub only,
+    where it selects the hub entry point) and ``token`` (only as an opaque scope).
+    Uploaded artifact bytes are keyed by content: ``source = "sha256:<hex>"``.
+    Not part of the key, because the server does not use them to load:
+    ``model_id``, the friendly ``name`` of other formats, ``preprocessing``,
+    ``postprocessing``, ``metadata`` entries and ``artifact_mime_type``.
+    """
+
+    fmt = _enum_name(spec, "format")
+    artifact = bytes(getattr(spec, "artifact", b"") or b"")
+    if artifact_sha256:
+        digest = artifact_sha256.strip().lower()
+        if not _SHA256_HEX.fullmatch(digest):
+            raise ValueError("artifact_sha256 must be 64 hexadecimal characters")
+        source = f"sha256:{digest}"
+    elif artifact:
+        source = f"sha256:{hashlib.sha256(artifact).hexdigest()}"
+    else:
+        source = (spec.source or "").strip()
+    options: List[Tuple[str, str]] = []
+    if spec.lazy_load:
+        options.append(("lazy_load", "true"))
+    if fmt == "torchhub" and spec.name.strip():
+        options.append(("name", spec.name.strip()))
+    return ModelCacheKey(
+        format=fmt,
+        source=source,
+        revision=(spec.version or "").strip(),
+        checksum=(spec.checksum or "").strip().lower(),
+        model_class=(spec.model_class or "").strip(),
+        task=_enum_name(spec, "task"),
+        load_options=tuple(options),
+        auth_scope=_auth_scope(spec.token or ""),
+    )
+
+
+def _is_secret_key(key: object) -> bool:
+    lowered = str(key).lower()
+    if any(fragment in lowered for fragment in _SECRET_FRAGMENTS):
+        return True
+    return any(word in _SECRET_WORDS for word in re.split(r"[^0-9a-z]+", lowered))
+
+
+def _split_secrets(metadata: Optional[Mapping[str, object]]) -> Tuple[Dict[str, object], str]:
+    """Return metadata without credential-like keys, and the value of ``token`` if any."""
+
+    clean: Dict[str, object] = {}
+    token = ""
+    for key, value in dict(metadata or {}).items():
+        if _is_secret_key(key):
+            if str(key).lower() == "token" and isinstance(value, str):
+                token = value
+            continue
+        clean[key] = value
+    return clean, token
+
+
+def _redact(text: str, *values: str) -> str:
+    for value in values:
+        if value:
+            text = text.replace(value, "***")
+    return text
+
+
+# ---------------------------------------------------------------------------
+# Records, results and leases
+# ---------------------------------------------------------------------------
+
+
+class _ResourceAttempt:
+    __slots__ = ("done", "error", "waiters")
+
+    def __init__(self) -> None:
+        self.done = False
+        self.error: Optional[BaseException] = None
+        self.waiters = 0
+
+
+@dataclass(eq=False)
+class ModelRecord:
+    """A loaded model with its device replicas, aux resources and owned artifacts."""
+
+    model: Optional[object]
+    backend: str
+    metadata: Dict[str, object]
+    # Out of repr: a proto ModelSpec carries its token field.
+    spec: Optional[object] = field(default=None, repr=False)
+    # Multi-device support: device_id -> model instance
+    device_models: Dict[str, object] = field(default_factory=dict)
+    model_id: str = ""
+    key: Optional[ModelCacheKey] = None
+    # A credential the model needs after loading (for example a Hugging Face
+    # token for SAM variants). Never in metadata, keys, repr or logs.
+    auth_token: str = field(default="", repr=False)
+    _resources: Dict[str, object] = field(default_factory=dict, init=False, repr=False)
+    _attempts: Dict[str, _ResourceAttempt] = field(default_factory=dict, init=False, repr=False)
+    _finalizers: List[Callable[[], None]] = field(default_factory=list, init=False, repr=False)
+    _disposed: bool = field(default=False, init=False, repr=False)
+    _cond: threading.Condition = field(default_factory=threading.Condition, init=False, repr=False)
+
+    @property
+    def disposed(self) -> bool:
+        with self._cond:
+            return self._disposed
+
+    def _resource(self, name: str, factory: Callable[[], object]) -> object:
+        """Return the record-scoped resource ``name``, creating it once.
+
+        Concurrent callers share one factory call. The factory runs without any
+        lock held. A failure is raised to the caller and to concurrent waiters
+        (as ``ModelLoadError``) and is not cached: the next call tries again.
+        """
+
+        with self._cond:
+            while True:
+                if self._disposed:
+                    raise ModelCacheError(f"model {self.model_id} is disposed")
+                if name in self._resources:
+                    return self._resources[name]
+                attempt = self._attempts.get(name)
+                if attempt is None:
+                    attempt = _ResourceAttempt()
+                    self._attempts[name] = attempt
+                    break
+                attempt.waiters += 1
+                while not attempt.done:
+                    self._cond.wait()
+                if attempt.error is not None:
+                    raise ModelLoadError(
+                        f"resource {name!r} of model {self.model_id} failed to load"
+                    ) from attempt.error
+        try:
+            value = factory()
+        except BaseException as exc:
+            with self._cond:
+                attempt.error = exc
+                attempt.done = True
+                self._attempts.pop(name, None)
+                self._cond.notify_all()
+            raise
+        with self._cond:
+            attempt.done = True
+            self._attempts.pop(name, None)
+            late = self._disposed
+            if not late:
+                self._resources[name] = value
+            self._cond.notify_all()
+        if late:
+            del value
+            raise ModelCacheError(f"model {self.model_id} was disposed while {name!r} loaded")
+        return value
+
+    def dispose(self) -> None:
+        """Release replicas, aux resources and owned temporary artifacts. Idempotent."""
+
+        with self._cond:
+            if self._disposed:
+                return
+            self._disposed = True
+            resources = list(self._resources.values())
+            self._resources.clear()
+            finalizers = list(self._finalizers)
+            self._finalizers.clear()
+            self._cond.notify_all()
+        self.device_models.clear()
+        self.model = None
+        self.auth_token = ""
+        del resources
+        for finalizer in finalizers:
+            try:
+                finalizer()
+            except Exception as exc:  # disposal continues past a failing finalizer
+                logger.warning(
+                    "model %s: disposal step failed: %s", self.model_id, type(exc).__name__
+                )
+
+
+@dataclass(frozen=True)
+class LoadResult:
+    model_id: str
+    cache_hit: bool
+
+
+@dataclass(frozen=True)
+class SessionLease:
+    session_id: str
+    model_id: str
+    cache_hit: bool
+    reused: bool
+
+
+@dataclass(frozen=True)
+class CacheStats:
+    capacity: int
+    resident: int
+    reserved: int
+    pinned: int
+
+
+class _Session:
+    __slots__ = ("session_id", "model_id", "key", "last_activity", "active")
+
+    def __init__(self, session_id: str, model_id: str, key: ModelCacheKey, now: float) -> None:
+        self.session_id = session_id
+        self.model_id = model_id
+        self.key = key
+        self.last_activity = now
+        self.active = 0  # unreleased execution leases acquired through this session
+
+
+class ExecutionLease:
+    """Pins one record for the duration of one call or stream. Release exactly once."""
+
+    def __init__(
+        self,
+        cache: "ModelCache",
+        lease_id: str,
+        record: ModelRecord,
+        session: Optional[_Session],
+    ) -> None:
+        self._cache = cache
+        self._session = session
+        self._released = False
+        self.lease_id = lease_id
+        self.model_id = record.model_id
+        self.session_id = session.session_id if session is not None else ""
+        self.record = record
+
+    @property
+    def released(self) -> bool:
+        return self._released
+
+    def _ensure_live(self) -> None:
+        if self._released:
+            raise ModelCacheError(f"execution lease {self.lease_id} was released")
+
+    def model_for_device(self, device_id: str) -> object:
+        """The replica for ``device_id``, else the primary model."""
+
+        self._ensure_live()
+        replicas = self.record.device_models
+        if device_id in replicas:
+            return replicas[device_id]
+        return self.record.model
+
+    def resource(self, name: str, factory: Callable[[], object]) -> object:
+        """A record-scoped aux resource, created once and disposed with the record."""
+
+        self._ensure_live()
+        return self.record._resource(name, factory)
+
+    def release(self) -> None:
+        self._cache._release_execution(self)
+
+    def __enter__(self) -> "ExecutionLease":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.release()
+
+    def __repr__(self) -> str:
+        return (
+            f"ExecutionLease(lease_id={self.lease_id!r}, model_id={self.model_id!r}, "
+            f"session_id={self.session_id!r}, released={self._released})"
+        )
+
+
+class _Entry:
+    __slots__ = ("record", "key", "sessions", "executions", "handoffs")
+
+    def __init__(self, record: ModelRecord, key: ModelCacheKey) -> None:
+        self.record = record
+        self.key = key
+        self.sessions: set[str] = set()
+        self.executions: set[str] = set()
+        # Coalesced waiters that have not yet picked up this freshly loaded
+        # record. They keep it from eviction until they resume.
+        self.handoffs = 0
+
+    def pins(self) -> int:
+        return len(self.sessions) + len(self.executions)
+
+    def evictable(self) -> bool:
+        return self.pins() == 0 and self.handoffs == 0
+
+
+class _PendingLoad:
+    __slots__ = ("key", "model_id", "waiters", "done", "error")
+
+    def __init__(self, key: ModelCacheKey, model_id: str) -> None:
+        self.key = key
+        self.model_id = model_id
+        self.waiters = 0
+        self.done = False
+        self.error: Optional[BaseException] = None
+
+
+Loader = Callable[[object, ModelCacheKey, dict, Optional[List[dict]]], ModelRecord]
+
+
+# ---------------------------------------------------------------------------
+# Cache
+# ---------------------------------------------------------------------------
+
+
+class ModelCache:
+    """Thread-safe bounded LRU of model records with session and execution leases.
+
+    ``nxmndr.server.managers.ModelManager`` is this class plus the default
+    loader; see the module docstring for the rules.
+    """
+
+    def __init__(
+        self,
+        *,
+        loader: Loader,
+        capacity: int = 10,
+        session_ttl_s: float = 3600.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 1:
+            raise ValueError("capacity must be an integer >= 1")
+        if session_ttl_s < 0:
+            raise ValueError("session_ttl_s must be >= 0")
+        self._loader = loader
+        self._capacity = capacity
+        self._ttl = float(session_ttl_s)
+        self._clock = clock
+        self._cond = threading.Condition(threading.Lock())
+        self._records: "OrderedDict[str, _Entry]" = OrderedDict()  # least recent first
+        self._by_key: Dict[ModelCacheKey, str] = {}
+        self._loading: Dict[ModelCacheKey, _PendingLoad] = {}
+        self._sessions: Dict[str, _Session] = {}
+        self._tombstones: Dict[str, Tuple[str, float]] = {}  # session_id -> (reason, closed_at)
+        self._live_executions = 0
+        self._artifacts: Dict[str, set[str]] = {}  # path -> owning model IDs ("" = the cache)
+        self._state = "running"  # running -> draining -> stopped
+
+    # ---- loading --------------------------------------------------------
+
+    def load(
+        self,
+        model_spec: object,
+        *,
+        key: ModelCacheKey,
+        metadata: Optional[Mapping[str, object]] = None,
+        device_plan: Optional[List[dict]] = None,
+        overwrite: bool = False,
+    ) -> LoadResult:
+        """Make the model resident without pinning it (LoadModel).
+
+        With ``overwrite=True`` a resident unpinned record for ``key`` is disposed
+        and loaded again under a new model ID; a pinned one raises
+        ``ModelInUseError``. If ``key`` is being loaded by another call, this call
+        waits for that load and returns its model ID, also with ``overwrite``.
+        """
+
+        _check_key(key)
+        model_id, cache_hit, _ = self._acquire(
+            key, model_spec, metadata, device_plan, overwrite=overwrite, session_id=None
+        )
+        return LoadResult(model_id=model_id, cache_hit=cache_hit)
+
+    def _acquire(
+        self,
+        key: ModelCacheKey,
+        model_spec: object,
+        metadata: Optional[Mapping[str, object]],
+        device_plan: Optional[List[dict]],
+        *,
+        overwrite: bool,
+        session_id: Optional[str],
+    ) -> Tuple[str, bool, bool]:
+        """Resolve ``key`` to a resident record, loading it if needed.
+
+        With ``session_id``, the session is bound to the record in the same lock
+        hold that finds or inserts it. Returns (model_id, cache_hit, reused).
+        """
+
+        victims: List[ModelRecord] = []
+        with self._cond:
+            while True:
+                self._check_running()
+                if session_id is not None:
+                    existing = self._session_precheck(session_id, key=key)
+                    if existing is not None:
+                        return existing.model_id, True, True
+                model_id = self._by_key.get(key)
+                if model_id is not None:
+                    entry = self._records[model_id]
+                    if not overwrite:
+                        self._records.move_to_end(model_id)
+                        if session_id is not None:
+                            self._bind_session(session_id, entry)
+                        return model_id, True, False
+                    if not entry.evictable():
+                        raise ModelInUseError(
+                            f"model {model_id} is in use ({entry.pins()} pins); cannot overwrite"
+                        )
+                    self._remove_entry(model_id)
+                    victims.append(entry.record)
+                    overwrite = False
+                pending = self._loading.get(key)
+                if pending is not None:
+                    pending.waiters += 1
+                    while not pending.done:
+                        self._cond.wait()
+                    if pending.error is not None:
+                        if isinstance(pending.error, CacheShutdownError):
+                            raise CacheShutdownError("model cache shut down during load")
+                        raise ModelLoadError(
+                            f"loading model {pending.model_id} ({key.format}) failed"
+                        ) from pending.error
+                    self._check_running()
+                    entry = self._records[pending.model_id]
+                    entry.handoffs -= 1
+                    self._records.move_to_end(pending.model_id)
+                    if session_id is not None:
+                        existing = self._session_precheck(session_id, key=key)
+                        if existing is not None:
+                            return existing.model_id, True, True
+                        self._bind_session(session_id, entry)
+                    return pending.model_id, False, False
+                if len(self._records) + len(self._loading) >= self._capacity:
+                    victim = self._lru_evictable()
+                    if victim is None:
+                        raise CacheExhaustedError(
+                            f"all {self._capacity} model cache slots are pinned or reserved"
+                        )
+                    self._remove_entry(victim.record.model_id)
+                    victims.append(victim.record)
+                    logger.info(
+                        "evicting model %s (%s) to make room",
+                        victim.record.model_id,
+                        victim.key.format,
+                    )
+                model_id = uuid.uuid4().hex
+                pending = _PendingLoad(key, model_id)
+                self._loading[key] = pending
+                break
+
+        for victim_record in victims:
+            self._dispose_record(victim_record)
+
+        clean, token = _split_secrets(metadata)
+        clean["model_id"] = model_id
+        spec_token = getattr(model_spec, "token", None)
+        spec_token = spec_token if isinstance(spec_token, str) else ""
+        logger.info("loading model %s (%s)", model_id, key.format)
+        try:
+            record = self._loader(model_spec, key, dict(clean), device_plan)
+            if not isinstance(record, ModelRecord):
+                raise TypeError(f"loader returned {type(record).__name__}, not ModelRecord")
+        except BaseException as exc:
+            with self._cond:
+                self._loading.pop(key, None)
+                pending.error = exc
+                pending.done = True
+                self._cond.notify_all()
+            self._release_artifacts(model_id)
+            if not isinstance(exc, Exception):
+                raise
+            logger.warning("loading model %s failed: %s", model_id, type(exc).__name__)
+            message = _redact(f"{type(exc).__name__}: {exc}", token, spec_token)
+            raise ModelLoadError(
+                f"loading model {model_id} ({key.format}) failed: {message}"
+            ) from exc
+
+        record.model_id = model_id
+        record.key = key
+        record.metadata, _ = _split_secrets(record.metadata)
+        record.metadata["model_id"] = model_id
+        if not record.auth_token:
+            record.auth_token = token or spec_token
+        record._finalizers.append(lambda mid=model_id: self._release_artifacts(mid))
+
+        reused: Optional[SessionLease] = None
+        with self._cond:
+            self._loading.pop(key, None)
+            try:
+                if self._state != "running":
+                    pending.error = CacheShutdownError("model cache shut down during load")
+                else:
+                    entry = _Entry(record, key)
+                    entry.handoffs = pending.waiters
+                    self._records[model_id] = entry
+                    self._by_key[key] = model_id
+                    if session_id is not None:
+                        reused = self._session_precheck(session_id, key=key)
+                        if reused is None:
+                            self._bind_session(session_id, entry)
+            finally:
+                pending.done = True
+                self._cond.notify_all()
+        if pending.error is not None:
+            self._dispose_record(record)
+            raise CacheShutdownError("model cache shut down during load")
+        logger.info("loaded model %s (%s)", model_id, key.format)
+        if reused is not None:
+            return reused.model_id, True, True
+        return model_id, False, False
+
+    # ---- sessions -------------------------------------------------------
+
+    def open_session(
+        self,
+        session_id: str,
+        *,
+        model_id: str = "",
+        model_spec: object = None,
+        key: Optional[ModelCacheKey] = None,
+        metadata: Optional[Mapping[str, object]] = None,
+        device_plan: Optional[List[dict]] = None,
+    ) -> SessionLease:
+        """Bind ``session_id`` to a model and pin it (OpenSession). Idempotent.
+
+        Pass exactly one of ``model_id`` (a resident model) or ``key`` together
+        with ``model_spec`` (load if needed). A retry with the same session ID and
+        the same model returns ``reused=True`` and does not add a pin.
+        """
+
+        _check_session_id(session_id)
+        if bool(model_id) == (key is not None):
+            raise ValueError("open_session needs exactly one of model_id or key")
+        if key is not None:
+            _check_key(key)
+            if model_spec is None:
+                raise ValueError("open_session with key needs model_spec")
+            mid, cache_hit, reused = self._acquire(
+                key, model_spec, metadata, device_plan, overwrite=False, session_id=session_id
+            )
+            return SessionLease(
+                session_id=session_id, model_id=mid, cache_hit=cache_hit, reused=reused
+            )
+        with self._cond:
+            self._check_running()
+            existing = self._session_precheck(session_id, model_id=model_id)
+            if existing is not None:
+                return existing
+            entry = self._records.get(model_id)
+            if entry is None:
+                raise UnknownModelError(f"model {model_id} is not resident")
+            self._bind_session(session_id, entry)
+        return SessionLease(session_id=session_id, model_id=model_id, cache_hit=True, reused=False)
+
+    def close_session(self, session_id: str, *, reason: str) -> bool:
+        """Release the session pin once and tombstone the ID. False if not open."""
+
+        if reason not in SESSION_CLOSE_REASONS:
+            raise ValueError(f"unknown close reason {reason!r}")
+        with self._cond:
+            closed = self._close_locked(session_id, reason, self._clock())
+        if closed:
+            logger.info("session %s %s", session_id, reason)
+        return closed
+
+    def touch_session(self, session_id: str) -> None:
+        """Record activity on an open session (for TTL expiry)."""
+
+        with self._cond:
+            now = self._clock()
+            self._open_session_or_raise(session_id, now).last_activity = now
+
+    def session_state(self, session_id: str) -> str:
+        """``"open"``, the close reason while tombstoned, else ``"unknown"``."""
+
+        with self._cond:
+            if session_id in self._sessions:
+                return "open"
+            tombstone = self._live_tombstone(session_id, self._clock())
+            return tombstone[0] if tombstone is not None else "unknown"
+
+    def expire_sessions(self) -> List[str]:
+        """Close (reason ``expired``) open sessions idle longer than the TTL.
+
+        A session with a live execution lease is never expired. Also forgets
+        tombstones older than the TTL. Returns the expired session IDs.
+        """
+
+        with self._cond:
+            now = self._clock()
+            expired = [
+                sid
+                for sid, session in self._sessions.items()
+                if session.active == 0 and now - session.last_activity > self._ttl
+            ]
+            for sid in expired:
+                self._close_locked(sid, "expired", now)
+            for sid, (_, closed_at) in list(self._tombstones.items()):
+                if now - closed_at > self._ttl:
+                    del self._tombstones[sid]
+        for sid in expired:
+            logger.info("session %s expired", sid)
+        return expired
+
+    # ---- execution ------------------------------------------------------
+
+    def acquire_execution(self, *, model_id: str = "", session_id: str = "") -> ExecutionLease:
+        """Pin a model for one call or stream. Pass exactly one of the two IDs."""
+
+        if bool(model_id) == bool(session_id):
+            raise ValueError("acquire_execution needs exactly one of model_id or session_id")
+        with self._cond:
+            self._check_running()
+            now = self._clock()
+            session: Optional[_Session] = None
+            if session_id:
+                session = self._open_session_or_raise(session_id, now)
+                entry = self._records[session.model_id]
+                session.active += 1
+                session.last_activity = now
+            else:
+                entry = self._records.get(model_id)
+                if entry is None:
+                    raise UnknownModelError(f"model {model_id} is not resident")
+            lease = ExecutionLease(self, uuid.uuid4().hex, entry.record, session)
+            entry.executions.add(lease.lease_id)
+            self._live_executions += 1
+            self._records.move_to_end(entry.record.model_id)
+        logger.debug("execution lease %s on model %s", lease.lease_id, lease.model_id)
+        return lease
+
+    def _release_execution(self, lease: ExecutionLease) -> None:
+        with self._cond:
+            if lease._released:
+                return
+            lease._released = True
+            entry = self._records.get(lease.model_id)
+            if entry is not None:
+                entry.executions.discard(lease.lease_id)
+            self._live_executions -= 1
+            if lease._session is not None:
+                lease._session.active -= 1
+                lease._session.last_activity = self._clock()
+            self._cond.notify_all()
+        logger.debug("released execution lease %s", lease.lease_id)
+
+    # ---- unload and introspection ---------------------------------------
+
+    def unload(self, model_id: str) -> bool:
+        """Dispose an unpinned record. False if unknown; ``ModelInUseError`` if pinned."""
+
+        with self._cond:
+            entry = self._records.get(model_id)
+            if entry is None:
+                return False
+            if not entry.evictable():
+                raise ModelInUseError(f"model {model_id} is in use ({entry.pins()} pins)")
+            self._remove_entry(model_id)
+        self._dispose_record(entry.record)
+        logger.info("unloaded model %s", model_id)
+        return True
+
+    def get(self, model_id: str) -> Optional[ModelRecord]:
+        """Peek at a resident record. Does not pin it or change recency."""
+
+        with self._cond:
+            entry = self._records.get(model_id)
+            return entry.record if entry is not None else None
+
+    def list_models(self) -> Dict[str, ModelRecord]:
+        """Resident records, least recently used first."""
+
+        with self._cond:
+            return {mid: entry.record for mid, entry in self._records.items()}
+
+    def pin_count(self, model_id: str) -> int:
+        """Open sessions bound to the model plus its unreleased execution leases."""
+
+        with self._cond:
+            entry = self._records.get(model_id)
+            return entry.pins() if entry is not None else 0
+
+    def stats(self) -> CacheStats:
+        with self._cond:
+            return CacheStats(
+                capacity=self._capacity,
+                resident=len(self._records),
+                reserved=len(self._loading),
+                pinned=sum(1 for entry in self._records.values() if entry.pins() > 0),
+            )
+
+    # ---- temporary artifacts -------------------------------------------
+
+    def register_temp_artifact(self, path: str, *, model_id: str = "") -> None:
+        """Delete ``path`` when its last owner is disposed.
+
+        With ``model_id`` (resident or being loaded) the record owns the file;
+        without it the cache owns it until shutdown. A path registered by several
+        owners is deleted only after all of them are gone.
+        """
+
+        path = os.fspath(path)
+        with self._cond:
+            if self._state == "stopped":
+                raise CacheShutdownError("model cache is shut down")
+            if model_id and model_id not in self._records:
+                if not any(p.model_id == model_id for p in self._loading.values()):
+                    raise UnknownModelError(f"model {model_id} is not resident or loading")
+            self._artifacts.setdefault(path, set()).add(model_id)
+
+    def _release_artifacts(self, owner: str) -> None:
+        with self._cond:
+            doomed = []
+            for path, owners in list(self._artifacts.items()):
+                if owner in owners:
+                    owners.discard(owner)
+                    if not owners:
+                        del self._artifacts[path]
+                        doomed.append(path)
+        for path in doomed:
+            try:
+                os.unlink(path)
+                logger.debug("deleted temporary artifact %s", path)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                logger.warning(
+                    "could not delete temporary artifact %s: %s", path, type(exc).__name__
+                )
+
+    # ---- shutdown -------------------------------------------------------
+
+    def shutdown(self, *, drain_timeout_s: Optional[float] = None) -> None:
+        """Stop new work, close sessions, drain leases and loads, dispose every record.
+
+        Waits for execution leases and in-progress loads without limit when
+        ``drain_timeout_s`` is None. Records still leased after the timeout are
+        disposed with a warning. Safe to call more than once.
+        """
+
+        with self._cond:
+            if self._state != "running":
+                while self._state != "stopped":
+                    self._cond.wait()
+                return
+            self._state = "draining"
+            now = self._clock()
+            for sid in list(self._sessions):
+                self._close_locked(sid, "shutdown", now)
+            self._cond.notify_all()
+            deadline = (
+                None if drain_timeout_s is None else time.monotonic() + max(0.0, drain_timeout_s)
+            )
+            while self._live_executions > 0 or self._loading:
+                if deadline is None:
+                    self._cond.wait()
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._cond.wait(remaining)
+            entries = list(self._records.values())
+            self._records.clear()
+            self._by_key.clear()
+            live = self._live_executions
+        if live:
+            logger.warning(
+                "model cache shutdown: drain timed out with %d live execution lease(s)", live
+            )
+        for entry in entries:
+            if entry.executions:
+                logger.warning(
+                    "disposing model %s with %d live execution lease(s)",
+                    entry.record.model_id,
+                    len(entry.executions),
+                )
+            self._dispose_record(entry.record)
+        self._release_artifacts("")
+        with self._cond:
+            self._state = "stopped"
+            self._cond.notify_all()
+        logger.info("model cache shut down (%d model(s) disposed)", len(entries))
+
+    # ---- internals (lock held unless noted) ------------------------------
+
+    def _check_running(self) -> None:
+        if self._state != "running":
+            raise CacheShutdownError("model cache is shut down")
+
+    def _remove_entry(self, model_id: str) -> _Entry:
+        entry = self._records.pop(model_id)
+        if self._by_key.get(entry.key) == model_id:
+            del self._by_key[entry.key]
+        return entry
+
+    def _lru_evictable(self) -> Optional[_Entry]:
+        for entry in self._records.values():
+            if entry.evictable():
+                return entry
+        return None
+
+    def _live_tombstone(self, session_id: str, now: float) -> Optional[Tuple[str, float]]:
+        tombstone = self._tombstones.get(session_id)
+        if tombstone is not None and now - tombstone[1] > self._ttl:
+            del self._tombstones[session_id]
+            return None
+        return tombstone
+
+    def _open_session_or_raise(self, session_id: str, now: float) -> _Session:
+        session = self._sessions.get(session_id)
+        if session is not None:
+            return session
+        tombstone = self._live_tombstone(session_id, now)
+        if tombstone is not None:
+            raise SessionClosedError(f"session {session_id} is {tombstone[0]}")
+        raise UnknownSessionError(f"session {session_id} was not opened")
+
+    def _session_precheck(
+        self, session_id: str, *, key: Optional[ModelCacheKey] = None, model_id: str = ""
+    ) -> Optional[SessionLease]:
+        """Tombstone, conflict and idempotent-retry checks for open_session."""
+
+        now = self._clock()
+        tombstone = self._live_tombstone(session_id, now)
+        if tombstone is not None:
+            raise SessionClosedError(f"session {session_id} is {tombstone[0]}")
+        session = self._sessions.get(session_id)
+        if session is None:
+            return None
+        same = (key is not None and session.key == key) or (
+            model_id and session.model_id == model_id
+        )
+        if not same:
+            raise SessionConflictError(f"session {session_id} is bound to model {session.model_id}")
+        session.last_activity = now
+        self._records.move_to_end(session.model_id)
+        return SessionLease(
+            session_id=session_id, model_id=session.model_id, cache_hit=True, reused=True
+        )
+
+    def _bind_session(self, session_id: str, entry: _Entry) -> None:
+        model_id = entry.record.model_id
+        self._sessions[session_id] = _Session(session_id, model_id, entry.key, self._clock())
+        entry.sessions.add(session_id)
+        self._records.move_to_end(model_id)
+        logger.info("session %s opened on model %s", session_id, model_id)
+
+    def _close_locked(self, session_id: str, reason: str, now: float) -> bool:
+        session = self._sessions.pop(session_id, None)
+        if session is None:
+            return False
+        entry = self._records.get(session.model_id)
+        if entry is not None:
+            entry.sessions.discard(session_id)
+        self._tombstones[session_id] = (reason, now)
+        self._cond.notify_all()
+        return True
+
+    def _dispose_record(self, record: ModelRecord) -> None:
+        """Dispose outside the global lock."""
+
+        try:
+            record.dispose()
+        except Exception as exc:
+            logger.warning("disposing model %s failed: %s", record.model_id, type(exc).__name__)
+
+
+def _check_key(key: object) -> None:
+    if not isinstance(key, ModelCacheKey):
+        raise TypeError("key must be a ModelCacheKey")
+
+
+def _check_session_id(session_id: object) -> None:
+    if not isinstance(session_id, str) or not session_id:
+        raise ValueError("session_id must be a non-empty string")
+
+
+__all__ = [
+    "SESSION_CLOSE_REASONS",
+    "ModelCacheError",
+    "CacheExhaustedError",
+    "ModelInUseError",
+    "UnknownModelError",
+    "UnknownSessionError",
+    "SessionConflictError",
+    "SessionClosedError",
+    "ModelLoadError",
+    "CacheShutdownError",
+    "ModelCacheKey",
+    "cache_key_from_spec",
+    "ModelRecord",
+    "LoadResult",
+    "SessionLease",
+    "ExecutionLease",
+    "CacheStats",
+    "ModelCache",
+]

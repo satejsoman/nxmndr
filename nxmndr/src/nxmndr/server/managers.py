@@ -4,44 +4,154 @@
 """Server-side managers for model lifecycle and RPC worker orchestration.
 
 This module extracts logic from server/server.py to improve separation of concerns.
+The bounded model cache and its session/execution leases live in ``model_cache``;
+the lease API names stay importable from here (rebuild contract, chunk 1a).
 """
 
 from __future__ import annotations
 
 import multiprocessing
+import time
 import uuid
-from pathlib import Path
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from functools import partial
+from types import SimpleNamespace
+from typing import Callable, Dict, List, Optional
 
 import torch.distributed.rpc as torch_rpc
 
-from ..inference import InferenceSession
 from ..logging import get_logger
+from .model_cache import (
+    SESSION_CLOSE_REASONS,
+    CacheExhaustedError,
+    CacheShutdownError,
+    CacheStats,
+    ExecutionLease,
+    LoadResult,
+    ModelCache,
+    ModelCacheError,
+    ModelCacheKey,
+    ModelInUseError,
+    ModelLoadError,
+    ModelRecord,
+    SessionClosedError,
+    SessionConflictError,
+    SessionLease,
+    UnknownModelError,
+    UnknownSessionError,
+    cache_key_from_spec,
+)
 
 logger = get_logger(__name__)
 
 
-@dataclass
-class ModelRecord:
-    model: Optional[object]
-    backend: str
-    metadata: Dict[str, object]
-    spec: Optional[object] = None
-    # Multi-device support: device_id -> model instance
-    device_models: Dict[str, object] = field(default_factory=dict)
+def _load_model_object(model_spec, provider):
+    """Construct the model for ``model_spec`` without the process-global model cache.
 
-
-class ModelManager:
-    """Manage model specifications, loading, unloading, and metadata tracking.
-
-    Supports loading models to multiple devices for parallel inference.
+    ``InferenceSession`` consults ``nxmndr.memory.get_model_cache()``, a second
+    LRU keyed only by spec class, path/repo and name. Going through it here would
+    keep evicted models alive and hand back a model loaded for another revision
+    or token, so the local path calls the registered loader directly.
     """
 
-    def __init__(self, provider):
+    from ..inference import InferenceSession  # registers the built-in loaders
+    from ..models import get_loader
+    from ..validation import validate_model_spec
+
+    if hasattr(provider, "load_spec"):
+        # Remote and RPC providers load through the provider, not in this process.
+        return InferenceSession(model_spec, provider).model
+    validate_model_spec(model_spec)
+    loader = get_loader(model_spec)
+    if loader is None:
+        raise ValueError(f"No registered model loader for spec type: {type(model_spec).__name__}")
+    return loader(model_spec, provider, SimpleNamespace(model_spec=model_spec))
+
+
+def build_model_record(
+    provider,
+    model_spec,
+    key: ModelCacheKey,
+    metadata: Dict[str, object],
+    device_plan: Optional[List[Dict[str, str]]] = None,
+) -> ModelRecord:
+    """Default loader: load ``model_spec``, optionally replicating to multiple devices.
+
+    Args:
+        provider: The inference provider models are loaded for
+        model_spec: The model specification to load
+        key: The cache key of the spec (unused here; part of the loader signature)
+        metadata: Record metadata; ``metadata["model_id"]`` is the assigned model_id
+        device_plan: Optional list of device dicts with 'id' keys (e.g., [{'id': 'cuda:0'}, {'id': 'cuda:1'}])
+    """
+    model_type = model_spec.__class__.__name__
+    model_id = metadata.get("model_id", "")
+
+    if model_type == "PytorchModelSpec":
+        # Defer actual model object creation to RPC worker path
+        return ModelRecord(None, "pytorch", metadata, model_spec)
+    if model_type not in ("OnnxModelSpec", "HuggingFaceModelSpec"):
+        raise ValueError(f"Unsupported spec type {model_type}")
+    model = _load_model_object(model_spec, provider)
+    backend = model_type[:-9].lower()
+    record = ModelRecord(model, backend, metadata, model_spec)
+
+    # Multi-device replication for ONNX/HuggingFace models
+    if device_plan and len(device_plan) > 0:
+        primary_device = device_plan[0].get("id", "cpu")
+        record.device_models[primary_device] = model
+
+        # Replicate to additional devices
+        for device_info in device_plan[1:]:
+            device_id = device_info.get("id", "cpu")
+            try:
+                if backend == "huggingface" and hasattr(model, "to"):
+                    # For HuggingFace models, create a copy and move to device
+                    import copy
+
+                    device_model = copy.deepcopy(model)
+                    device_model.to(device_id)
+                    record.device_models[device_id] = device_model
+                    logger.info(f"Replicated model {model_id} to {device_id}")
+                else:
+                    # For ONNX, we typically can't replicate easily
+                    # Just reference the same model for now
+                    record.device_models[device_id] = model
+            except Exception as e:
+                logger.warning(f"Failed to replicate model to {device_id}: {e}")
+                record.device_models[device_id] = model
+    logger.info(
+        f"ModelManager loaded model_id={model_id} type={model_type} devices={list(record.device_models.keys())}"
+    )
+    return record
+
+
+class ModelManager(ModelCache):
+    """Bounded LRU of loaded models with session and execution leases.
+
+    Supports loading models to multiple devices for parallel inference. ``loader``
+    defaults to ``build_model_record`` bound to ``provider``; tests inject their own.
+    """
+
+    def __init__(
+        self,
+        provider,
+        *,
+        capacity: int = 10,
+        session_ttl_s: float = 3600.0,
+        clock: Callable[[], float] = time.monotonic,
+        loader: Optional[Callable[..., ModelRecord]] = None,
+    ):
         self._provider = provider
-        self._models: Dict[str, ModelRecord] = {}
-        self._temp_artifacts: set[str] = set()
+        super().__init__(
+            loader=loader if loader is not None else partial(build_model_record, provider),
+            capacity=capacity,
+            session_ttl_s=session_ttl_s,
+            clock=clock,
+        )
+
+    # ---- Deprecated pre-lease entry points -------------------------------
+    # server.py on the rebuild baseline still calls these. Chunk 1 replaces them
+    # with load()/acquire_execution(); remove them once server.py no longer does.
 
     def load_spec(
         self,
@@ -49,68 +159,20 @@ class ModelManager:
         metadata: Optional[Dict[str, object]] = None,
         device_plan: Optional[List[Dict[str, str]]] = None,
     ) -> str:
-        """Load a model spec, optionally replicating to multiple devices.
+        """Deprecated: load under a fresh model_id, as before the cache existed.
 
-        Args:
-            model_spec: The model specification to load
-            metadata: Optional metadata dict
-            device_plan: Optional list of device dicts with 'id' keys (e.g., [{'id': 'cuda:0'}, {'id': 'cuda:1'}])
-
-        Returns:
-            The assigned model_id
+        The key is unique per call, so nothing is reused; the record still takes a
+        cache slot and can be evicted when unpinned.
         """
-        model_type = model_spec.__class__.__name__
-        model_id = uuid.uuid4().hex
-        record_meta = dict(metadata or {})
-        record_meta.setdefault("model_id", model_id)
-
-        if model_type == "PytorchModelSpec":
-            # Defer actual model object creation to RPC worker path
-            self._models[model_id] = ModelRecord(None, "pytorch", record_meta, model_spec)
-        elif model_type in ("OnnxModelSpec", "HuggingFaceModelSpec"):
-            session = InferenceSession(model_spec, self._provider)
-            backend = model_type[:-9].lower()
-            record = ModelRecord(session.model, backend, record_meta, model_spec)
-
-            # Multi-device replication for ONNX/HuggingFace models
-            if device_plan and len(device_plan) > 0:
-                primary_device = device_plan[0].get("id", "cpu")
-                record.device_models[primary_device] = session.model
-
-                # Replicate to additional devices
-                for device_info in device_plan[1:]:
-                    device_id = device_info.get("id", "cpu")
-                    try:
-                        if backend == "huggingface" and hasattr(session.model, "to"):
-                            # For HuggingFace models, create a copy and move to device
-                            import copy
-
-                            device_model = copy.deepcopy(session.model)
-                            device_model.to(device_id)
-                            record.device_models[device_id] = device_model
-                            logger.info(f"Replicated model {model_id} to {device_id}")
-                        else:
-                            # For ONNX, we typically can't replicate easily
-                            # Just reference the same model for now
-                            record.device_models[device_id] = session.model
-                    except Exception as e:
-                        logger.warning(f"Failed to replicate model to {device_id}: {e}")
-                        record.device_models[device_id] = session.model
-
-            self._models[model_id] = record
-        else:
-            raise ValueError(f"Unsupported spec type {model_type}")
-        logger.info(
-            f"ModelManager loaded model_id={model_id} type={model_type} devices={list((self._models[model_id].device_models or {}).keys())}"
-        )
-        return model_id
+        key = ModelCacheKey(format=type(model_spec).__name__, source=f"legacy:{uuid.uuid4().hex}")
+        return self.load(model_spec, key=key, metadata=metadata, device_plan=device_plan).model_id
 
     def get_model_for_device(self, model_id: str, device_id: str) -> Optional[object]:
-        """Get the model instance for a specific device.
+        """Deprecated: peek at a model without pinning it; use an ExecutionLease.
 
         Falls back to primary model if device-specific instance not available.
         """
-        record = self._models.get(model_id)
+        record = self.get(model_id)
         if record is None:
             return None
 
@@ -120,34 +182,6 @@ class ModelManager:
 
         # Fall back to primary model
         return record.model
-
-    def register_temp_artifact(self, path: str) -> None:
-        self._temp_artifacts.add(path)
-
-    def unload(self, model_id: str) -> bool:
-        if model_id in self._models:
-            del self._models[model_id]
-            remaining_onnx = any(rec.backend == "onnx" for rec in self._models.values())
-            if not remaining_onnx:
-                self._cleanup_temp_artifacts()
-            return True
-        return False
-
-    def _cleanup_temp_artifacts(self):
-        for p in list(self._temp_artifacts):
-            try:
-                Path(p).unlink(missing_ok=True)
-                logger.debug(f"Cleaned temp artifact {p}")
-            except OSError:
-                pass
-            finally:
-                self._temp_artifacts.discard(p)
-
-    def list_models(self):
-        return self._models.copy()
-
-    def get(self, model_id: str):
-        return self._models.get(model_id)
 
 
 class RpcWorkerManager:
@@ -194,3 +228,27 @@ class RpcWorkerManager:
 
     def is_alive(self) -> bool:
         return self._proc is not None and self._proc.is_alive()
+
+
+__all__ = [
+    "SESSION_CLOSE_REASONS",
+    "ModelCacheError",
+    "CacheExhaustedError",
+    "ModelInUseError",
+    "UnknownModelError",
+    "UnknownSessionError",
+    "SessionConflictError",
+    "SessionClosedError",
+    "ModelLoadError",
+    "CacheShutdownError",
+    "ModelCacheKey",
+    "cache_key_from_spec",
+    "ModelRecord",
+    "LoadResult",
+    "SessionLease",
+    "ExecutionLease",
+    "CacheStats",
+    "ModelManager",
+    "build_model_record",
+    "RpcWorkerManager",
+]
