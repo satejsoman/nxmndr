@@ -229,7 +229,6 @@ class _Pending:
         self.done = threading.Event()
         self.model_id = ""
         self.error: Optional[BaseException] = None
-        self.session_pins: List[str] = []
 
 
 class ModelManager:
@@ -262,7 +261,6 @@ class ModelManager:
         self._aux_pending: Dict[Tuple[str, str], threading.Event] = {}
         self._lease_ids = itertools.count(1)
         self._shutdown = False
-        self._all_records: List[ModelRecord] = []
 
     # -- helpers (lock held) --
     def _check_open_locked(self) -> None:
@@ -351,15 +349,14 @@ class ModelManager:
                 record.model_id = model_id
                 record.key = key
                 self._records[model_id] = record
-                self._all_records.append(record)
                 self._by_key[key] = model_id
                 self._pins[model_id] = 0
                 self._reserved -= 1
                 del self._loading[key]
+                pending.model_id = model_id
+                pending.done.set()  # release coalesced waiters before anything can raise
                 if pin_session is not None:
                     self._pin_session_locked(pin_session, model_id, key)
-                pending.model_id = model_id
-                pending.done.set()
                 return model_id, False
 
     def _pin_session_locked(self, session_id, model_id, key) -> None:

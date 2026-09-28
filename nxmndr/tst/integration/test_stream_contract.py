@@ -575,3 +575,53 @@ def test_capabilities_advertise_stream_context_and_limits(tmp_path, loader):
         with pytest.raises(InferenceGrpcError) as err:
             _open(c, "sess-too-wide", mid, chunk_bytes=ceiling + 1)
         assert err.value.code == grpc.StatusCode.INVALID_ARGUMENT
+
+
+def test_serve_stops_grpc_then_shuts_down_the_model_cache(tmp_path, loader, monkeypatch):
+    from nxmndr.server import managers, server
+
+    created = []
+
+    class _Capturing(server.InferenceService):
+        def __init__(self, **kwargs):
+            kwargs["model_manager"] = managers.ModelManager(None, capacity=2, loader=loader)
+            super().__init__(**kwargs)
+            created.append(self)
+
+    class _Ctx:
+        def set_code(self, code):
+            raise AssertionError(f"unexpected status {code}")
+
+        def set_details(self, details):
+            pass
+
+    monkeypatch.setattr(server, "InferenceService", _Capturing)
+    started, stop = threading.Event(), threading.Event()
+    thread = threading.Thread(
+        target=server.serve,
+        kwargs=dict(port=0, model_cache_dir=tmp_path, startup_event=started, stop_event=stop,
+                    max_cores=1, stop_grace=1.0),
+    )
+    thread.start()
+    assert started.wait(30)
+    svc = created[0]
+    load = svc.LoadModel(
+        inference_pb2.LoadModelRequest(
+            spec=inference_pb2.ModelSpec(format=inference_pb2.ONNX, source="double://seg")
+        ),
+        _Ctx(),
+    )
+    opened = svc.OpenSession(
+        inference_pb2.OpenSessionRequest(
+            session_id="sess-serve", spec=inference_pb2.ModelSpec(model_id=load.model_id)
+        ),
+        _Ctx(),
+    )
+    assert opened.status == "ok"
+
+    stop.set()
+    thread.join(timeout=30)
+    assert not thread.is_alive()
+    assert svc._session_state("sess-serve") == "shutdown"
+    with pytest.raises(managers.CacheShutdownError):
+        svc.model_manager.acquire_execution(model_id=load.model_id)
