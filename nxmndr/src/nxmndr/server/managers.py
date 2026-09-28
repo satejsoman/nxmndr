@@ -149,6 +149,26 @@ class ModelManager(ModelCache):
         )
 
 
+def _run_rpc_worker(model_spec, master_addr: str, master_port: int) -> None:
+    """Process target of the PyTorch RPC worker.
+
+    Module level so the ``spawn`` start method (the default on macOS and Windows)
+    can pickle it; a nested function cannot be pickled. The worker module is
+    imported in the child only.
+    """
+
+    from .rpc_worker import run_worker
+
+    run_worker(
+        "worker",
+        model_spec,
+        rank=1,
+        world_size=2,
+        master_addr=master_addr,
+        master_port=master_port,
+    )
+
+
 class RpcWorkerManager:
     """Manage lifecycle of a single RPC worker process for PyTorch models."""
 
@@ -159,20 +179,11 @@ class RpcWorkerManager:
         self, model_spec, *, master_addr: str = "127.0.0.1", master_port: int = 29500
     ):
         if self._proc is None or not self._proc.is_alive():
-
-            def _start():
-                from .rpc_worker import run_worker
-
-                run_worker(
-                    "worker",
-                    model_spec,
-                    rank=1,
-                    world_size=2,
-                    master_addr=master_addr,
-                    master_port=master_port,
-                )
-
-            self._proc = multiprocessing.Process(target=_start, daemon=True)
+            self._proc = multiprocessing.Process(
+                target=_run_rpc_worker,
+                args=(model_spec, master_addr, master_port),
+                daemon=True,
+            )
             self._proc.start()
             logger.info("RpcWorkerManager started worker process")
 

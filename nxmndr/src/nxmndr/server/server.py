@@ -44,6 +44,7 @@ import threading
 import time
 import uuid
 import random
+import re
 from concurrent import futures
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -137,13 +138,29 @@ def _await_rpc_worker_ready(timeout: float = 5.0, poll: float = 0.1) -> bool:
     return False
 
 
+# Invocation metadata keys whose values are never logged (credential-like).
+_CREDENTIAL_METADATA_KEY = re.compile(
+    r"authorization|cookie|token|key|secret|password", re.IGNORECASE
+)
+
+
+def _loggable_metadata(metadata) -> Dict[str, object]:
+    """Invocation metadata with the value of every credential-like key redacted."""
+
+    return {
+        key: "<redacted>" if _CREDENTIAL_METADATA_KEY.search(key) else value
+        for key, value in (metadata or [])
+    }
+
+
 class LoggingInterceptor(grpc.ServerInterceptor):
-    """Interceptor to log all incoming gRPC requests."""
+    """Interceptor to log all incoming gRPC requests (credential values redacted)."""
 
     def intercept_service(self, continuation, handler_call_details):
         logger.debug(
-            f"gRPC request: method={handler_call_details.method}, "
-            f"metadata={dict(handler_call_details.invocation_metadata or [])}"
+            "gRPC request: method=%s, metadata=%s",
+            handler_call_details.method,
+            _loggable_metadata(handler_call_details.invocation_metadata),
         )
         return continuation(handler_call_details)
 
@@ -1296,6 +1313,59 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
         self.model_manager.shutdown(drain_timeout_s=grace)
 
 
+def create_server(
+    host: str = "127.0.0.1",
+    port: int = 0,
+    *,
+    model_cache_dir: str | Path | None = None,
+    max_cores: int = 4,
+):
+    """Build, bind and start the gRPC inference server without blocking.
+
+    Args:
+            host: address to bind; loopback by default. ``serve()`` passes ``"[::]"``.
+                An IPv6 address needs brackets.
+            port: TCP port; 0 picks a free ephemeral port.
+            model_cache_dir, max_cores: as for ``InferenceService``.
+
+    Returns:
+            ``(server, bound_port, service)``: the started ``grpc.Server``, the port it
+            is bound to and its ``InferenceService``. Stop it with ``stop_server``.
+
+    Raises:
+            RuntimeError: the address cannot be bound (grpcio raises it).
+    """
+    cpu_count = os.cpu_count() or 1
+    server_workers = max(1, min(int(max_cores or 4), cpu_count))
+    server = grpc.server(
+        futures.ThreadPoolExecutor(max_workers=server_workers),
+        interceptors=[LoggingInterceptor()],
+        options=GRPC_OPTIONS,
+    )
+    service = InferenceService(model_cache_dir=model_cache_dir, max_cores=max_cores)
+    inference_pb2_grpc.add_InferenceServiceServicer_to_server(service, server)
+    try:
+        bound_port = server.add_insecure_port(f"{host}:{port}")
+    except BaseException:
+        service.shutdown(grace=0)
+        raise
+    server.start()
+    return server, bound_port, service
+
+
+def stop_server(server, service, *, grace: float | None = SERVER_STOP_GRACE_SECONDS) -> None:
+    """Stop a server from ``create_server``: gRPC first, then the model cache.
+
+    New RPCs are refused and running ones get ``grace`` seconds (``server.stop``).
+    Then ``service.model_manager.shutdown(drain_timeout_s=grace)`` closes every
+    session, waits at most ``grace`` seconds for execution leases to drain and
+    disposes every model. ``grace=None`` aborts running RPCs at once and waits for
+    the leases without limit.
+    """
+    server.stop(grace).wait()
+    service.shutdown(grace=grace)
+
+
 def serve(
     port: int = 50051,
     *,
@@ -1317,18 +1387,9 @@ def serve(
     Returns:
             The actual bound port (useful if port=0 was passed).
     """
-    cpu_count = os.cpu_count() or 1
-    server_workers = max(1, min(int(max_cores or 4), cpu_count))
-    server = grpc.server(
-        futures.ThreadPoolExecutor(max_workers=server_workers),
-        interceptors=[LoggingInterceptor()],
-        options=GRPC_OPTIONS,
+    server, bound_port, service = create_server(
+        "[::]", port, model_cache_dir=model_cache_dir, max_cores=max_cores
     )
-    service = InferenceService(model_cache_dir=model_cache_dir, max_cores=max_cores)
-    inference_pb2_grpc.add_InferenceServiceServicer_to_server(service, server)
-
-    bound_port = server.add_insecure_port(f"[::]:{port}")
-    server.start()
     logger.info(f"gRPC inference server started on port {bound_port}")
     if startup_event is not None:
         startup_event.set()
@@ -1345,10 +1406,7 @@ def serve(
     except KeyboardInterrupt:
         logger.info("gRPC server interrupted")
     finally:
-        # Stop accepting RPCs, give running ones the grace period, then close sessions and
-        # dispose models once their execution leases have drained.
-        server.stop(stop_grace).wait()
-        service.shutdown(grace=stop_grace)
+        stop_server(server, service, grace=stop_grace)
     return bound_port
 
 
