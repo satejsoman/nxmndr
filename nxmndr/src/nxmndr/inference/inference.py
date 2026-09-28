@@ -729,8 +729,12 @@ def load_huggingface(spec: HuggingFaceModelSpec, provider, session):
         target_device = provider.device if provider.device != "auto" else (
             "cuda" if torch.cuda.is_available() else "cpu"
         )
-        model.to(target_device)
-        logger.info("HuggingFace model %s placed on %s", spec.repo_id, target_device)
+        if callable(getattr(model, "to", None)):
+            model.to(target_device)
+            logger.info("HuggingFace model %s placed on %s", spec.repo_id, target_device)
+        else:
+            # Remote-code models need not be torch modules; they stay where they loaded.
+            logger.debug("HuggingFace model %s has no .to(); device move skipped", spec.repo_id)
         return HuggingFaceModel(model, processor, provider, repo_path=str(repo_path))
     elif isinstance(provider, RemoteInferenceProvider):
         return RemoteModel(provider)

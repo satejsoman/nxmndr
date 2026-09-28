@@ -523,6 +523,64 @@ def test_aux_resource_failure_is_not_cached():
     assert len(attempts) == 2
 
 
+class _Disposable:
+    """Records each dispose()/close() call and the thread it ran in."""
+
+    def __init__(self, calls, name, *, has_dispose=True, has_close=True, fail=False):
+        self._calls, self._name, self._fail = calls, name, fail
+        if has_dispose:
+            self.dispose = lambda: self._hook("dispose")
+        if has_close:
+            self.close = lambda: self._hook("close")
+
+    def _hook(self, hook):
+        self._calls.append((self._name, hook, threading.get_ident()))
+        if self._fail:
+            raise RuntimeError(f"{self._name} {hook} failed")
+
+
+def test_aux_resources_are_disposed_once_in_the_disposing_thread(caplog):
+    manager, _, _ = make_manager()
+    a = manager.load(spec(), key=key("A")).model_id
+    calls = []
+    made = {
+        "both@cpu": _Disposable(calls, "both"),  # dispose() wins over close()
+        "close-only@cpu": _Disposable(calls, "close-only", has_dispose=False),
+        "failing@cpu": _Disposable(calls, "failing", fail=True),
+        "plain@cpu": _Resource(),  # neither hook: only the reference is dropped
+    }
+    with manager.acquire_execution(model_id=a) as lease:
+        for name, resource in made.items():
+            assert lease.resource(name, lambda r=resource: r) is resource
+    assert calls == []  # nothing is disposed while the record lives
+
+    caplog.set_level(logging.WARNING)
+    assert manager.unload(a) is True  # the failing resource does not raise here
+    me = threading.get_ident()
+    assert sorted(calls) == sorted(
+        [("both", "dispose", me), ("close-only", "close", me), ("failing", "dispose", me)]
+    )
+    assert "'failing@cpu' failed" in caplog.text  # logged instead
+    manager.shutdown()
+    assert len(calls) == 3  # never disposed a second time
+
+
+def test_aux_resource_finished_after_disposal_is_disposed_by_its_creator():
+    manager, _, _ = make_manager()
+    a = manager.load(spec(), key=key("A")).model_id
+    calls = []
+    with manager.acquire_execution(model_id=a) as lease:
+        record = lease.record
+
+        def factory():
+            record.dispose()  # the record is disposed while the factory runs
+            return _Disposable(calls, "late")
+
+        with pytest.raises(ModelCacheError):
+            lease.resource("late@cpu", factory)
+    assert [(name, hook) for name, hook, _ in calls] == [("late", "dispose")]
+
+
 # ---------------------------------------------------------------------------
 # Credentials
 # ---------------------------------------------------------------------------

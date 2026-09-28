@@ -241,6 +241,29 @@ def _redact(text: str, *values: str) -> str:
     return text
 
 
+def _dispose_resource(model_id: str, name: str, resource: object) -> None:
+    """Call the resource's ``dispose()``, else its ``close()``, if it has one.
+
+    Runs in the calling thread. An exception is logged, never raised, so one
+    failing resource does not stop the disposal of the others.
+    """
+
+    for hook in ("dispose", "close"):
+        method = getattr(resource, hook, None)
+        if callable(method):
+            try:
+                method()
+            except Exception as exc:
+                logger.warning(
+                    "model %s: %s() of resource %r failed: %s",
+                    model_id,
+                    hook,
+                    name,
+                    type(exc).__name__,
+                )
+            return
+
+
 # ---------------------------------------------------------------------------
 # Records, results and leases
 # ---------------------------------------------------------------------------
@@ -325,18 +348,24 @@ class ModelRecord:
                 self._resources[name] = value
             self._cond.notify_all()
         if late:
+            # Never part of the record, so the record's disposal did not see it.
+            _dispose_resource(self.model_id, name, value)
             del value
             raise ModelCacheError(f"model {self.model_id} was disposed while {name!r} loaded")
         return value
 
     def dispose(self) -> None:
-        """Release replicas, aux resources and owned temporary artifacts. Idempotent."""
+        """Release replicas, aux resources and owned temporary artifacts. Idempotent.
+
+        Each aux resource gets one ``dispose()`` call, or ``close()`` if it has no
+        ``dispose``, in the calling thread; failures are logged, not raised.
+        """
 
         with self._cond:
             if self._disposed:
                 return
             self._disposed = True
-            resources = list(self._resources.values())
+            resources = list(self._resources.items())
             self._resources.clear()
             finalizers = list(self._finalizers)
             self._finalizers.clear()
@@ -344,6 +373,8 @@ class ModelRecord:
         self.device_models.clear()
         self.model = None
         self.auth_token = ""
+        for name, resource in resources:
+            _dispose_resource(self.model_id, name, resource)
         del resources
         for finalizer in finalizers:
             try:
