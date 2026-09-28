@@ -1597,7 +1597,8 @@ def main():
     parser.add_argument(
         "--model-cache-dir",
         default="",
-        help="Directory where downloaded model artifacts are stored (default: ~/.cache/nxmndr/models)",
+        help="Directory where downloaded model artifacts are stored "
+        "(default: $NXMNDR_CACHE_DIR/models, else ~/.cache/nxmndr/models)",
     )
     parser.add_argument(
         "--log-level",
