@@ -24,10 +24,15 @@ HERE = Path(__file__).resolve().parent
 SRC = HERE.parent / "src"
 
 # The host import surface frozen in the rebuild contracts (HOST_WIRE_MODULES),
-# plus the generated stub types and the schema they were generated from.
+# plus the generated stub types and the schema they were generated from, plus the
+# Hugging Face Hub search helpers and the model-file constants they use
+# (wave2-chunk-4.md [7]: the plugin can import one search implementation).
 WIRE_FILES = (
     "nxmndr/__init__.py",
     "nxmndr/client.py",
+    "nxmndr/constants.py",
+    "nxmndr/huggingface/__init__.py",
+    "nxmndr/huggingface/search.py",
     "nxmndr/session_protocol.py",
     "nxmndr/tensor_bundle.py",
     "nxmndr/inference/__init__.py",

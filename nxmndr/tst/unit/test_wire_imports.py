@@ -27,6 +27,9 @@ HOST_WIRE_MODULES = [
     "nxmndr.inference.inference_pb2",
     "nxmndr.inference.inference_pb2_grpc",
     "nxmndr.tensor_bundle",
+    "nxmndr.constants",
+    "nxmndr.huggingface",
+    "nxmndr.huggingface.search",
 ]
 BLOCKED = [
     "torch", "torchvision", "onnxruntime", "transformers", "ultralytics", "huggingface_hub",
@@ -53,8 +56,24 @@ PROBE = textwrap.dedent(
     import nxmndr.client as c
     c.InferenceGrpcClient("127.0.0.1:1").close()
     import nxmndr
+    from nxmndr.huggingface import search
+    found = search.HFModelSearchResult.from_dict(
+        {"modelId": "org/m", "siblings": [{"rfilename": "a.bin"}, {"rfilename": "model.safetensors"}]})
+    lazy = {}
+    for name, call in (("hub", lambda: search.hf_model_supports_inference("org/m")),
+                       ("spec", lambda: found.to_spec())):
+        try:
+            call()
+            lazy[name] = "ran"
+        except ImportError as exc:
+            lazy[name] = "ImportError"
     print(json.dumps({"file": nxmndr.__file__,
-                      "loaded": sorted(m for m in sys.modules if m.startswith("nxmndr"))}))
+                      "loaded": sorted(m for m in sys.modules if m.startswith("nxmndr")),
+                      "ml_loaded": sorted(m for m in ("torch", "transformers", "huggingface_hub")
+                                          if m in sys.modules),
+                      "weights": search._select_primary_weight_file(found.siblings),
+                      "extensions": sorted(nxmndr.MODEL_EXTENSIONS),
+                      "lazy": lazy}))
     """
 )
 
@@ -76,6 +95,11 @@ def test_wire_modules_import_without_ml_runtime():
     loaded = set(report["loaded"])
     assert set(HOST_WIRE_MODULES) <= loaded
     assert not loaded & set(NEVER_LOADED)
+    assert report["ml_loaded"] == []  # no torch, transformers or huggingface_hub
+    assert report["weights"] == "model.safetensors"
+    assert ".onnx" in report["extensions"]
+    # the ML-dependent helpers import lazily and fail loudly without the ML runtime
+    assert report["lazy"] == {"hub": "ImportError", "spec": "ImportError"}
 
 
 def test_image_utils_reexports_the_pil_free_codec():

@@ -34,13 +34,17 @@ class Blocker(importlib.abc.MetaPathFinder):
 sys.meta_path.insert(0, Blocker())
 import numpy as np
 import nxmndr, nxmndr.client, nxmndr.session_protocol, nxmndr.tensor_bundle
+import nxmndr.constants, nxmndr.huggingface.search
 from nxmndr.inference import inference_pb2, inference_pb2_grpc
 bundle = nxmndr.tensor_bundle.pack_tensor_bundle({"mask": np.arange(6, dtype=np.uint16)})
 print(json.dumps({
     "file": nxmndr.__file__,
+    "search_file": nxmndr.huggingface.search.__file__,
     "stub": hasattr(inference_pb2_grpc, "InferenceServiceStub"),
     "roundtrip": nxmndr.tensor_bundle.unpack_tensor_bundle(bundle)["mask"].tolist(),
     "has_runtime": importlib.util.find_spec("nxmndr.inference.inference") is not None,
+    "has_models": importlib.util.find_spec("nxmndr.models") is not None,
+    "ml_loaded": sorted(m for m in ("torch", "transformers", "huggingface_hub") if m in sys.modules),
 }))
 """
 
@@ -58,7 +62,7 @@ def test_wheel_contains_exactly_the_wire_modules(tmp_path):
     assert "Name: nxmndr-wire" in metadata
     assert f"Version: {nxmndr.__version__}" in metadata
     requires = sorted(line.split(": ", 1)[1] for line in metadata.splitlines() if line.startswith("Requires-Dist"))
-    assert requires == ["grpcio>=1.76.0", "numpy", "protobuf<7,>=6.31.1"]
+    assert requires == ["grpcio>=1.76.0", "numpy", "protobuf<7,>=6.31.1", "requests"]
 
     unpacked = tmp_path / "site"
     with zipfile.ZipFile(wheel) as zf:
@@ -74,5 +78,8 @@ def test_wheel_contains_exactly_the_wire_modules(tmp_path):
     assert out.returncode == 0, out.stderr
     report = json.loads(out.stdout.strip().splitlines()[-1])
     assert report["file"].startswith(str(unpacked))
+    assert report["search_file"].startswith(str(unpacked))
     assert report["stub"] and report["roundtrip"] == [0, 1, 2, 3, 4, 5]
     assert report["has_runtime"] is False  # the wheel carries no ML runtime module
+    assert report["has_models"] is False
+    assert report["ml_loaded"] == []
