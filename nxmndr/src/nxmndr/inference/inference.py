@@ -35,6 +35,7 @@ from ..models import (
     TorchHubModelSpec,
 )
 from ..models import get_loader, get_registry
+from ..models.ultralytics_yolo import UltralyticsModelSpec, load_ultralytics_yolo
 
 from . import inference_pb2, inference_pb2_grpc
 
@@ -779,3 +780,4 @@ registry.register_spec("torchhub", TorchHubModelSpec, load_torchhub)
 registry.register_spec("pytorch", PytorchModelSpec, load_pytorch)
 registry.register_spec("huggingface", HuggingFaceModelSpec, load_huggingface)
 registry.register_spec("onnx", OnnxModelSpec, load_onnx)
+registry.register_spec("ultralytics", UltralyticsModelSpec, load_ultralytics_yolo)

@@ -88,10 +88,10 @@ def build_model_record(
     if model_type == "PytorchModelSpec":
         # Defer actual model object creation to RPC worker path
         return ModelRecord(None, "pytorch", metadata, model_spec)
-    if model_type not in ("OnnxModelSpec", "HuggingFaceModelSpec"):
+    if model_type not in ("OnnxModelSpec", "HuggingFaceModelSpec", "UltralyticsModelSpec"):
         raise ValueError(f"Unsupported spec type {model_type}")
     model = _load_model_object(model_spec, provider)
-    backend = model_type[:-9].lower()
+    backend = model_type[:-9].lower()  # "onnx", "huggingface" or "ultralytics"
     record = ModelRecord(model, backend, metadata, model_spec)
 
     # Multi-device replication for ONNX/HuggingFace models

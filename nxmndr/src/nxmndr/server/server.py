@@ -62,6 +62,7 @@ from ..logging import get_logger
 
 from ..inference import LocalInferenceProvider, inference_pb2, inference_pb2_grpc
 from ..models import Model
+from ..models import ultralytics_yolo
 from ..models.sam import resolve_sam_capability
 from . import dispatch
 from . import managers
@@ -371,6 +372,21 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
             inference_pb2.TORCHHUB: "torchhub",
         }
         fmt_str = format_map[spec_msg.format]
+        # model_class ultralytics_yolo: a local YOLO checkpoint served by the instance-mask
+        # adapter (nxmndr.models.ultralytics_yolo), never by the PyTorch RPC worker.
+        yolo = (spec_msg.model_class or "").strip() == ultralytics_yolo.ULTRALYTICS_YOLO
+        if yolo and fmt_str not in ultralytics_yolo.ULTRALYTICS_FORMATS:
+            raise _LoadRequestError(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                f"model_class {ultralytics_yolo.ULTRALYTICS_YOLO} needs format PYTORCH or ONNX "
+                f"(a local checkpoint), not {fmt_str}",
+            )
+        if yolo and not ultralytics_yolo.ultralytics_available():
+            raise _LoadRequestError(
+                grpc.StatusCode.FAILED_PRECONDITION,
+                f"model_class {ultralytics_yolo.ULTRALYTICS_YOLO} needs the ultralytics package, "
+                "which this server's Python environment does not have",
+            )
         # Determine artifact path (write ONNX artifact bytes if provided); special handling for huggingface
         model_path = spec_msg.source or ""
         metadata_updates = {}
@@ -433,13 +449,13 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
                 )
         else:
             spec_dict = {
-                "type": fmt_str,
+                "type": ultralytics_yolo.ULTRALYTICS_BACKEND if yolo else fmt_str,
                 "model_path": model_path,
                 "name": spec_msg.name or "",
             }
-            if fmt_str in ("pytorch", "torchhub") and spec_msg.model_class:
+            if fmt_str in ("pytorch", "torchhub") and spec_msg.model_class and not yolo:
                 spec_dict["model_class"] = spec_msg.model_class
-        if fmt_str == "pytorch":
+        if fmt_str == "pytorch" and not yolo:
             # Start RPC driver before spawning worker to avoid rendezvous hangs
             try:
                 self._ensure_rpc_driver()
@@ -475,6 +491,9 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
         elif model_type in ("OnnxModelSpec", "HuggingFaceModelSpec"):
             # Pass device plan for multi-device model replication
             device_plan = self._device_plan
+        elif model_type == "UltralyticsModelSpec":
+            # One YOLO object serves every device; the adapter serializes its calls.
+            device_plan = None
         else:
             raise _LoadRequestError(grpc.StatusCode.INVALID_ARGUMENT, "Unsupported spec type")
         key = managers.cache_key_from_spec(spec_msg, artifact_sha256=artifact_sha)
@@ -500,6 +519,15 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
         record = self.model_manager.get(model_id)
         if record is None:
             return []
+        if record.backend == ultralytics_yolo.ULTRALYTICS_BACKEND:
+            # An instance model whose result covers the whole chip: the host assigns
+            # job-unique instance IDs and tiles with window = chip.
+            return [
+                inference_pb2.MetadataEntry(
+                    key="capability.instances", value=ultralytics_yolo.ULTRALYTICS_YOLO
+                ),
+                inference_pb2.MetadataEntry(key="capability.window", value="full_chip"),
+            ]
         capability = resolve_sam_capability(record.model, record.spec)
         if capability is None:
             return []
@@ -575,6 +603,10 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
                 format_enum = inference_pb2.ONNX
             elif mtype == "huggingface":
                 format_enum = inference_pb2.HUGGINGFACE
+            elif mtype == ultralytics_yolo.ULTRALYTICS_BACKEND:
+                format_enum = {"pytorch": inference_pb2.PYTORCH, "onnx": inference_pb2.ONNX}.get(
+                    str(metadata.get("format", "")), inference_pb2.MODEL_FORMAT_UNSPECIFIED
+                )
             task_enum = inference_pb2.TASK_TYPE_UNSPECIFIED
             task_value = metadata.get("task")
             if task_value is not None:
@@ -1294,6 +1326,14 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
             ),
             inference_pb2.CapabilityInfo(
                 key="stream_max_inflight", value=str(self._default_max_inflight)
+            ),
+            # model_class values loaded as instance models with full-chip results
+            # (comma-separated; empty when the adapter's package is missing).
+            inference_pb2.CapabilityInfo(
+                key="instance_model_classes",
+                value=ultralytics_yolo.ULTRALYTICS_YOLO
+                if ultralytics_yolo.ultralytics_available()
+                else "",
             ),
         ]
         if self._device_plan:

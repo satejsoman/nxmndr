@@ -32,6 +32,7 @@ from ..inference.image_utils import (
     prepare_segmentation_mask_with_confidence,
 )
 from ..models import sam as sam_support
+from ..models import ultralytics_yolo
 from ..tensor_bundle import pack_tensor_bundle
 
 # ---------------------------------------------------------------- stream context v1
@@ -220,8 +221,13 @@ def shape_result(
     options: Mapping[str, str],
     model_metadata: Mapping[str, object],
     logger=None,
+    instance_masks: bool = False,
 ) -> DispatchResult:
-    """Task shaping and serialization shared by every prediction path."""
+    """Task shaping and serialization shared by every prediction path.
+
+    ``instance_masks``: ``output`` is an ``(N, H, W)`` instance stack that stays as it
+    is (no argmax, no squeeze) as a ``segmentation_mask`` result.
+    """
 
     embeddings_from_model = None
     if isinstance(output, dict):
@@ -255,7 +261,9 @@ def shape_result(
         meta["result_type"] = "embeddings"
     elif task_type == "segmentation":
         try:
-            if return_confidence:
+            if instance_masks:
+                masks = np.ascontiguousarray(base_output)
+            elif return_confidence:
                 masks, confidence = prepare_segmentation_mask_with_confidence(base_output)
             else:
                 masks = prepare_segmentation_mask(base_output)
@@ -348,6 +356,47 @@ def _sam_variant_getter(lease, capability, device_id: str, torch_device: str):
     return get_variant
 
 
+# The embedding-only task names of shape_result.
+_EMBEDDING_TASKS = {"embedding", "embeddings", "feature", "features"}
+
+
+def _run_instance_prediction(model_obj, image, options, model_metadata, logger) -> DispatchResult:
+    """An instance-mask model (``ultralytics_yolo``): always a ``segmentation_mask``
+    result holding the ``(N, H, W)`` uint8 instance stack at the chip's size.
+
+    Embeddings and per-pixel confidence do not exist for these models, so
+    ``return_embeddings``, ``return_confidence`` and an embedding task are refused
+    (``malformed_options``) instead of being ignored. Option ``drop_group_masks``
+    (boolean, default true) controls the group-mask filter.
+    """
+
+    if (
+        option_bool(options, "return_embeddings")
+        or option_bool(options, "return_confidence")
+        or _task_type(options, model_metadata) in _EMBEDDING_TASKS
+    ):
+        raise MalformedOptionsError(
+            f"{ultralytics_yolo.ULTRALYTICS_YOLO} models return instance masks only; "
+            "embeddings and confidence are not available"
+        )
+    drop = True
+    if ultralytics_yolo.OPTION_DROP_GROUP_MASKS in options:
+        drop = option_bool(options, ultralytics_yolo.OPTION_DROP_GROUP_MASKS)
+    start = time.monotonic()
+    try:
+        masks = model_obj.predict(image, drop_group_masks=drop)
+    except ultralytics_yolo.InstanceInputError as exc:
+        raise MalformedPayloadError(str(exc)) from exc
+    infer_ms = (time.monotonic() - start) * 1000.0
+    shaping = dict(options)
+    shaping["task_type"] = "segmentation"
+    result = shape_result(
+        masks, options=shaping, model_metadata=model_metadata, logger=logger, instance_masks=True
+    )
+    result.metadata["latency_infer_ms"] = f"{infer_ms:.2f}"
+    return result
+
+
 def run_prediction(
     lease,
     *,
@@ -367,6 +416,10 @@ def run_prediction(
 
     record = lease.record
     model_metadata = record.metadata or {}
+    if record.backend == ultralytics_yolo.ULTRALYTICS_BACKEND:
+        return _run_instance_prediction(
+            lease.model_for_device(device_id), image, options, model_metadata, logger
+        )
     capability = sam_support.resolve_sam_capability(record.model, record.spec)
 
     start = time.monotonic()
