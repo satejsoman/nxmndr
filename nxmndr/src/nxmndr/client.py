@@ -1,12 +1,25 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
 
-"""High-level gRPC client for the nxmndr inference service."""
+"""High-level gRPC client for the nxmndr inference service.
+
+Host-side module: imports only the standard library, NumPy (1.x or 2.x), grpc and
+protobuf, and the generated bindings. It never imports the ML runtime.
+
+Streaming context v1: every message of a tile carries ``context["tile_id"]`` and,
+for session streams, ``context["session_id"]``. Per-tile inference options travel
+as ``context["opt.<name>"]`` on the tile's first message only; unprefixed keys are
+reserved. The declared dtype always describes the bytes actually sent.
+"""
 
 from __future__ import annotations
 
+import re
+import sys
+import threading
+import uuid
 from dataclasses import dataclass
-from typing import Iterable, Mapping, Optional, Sequence
+from typing import Callable, Dict, Iterable, Iterator, Mapping, Optional, Sequence
 
 import grpc
 import numpy as np
@@ -22,8 +35,107 @@ GRPC_OPTIONS = [
 ]
 
 
+# Stream context v1 (see module docstring).
+STREAM_CONTEXT_CAPABILITY = "stream_context_version"
+STREAM_CONTEXT_VERSION = "1"
+CONTEXT_SESSION_ID = "session_id"
+CONTEXT_TILE_ID = "tile_id"
+RESERVED_CONTEXT_KEYS = ("session_id", "tile_id", "batch_size")
+TILE_OPTION_PREFIX = "opt."
+_OPTION_NAME = re.compile(r"^[a-z][a-z0-9_]*$")
+
+# How often a ``cancel_fn`` callable is polled while a stream is blocked.
+CANCEL_POLL_SECONDS = 0.05
+
+# Deterministic rejections: retrying cannot succeed.
+_NON_RETRYABLE_CODES = frozenset(
+    {
+        grpc.StatusCode.INVALID_ARGUMENT,
+        grpc.StatusCode.NOT_FOUND,
+        grpc.StatusCode.ALREADY_EXISTS,
+        grpc.StatusCode.FAILED_PRECONDITION,
+        grpc.StatusCode.PERMISSION_DENIED,
+        grpc.StatusCode.UNAUTHENTICATED,
+        grpc.StatusCode.UNIMPLEMENTED,
+        grpc.StatusCode.CANCELLED,
+    }
+)
+
+
 class InferenceGrpcError(RuntimeError):
-    """Raised when a gRPC request to the inference service fails."""
+    """Raised when a gRPC request to the inference service fails.
+
+    ``code`` is the gRPC status code when the server returned one.
+    """
+
+    def __init__(self, message: str, *, code: Optional[grpc.StatusCode] = None) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def _rpc_error_parts(err) -> tuple:
+    details = getattr(err, "details", None)
+    message = details() if callable(details) else str(details or err)
+    code_fn = getattr(err, "code", None)
+    code = code_fn() if callable(code_fn) else None
+    return message, code
+
+
+def validate_option_name(name: str) -> str:
+    """Per-tile option names: ``^[a-z][a-z0-9_]*$`` and not a reserved context key."""
+
+    if not isinstance(name, str) or not _OPTION_NAME.match(name):
+        raise ValueError(f"option name {name!r} must match {_OPTION_NAME.pattern}")
+    if name in RESERVED_CONTEXT_KEYS:
+        raise ValueError(f"option name {name!r} is a reserved context key")
+    return name
+
+
+def encode_tile_context(
+    *,
+    tile_id: str,
+    session_id: str = "",
+    options: Optional[Mapping[str, object]] = None,
+) -> Dict[str, str]:
+    """``StreamPredictRequest.context`` for one message of a tile.
+
+    Pass ``options`` only for the tile's first message. ``None`` values are skipped;
+    other values are sent as ``str(value)``.
+    """
+
+    if not tile_id:
+        raise ValueError("tile_id is required")
+    ctx: Dict[str, str] = {CONTEXT_TILE_ID: str(tile_id)}
+    if session_id:
+        ctx[CONTEXT_SESSION_ID] = str(session_id)
+    for name, value in (options or {}).items():
+        if value is None:
+            continue
+        ctx[TILE_OPTION_PREFIX + validate_option_name(name)] = str(value)
+    return ctx
+
+
+def prepare_tensor(sample, dtype: Optional[str] = None) -> np.ndarray:
+    """C-contiguous little-endian array whose dtype is exactly what will be declared.
+
+    A ``dtype`` override casts the data when NumPy can do so without loss
+    (``np.can_cast(..., "safe")``); anything else is rejected, so bytes are never
+    relabelled with a dtype they do not have.
+    """
+
+    arr = np.asarray(sample)
+    if dtype is not None:
+        target = np.dtype(dtype)
+        if arr.dtype.newbyteorder("=") != target.newbyteorder("="):
+            if not np.can_cast(arr.dtype, target, casting="safe"):
+                raise ValueError(
+                    f"cannot send {arr.dtype} data as {target}: the cast is not lossless; "
+                    "convert the array explicitly before streaming"
+                )
+            arr = arr.astype(target)
+    if arr.dtype.byteorder == ">" or (arr.dtype.byteorder == "=" and sys.byteorder == "big"):
+        arr = arr.astype(arr.dtype.newbyteorder("<"))
+    return np.ascontiguousarray(arr)
 
 
 @dataclass
@@ -112,15 +224,17 @@ class InferenceGrpcClient:
                 return func()
             except grpc.RpcError as err:  # pragma: no cover - network dependent
                 last_err = err
+                _, code = _rpc_error_parts(err)
+                if code in _NON_RETRYABLE_CODES:
+                    break
                 # Reset channel on connection errors for reconnection
                 self._reset_channel()
                 if attempt >= self._max_attempts:
                     break
                 time.sleep(self._backoff_seconds * attempt)
         if last_err:
-            details = getattr(last_err, "details", None)
-            message = details() if callable(details) else str(details or last_err)
-            raise InferenceGrpcError(message) from last_err
+            message, code = _rpc_error_parts(last_err)
+            raise InferenceGrpcError(message, code=code) from last_err
         raise InferenceGrpcError("request failed")
 
     def close(self) -> None:
@@ -223,12 +337,12 @@ class InferenceGrpcClient:
         if tensor is None:
             raise ValueError("tensor is required")
 
-        array = np.ascontiguousarray(tensor)
+        array = prepare_tensor(tensor)
         request = inference_pb2.PredictRequest(
             model_id=str(model_id),
             input=array.tobytes(),
             shape=[int(dim) for dim in array.shape],
-            dtype=str(array.dtype),
+            dtype=array.dtype.name,
         )
 
         if options:
@@ -251,6 +365,16 @@ class InferenceGrpcClient:
         )
 
     # ---- Streaming & Sessions ----
+    def capabilities(self) -> Dict[str, str]:
+        """Server capabilities as a dict (e.g. ``stream_context_version``, stream limits)."""
+
+        def _call():
+            stub = self._get_stub()
+            return stub.Capabilities(inference_pb2.CapabilitiesRequest(), timeout=self._timeout)
+
+        response = self._with_retry(_call)
+        return {str(cap.key): str(cap.value) for cap in response.capabilities}
+
     def open_session(
         self,
         *,
@@ -260,7 +384,12 @@ class InferenceGrpcClient:
         transport: Optional[inference_pb2.TransportCaps] = None,
         options: Optional[Mapping[str, str]] = None,
     ) -> inference_pb2.OpenSessionResponse:
-        session_id = session_id or ""
+        """Open (or idempotently re-open) a session.
+
+        The session ID is generated here when not given, so a retried open reuses the
+        same ID and the server returns the existing session instead of a second one.
+        """
+        session_id = session_id or uuid.uuid4().hex
         req = inference_pb2.OpenSessionRequest(
             session_id=session_id,
         )
@@ -307,107 +436,69 @@ class InferenceGrpcClient:
     def stream_predict(
         self,
         *,
-        model_id: str,
+        model_id: str = "",
         samples: Iterable[np.ndarray],
         session_id: Optional[str] = None,
         tile_ids: Optional[Iterable[str]] = None,
+        tile_options: Optional[Iterable[Optional[Mapping[str, object]]]] = None,
+        options: Optional[Mapping[str, object]] = None,
         chunk_bytes: Optional[int] = None,
+        max_inflight: Optional[int] = None,
         dtype: Optional[str] = None,
         cancel_fn=None,
         on_response=None,
         on_error=None,
         on_tile_start=None,
-    ) -> Iterable[inference_pb2.StreamPredictResponse]:
-        """Client-side streaming inference with optional chunking and session/tile metadata.
+    ) -> "StreamPredictCall":
+        """Bidirectional streaming inference, one response per tile.
 
         Args:
-            model_id: model identifier.
-            samples: iterable of numpy arrays representing logical tiles/samples.
-            session_id: optional session identifier to bind stream to.
-            tile_ids: optional iterable of tile ids aligned with samples.
-            chunk_bytes: if set, will chunk the sample bytes into pieces <= chunk_bytes.
-            dtype: override dtype string; defaults to array dtype.
-            cancel_fn: optional callable returning True to abort streaming; will close channel.
+            model_id: model identifier; required without ``session_id`` (for a session
+                stream the server uses the session's model).
+            samples: iterable of numpy arrays, one per tile (consumed lazily).
+            session_id: session opened with :meth:`open_session`.
+            tile_ids: tile ids aligned with samples (default ``tile-<index>``).
+            tile_options: per-tile option mappings aligned with samples (``None`` for none).
+            options: options applied to every tile; ``tile_options`` override them.
+            chunk_bytes: split each tile into messages of at most this many bytes
+                (use the negotiated value, at most Capabilities ``stream_max_chunk_bytes``).
+            max_inflight: at most this many tiles sent but not yet answered
+                (use ``OpenSessionResponse.max_inflight``); ``None`` means unbounded.
+            dtype: declared dtype; the data is cast losslessly or rejected.
+            cancel_fn: optional callable polled every ``CANCEL_POLL_SECONDS``; returning
+                True cancels the RPC even while no response has arrived.
             on_response: optional callback(resp) invoked per response.
-            on_error: optional callback(err_msg) invoked if the stream errors.
-            on_tile_start: optional callback(tile_id) invoked when a tile starts being sent.
+            on_error: optional callback(err_msg) invoked if the stream fails.
+            on_tile_start: optional callback(tile_id) invoked when a tile starts sending.
+
+        Returns:
+            A :class:`StreamPredictCall`: iterate it for responses, call ``cancel()`` to
+            stop. Iteration ends quietly after a cancel.
         """
 
         model_id = str(model_id or "")
-        if not model_id:
-            raise ValueError("model_id is required")
-
-        def _iter_requests():
-            tid_iter = iter(tile_ids) if tile_ids is not None else None
-            for sample in samples:
-                arr = np.ascontiguousarray(sample)
-                tile_id = next(tid_iter) if tid_iter is not None else None
-
-                # Notify that this tile is starting to be processed
-                if on_tile_start and tile_id:
-                    try:
-                        on_tile_start(tile_id)
-                    except Exception:
-                        pass
-
-                raw = arr.tobytes()
-                shape_list = [int(dim) for dim in arr.shape]
-                dtype_str = dtype or str(arr.dtype)
-
-                chunks: list[bytes] = []
-                if chunk_bytes and chunk_bytes > 0:
-                    for i in range(0, len(raw), int(chunk_bytes)):
-                        chunks.append(raw[i : i + int(chunk_bytes)])
-                else:
-                    chunks.append(raw)
-
-                for c in chunks:
-                    req = inference_pb2.StreamPredictRequest(
-                        model_id=model_id,
-                        chunk=c,
-                        shape=shape_list,
-                        dtype=dtype_str,
-                    )
-                    if session_id or tile_id:
-                        ctx = req.context
-                        if session_id:
-                            ctx["session_id"] = str(session_id)
-                        if tile_id:
-                            ctx["tile_id"] = str(tile_id)
-                    yield req
-
-                # end-of-sequence marker for this sample
-                eos = inference_pb2.StreamPredictRequest(end_of_sequence=True)
-                if session_id or tile_id:
-                    ctx = eos.context
-                    if session_id:
-                        ctx["session_id"] = str(session_id)
-                    if tile_id:
-                        ctx["tile_id"] = str(tile_id)
-                yield eos
-
-        try:
-            stub = self._get_stub()
-            resp_iter = stub.StreamPredict(_iter_requests(), timeout=self._timeout)
-            for resp in resp_iter:
-                if cancel_fn and cancel_fn():
-                    break
-                if on_response:
-                    try:
-                        on_response(resp)
-                    except Exception:
-                        pass
-                yield resp
-        except grpc.RpcError as err:  # pragma: no cover - network dependent
-            self._reset_channel()  # Reset for reconnection on next call
-            msg = getattr(err, "details", None)
-            msg = msg() if callable(msg) else str(msg or err)
-            if on_error:
-                try:
-                    on_error(msg)
-                except Exception:
-                    pass
-            raise InferenceGrpcError(msg) from err
+        if not model_id and not session_id:
+            raise ValueError("model_id or session_id is required")
+        if max_inflight is not None and int(max_inflight) < 1:
+            raise ValueError("max_inflight must be >= 1")
+        if chunk_bytes is not None and int(chunk_bytes) < 0:
+            raise ValueError("chunk_bytes must be >= 0")
+        return StreamPredictCall(
+            self,
+            model_id=model_id,
+            samples=samples,
+            session_id=str(session_id or ""),
+            tile_ids=tile_ids,
+            tile_options=tile_options,
+            options=options,
+            chunk_bytes=int(chunk_bytes or 0),
+            max_inflight=int(max_inflight) if max_inflight is not None else None,
+            dtype=dtype,
+            cancel_fn=cancel_fn,
+            on_response=on_response,
+            on_error=on_error,
+            on_tile_start=on_tile_start,
+        )
 
     def list_model_registry(
         self, provider_id: Optional[str] = None
@@ -464,11 +555,235 @@ class InferenceGrpcClient:
         return bool(response.success)
 
 
+class _TileWindow:
+    """Bounds tiles sent but not yet answered; ``close()`` releases every waiter."""
+
+    def __init__(self, limit: Optional[int]):
+        self._limit = limit
+        self._outstanding = 0
+        self._closed = False
+        self._cond = threading.Condition()
+
+    def acquire(self) -> bool:
+        with self._cond:
+            while (
+                not self._closed
+                and self._limit is not None
+                and self._outstanding >= self._limit
+            ):
+                self._cond.wait()
+            if self._closed:
+                return False
+            self._outstanding += 1
+            return True
+
+    def release(self) -> None:
+        with self._cond:
+            if self._outstanding > 0:
+                self._outstanding -= 1
+            self._cond.notify_all()
+
+    def close(self) -> None:
+        with self._cond:
+            self._closed = True
+            self._cond.notify_all()
+
+
+class StreamPredictCall:
+    """One ``StreamPredict`` RPC: iterate for responses, ``cancel()`` to stop it.
+
+    Cancellation cancels the underlying gRPC call immediately, so a caller blocked
+    waiting for the first response is released even if the server never answers.
+    """
+
+    def __init__(
+        self,
+        client: "InferenceGrpcClient",
+        *,
+        model_id: str,
+        samples: Iterable[np.ndarray],
+        session_id: str,
+        tile_ids: Optional[Iterable[str]],
+        tile_options: Optional[Iterable[Optional[Mapping[str, object]]]],
+        options: Optional[Mapping[str, object]],
+        chunk_bytes: int,
+        max_inflight: Optional[int],
+        dtype: Optional[str],
+        cancel_fn: Optional[Callable[[], bool]],
+        on_response,
+        on_error,
+        on_tile_start,
+    ) -> None:
+        self._client = client
+        self._model_id = model_id
+        self._samples = samples
+        self._session_id = session_id
+        self._tile_ids = tile_ids
+        self._tile_options = tile_options
+        self._options = dict(options or {})
+        self._chunk_bytes = chunk_bytes
+        self._dtype = dtype
+        self._cancel_fn = cancel_fn
+        self._on_response = on_response
+        self._on_error = on_error
+        self._on_tile_start = on_tile_start
+        self._window = _TileWindow(max_inflight)
+        self._lock = threading.Lock()
+        self._call = None
+        self._cancelled = False
+        self._request_error: Optional[BaseException] = None
+        self._done = threading.Event()
+        self._started = False
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancelled
+
+    def cancel(self) -> None:
+        """Cancel the RPC now (idempotent, thread-safe)."""
+        with self._lock:
+            self._cancelled = True
+            call = self._call
+        self._window.close()
+        if call is not None and callable(getattr(call, "cancel", None)):
+            call.cancel()
+
+    def _cancel_requested(self) -> bool:
+        if self._cancelled:
+            return True
+        if self._cancel_fn is not None:
+            try:
+                if self._cancel_fn():
+                    self.cancel()
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def _requests(self) -> Iterator[inference_pb2.StreamPredictRequest]:
+        try:
+            id_iter = iter(self._tile_ids) if self._tile_ids is not None else None
+            opt_iter = iter(self._tile_options) if self._tile_options is not None else None
+            missing = object()
+            for index, sample in enumerate(self._samples):
+                tile_id = next(id_iter, missing) if id_iter is not None else f"tile-{index}"
+                per_tile = next(opt_iter, missing) if opt_iter is not None else None
+                if tile_id is missing or per_tile is missing:
+                    raise ValueError(f"tile_ids/tile_options have fewer entries than samples ({index + 1})")
+                tile_id = str(tile_id)
+                tile_opts = dict(self._options)
+                tile_opts.update(per_tile or {})
+                arr = prepare_tensor(sample, self._dtype)
+                first_ctx = encode_tile_context(
+                    tile_id=tile_id, session_id=self._session_id, options=tile_opts
+                )
+                later_ctx = encode_tile_context(tile_id=tile_id, session_id=self._session_id)
+                if self._cancel_requested() or not self._window.acquire():
+                    return
+                if self._on_tile_start:
+                    try:
+                        self._on_tile_start(tile_id)
+                    except Exception:
+                        pass
+                raw = arr.tobytes()
+                step = self._chunk_bytes if self._chunk_bytes > 0 else max(len(raw), 1)
+                chunks = [raw[i : i + step] for i in range(0, len(raw), step)] or [b""]
+                shape_list = [int(dim) for dim in arr.shape]
+                for position, chunk in enumerate(chunks):
+                    yield inference_pb2.StreamPredictRequest(
+                        model_id=self._model_id,
+                        chunk=chunk,
+                        shape=shape_list,
+                        dtype=arr.dtype.name,
+                        context=first_ctx if position == 0 else later_ctx,
+                    )
+                # end-of-sequence marker for this tile
+                yield inference_pb2.StreamPredictRequest(end_of_sequence=True, context=later_ctx)
+        except Exception as exc:
+            # Surface the caller's error (e.g. a rejected dtype cast) from iteration
+            # instead of letting gRPC turn it into an opaque cancelled RPC.
+            self._request_error = exc
+            with self._lock:
+                call = self._call
+            if call is not None and callable(getattr(call, "cancel", None)):
+                call.cancel()
+
+    def _watch_cancel_fn(self) -> None:
+        while not self._done.wait(CANCEL_POLL_SECONDS):
+            if self._cancel_requested():
+                return
+
+    def __iter__(self) -> Iterator[inference_pb2.StreamPredictResponse]:
+        if self._started:
+            raise RuntimeError("a StreamPredictCall can be iterated only once")
+        self._started = True
+        return self._run()
+
+    def _run(self) -> Iterator[inference_pb2.StreamPredictResponse]:
+        if self._cancel_requested():
+            self._done.set()
+            return
+        finished = False
+        try:
+            stub = self._client._get_stub()
+            call = stub.StreamPredict(self._requests(), timeout=self._client._timeout)
+            with self._lock:
+                self._call = call
+                cancelled = self._cancelled
+            if cancelled and callable(getattr(call, "cancel", None)):
+                call.cancel()
+            if self._cancel_fn is not None:
+                threading.Thread(
+                    target=self._watch_cancel_fn, name="nxmndr-stream-cancel", daemon=True
+                ).start()
+            for resp in call:
+                if self._cancelled:
+                    break
+                if resp.metadata.get(CONTEXT_TILE_ID):
+                    self._window.release()
+                if self._on_response:
+                    try:
+                        self._on_response(resp)
+                    except Exception:
+                        pass
+                yield resp
+            if self._request_error is not None:
+                raise self._request_error
+            finished = True
+        except grpc.RpcError as err:
+            if self._request_error is not None:
+                raise self._request_error from err
+            if self._cancelled:
+                return
+            self._client._reset_channel()  # Reset for reconnection on next call
+            message, code = _rpc_error_parts(err)
+            if self._on_error:
+                try:
+                    self._on_error(message)
+                except Exception:
+                    pass
+            raise InferenceGrpcError(message, code=code) from err
+        finally:
+            self._done.set()
+            self._window.close()
+            if not finished:
+                with self._lock:
+                    call = self._call
+                if call is not None and callable(getattr(call, "cancel", None)):
+                    call.cancel()
+
+
 __all__ = [
     "InferenceGrpcClient",
     "PredictResult",
     "InferenceGrpcError",
     "ModelRegistryEntry",
+    "StreamPredictCall",
+    "encode_tile_context",
+    "prepare_tensor",
+    "validate_option_name",
+    "STREAM_CONTEXT_CAPABILITY",
+    "STREAM_CONTEXT_VERSION",
     "inference_pb2",
     "inference_pb2_grpc",
 ]
