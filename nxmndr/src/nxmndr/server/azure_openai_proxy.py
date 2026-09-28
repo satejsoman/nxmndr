@@ -34,19 +34,23 @@ Required per endpoint:
 Optional per endpoint:
 - <PREFIX>_API_VERSION: API version (fallback: API_VERSION, default: 2025-01-01-preview)
 - <PREFIX>_TYPE: Model type "chat" or "vision" (default: "chat")
+- <PREFIX>_PROVIDER: "openai" or "azure_openai" (default: detected from the host)
 
 Global Fallbacks:
 - ENDPOINT_URL: Default endpoint URL when specific endpoint URLs not configured
 - API_VERSION: Default API version when specific versions not configured
 
 OpenAI Platform (non-Azure) endpoints:
-An endpoint whose URL host is ``api.openai.com`` is treated as the OpenAI platform
-rather than Azure OpenAI. For such endpoints the proxy authenticates with the
+An endpoint is served as the OpenAI platform when ``<PREFIX>_PROVIDER=openai``, or,
+when no provider is set, when its URL host is ``api.openai.com``
+(``<PREFIX>_PROVIDER=azure_openai`` forces Azure OpenAI for any host). For such
+endpoints the proxy authenticates with the
 ``OPENAI_API_KEY`` environment variable (no Azure credential is needed), forwards to
 ``/v1/chat/completions`` or ``/v1/images/edits`` instead of the
 ``/openai/deployments/{deployment}/...`` paths, omits ``api-version``, and sends the
 deployment name as the ``model`` field. The client-facing routes are unchanged, so
-the QGIS plugin needs no reconfiguration beyond pointing at this proxy.
+the QGIS plugin needs no reconfiguration beyond pointing at this proxy. Routes,
+identities and upstream shapes are defined once in ``nxmndr.server.proxy_routes``.
 
   export OPENAI_API_KEY="sk-..."
   export VISION_DEPLOYMENT_NAME="gpt-image-1"
@@ -87,7 +91,6 @@ import logging
 import os
 import time
 from typing import List, Optional
-from urllib.parse import urlparse
 
 import aiohttp
 from aiohttp import ClientSession, ClientTimeout, web
@@ -95,18 +98,21 @@ from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 
 from nxmndr.gpt.models import ModelEndpointSpec
 
+from . import proxy_routes
+
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
-# Hosts that are served by the OpenAI platform rather than Azure OpenAI.
-OPENAI_PLATFORM_HOSTS = {"api.openai.com"}
+# Hosts that are served by the OpenAI platform rather than Azure OpenAI (used only
+# when an endpoint has no explicit provider).
+OPENAI_PLATFORM_HOSTS = proxy_routes.OPENAI_PLATFORM_HOSTS
 
 
 def is_openai_platform(endpoint_spec: ModelEndpointSpec) -> bool:
     """Return True if the endpoint targets the OpenAI platform instead of Azure OpenAI."""
-    host = (urlparse(endpoint_spec.endpoint_url).hostname or "").lower()
-    return host in OPENAI_PLATFORM_HOSTS
+    provider = proxy_routes.resolve_provider(endpoint_spec.endpoint_url, endpoint_spec.provider)
+    return provider == proxy_routes.PROVIDER_OPENAI
 
 
 class AzureOpenAIProxy:
@@ -188,6 +194,7 @@ class AzureOpenAIProxy:
                 endpoint_url_key = f"{prefix}_ENDPOINT_URL"
                 api_version_key = f"{prefix}_API_VERSION"
                 type_key = f"{prefix}_TYPE"
+                provider_key = f"{prefix}_PROVIDER"
 
                 endpoint_url = os.getenv(endpoint_url_key)
                 if not endpoint_url:
@@ -218,6 +225,7 @@ class AzureOpenAIProxy:
                     deployment_name=deployment_name,
                     api_version=api_version,
                     type=endpoint_type,
+                    provider=os.getenv(provider_key, "").strip().lower(),
                 )
 
                 # Validate the spec
@@ -328,24 +336,11 @@ class AzureOpenAIProxy:
             token = self.token_provider()
         return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
-    @staticmethod
-    def _upstream_path(endpoint_spec: ModelEndpointSpec, operation: str) -> str:
-        """
-        Build the upstream API path for an operation.
-
-        Args:
-            endpoint_spec: Target endpoint
-            operation: "chat/completions" or "images/edits"
-        """
-        if is_openai_platform(endpoint_spec):
-            return f"v1/{operation}"
-        return f"openai/deployments/{endpoint_spec.deployment_name}/{operation}"
-
     async def _forward_request(
         self,
         endpoint_spec: ModelEndpointSpec,
         method: str,
-        path: str,
+        operation: str,
         request_data: dict = None,
         files: dict = None,
         params: dict = None,
@@ -356,7 +351,7 @@ class AzureOpenAIProxy:
         Args:
             endpoint_spec: The ModelEndpointSpec to use for the request
             method: HTTP method (GET, POST, etc.)
-            path: API path relative to endpoint
+            operation: proxy_routes.OPERATION_CHAT_COMPLETIONS or OPERATION_IMAGE_EDITS
             request_data: JSON request body
             files: File uploads for multipart requests
             params: Query parameters
@@ -366,24 +361,30 @@ class AzureOpenAIProxy:
         """
         await self.start_session()
 
-        # Build full URL
-        url = f"{endpoint_spec.endpoint_url}/{path.lstrip('/')}"
+        # Upstream URL, query and body fields for the endpoint's provider identity:
+        # Azure OpenAI requires api-version (the OpenAI platform rejects it); the
+        # OpenAI platform selects the model per request instead of per deployment URL.
+        upstream = proxy_routes.upstream_request(
+            endpoint_spec.endpoint_url,
+            endpoint_spec.deployment_name,
+            operation,
+            provider=endpoint_spec.provider,
+            api_version=endpoint_spec.api_version,
+        )
+        url = upstream.url
 
         if params is None:
             params = {}
-        openai_platform = is_openai_platform(endpoint_spec)
-        if not openai_platform:
-            # Azure OpenAI requires the api-version query parameter; the OpenAI platform rejects it
-            params["api-version"] = endpoint_spec.api_version
+        params.update(upstream.params)
 
         # Get authentication headers
         headers = self._get_auth_headers(endpoint_spec)
 
-        if openai_platform:
-            # The OpenAI platform selects the model per request instead of per deployment URL
+        if upstream.fields:
             if request_data is None:
                 request_data = {}
-            request_data.setdefault("model", endpoint_spec.deployment_name)
+            for key, value in upstream.fields.items():
+                request_data.setdefault(key, value)
 
         try:
             logger.info(f"Forwarding {method} request to: {url}")
@@ -471,9 +472,8 @@ class AzureOpenAIProxy:
 
             # Forward using the selected endpoint
             # Use the actual endpoint's deployment name, not the requested one
-            path = self._upstream_path(endpoint_spec, "chat/completions")
             status, response_data = await self._forward_request(
-                endpoint_spec, "POST", path, request_data
+                endpoint_spec, "POST", proxy_routes.OPERATION_CHAT_COMPLETIONS, request_data
             )
 
             logger.info(f"Chat completions request completed with status: {status}")
@@ -563,9 +563,8 @@ class AzureOpenAIProxy:
 
             # Forward using the selected endpoint
             # Use the actual endpoint's deployment name, not the requested one
-            path = self._upstream_path(endpoint_spec, "images/edits")
             status, response_data = await self._forward_request(
-                endpoint_spec, "POST", path, form_data, files
+                endpoint_spec, "POST", proxy_routes.OPERATION_IMAGE_EDITS, form_data, files
             )
 
             logger.info(f"Image edits request completed with status: {status}")
@@ -643,7 +642,7 @@ class AzureOpenAIProxy:
         """Handle list registered models API requests."""
         try:
             # Get optional type filter from query parameters
-            model_type = request.query.get("type")  # 'chat', 'vision', or None for all
+            model_type = request.query.get(proxy_routes.MODELS_TYPE_PARAM)  # 'chat', 'vision', or None for all
 
             logger.info(f"Handling list models request (type filter: {model_type or 'all'})")
 
@@ -739,17 +738,15 @@ def setup_azure_proxy_routes(app: web.Application, proxy: AzureOpenAIProxy):
     app["azure_proxy"] = proxy
 
     # Azure OpenAI API compatible routes
-    app.router.add_post(
-        "/openai/deployments/{deployment}/chat/completions", proxy.handle_chat_completions
-    )
-    app.router.add_post("/openai/deployments/{deployment}/images/edits", proxy.handle_image_edits)
+    app.router.add_post(proxy_routes.ROUTE_CHAT_COMPLETIONS, proxy.handle_chat_completions)
+    app.router.add_post(proxy_routes.ROUTE_IMAGE_EDITS, proxy.handle_image_edits)
 
     # Unified client-facing routes
-    app.router.add_post("/generate/image/{deployment}", proxy.handle_image_generation)
+    app.router.add_post(proxy_routes.ROUTE_GENERATE_IMAGE, proxy.handle_image_generation)
 
     # Proxy management routes
-    app.router.add_get("/models", proxy.handle_list_models)  # List registered models
-    app.router.add_get("/health", proxy.handle_health)
+    app.router.add_get(proxy_routes.ROUTE_MODELS, proxy.handle_list_models)  # List registered models
+    app.router.add_get(proxy_routes.ROUTE_HEALTH, proxy.handle_health)
 
     # Add cleanup handler
     async def cleanup_azure_proxy(app):
