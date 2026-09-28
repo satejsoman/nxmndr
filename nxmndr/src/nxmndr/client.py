@@ -664,9 +664,13 @@ class StreamPredictCall:
         try:
             id_iter = iter(self._tile_ids) if self._tile_ids is not None else None
             opt_iter = iter(self._tile_options) if self._tile_options is not None else None
+            missing = object()
             for index, sample in enumerate(self._samples):
-                tile_id = str(next(id_iter)) if id_iter is not None else f"tile-{index}"
-                per_tile = next(opt_iter) if opt_iter is not None else None
+                tile_id = next(id_iter, missing) if id_iter is not None else f"tile-{index}"
+                per_tile = next(opt_iter, missing) if opt_iter is not None else None
+                if tile_id is missing or per_tile is missing:
+                    raise ValueError(f"tile_ids/tile_options have fewer entries than samples ({index + 1})")
+                tile_id = str(tile_id)
                 tile_opts = dict(self._options)
                 tile_opts.update(per_tile or {})
                 arr = prepare_tensor(sample, self._dtype)

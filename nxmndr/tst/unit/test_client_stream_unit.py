@@ -161,3 +161,11 @@ def test_cancel_before_iteration_sends_nothing(stubbed):
     call = client.stream_predict(model_id="m", samples=[np.zeros(2)])
     call.cancel()
     assert list(call) == [] and stub.requests == []
+
+
+def test_misaligned_tile_ids_are_an_explicit_error(stubbed):
+    client, _ = stubbed
+    with pytest.raises(ValueError, match="fewer entries"):
+        list(client.stream_predict(model_id="m", samples=[np.zeros(2)] * 2, tile_ids=["only-one"]))
+    with pytest.raises(ValueError, match="fewer entries"):
+        list(client.stream_predict(model_id="m", samples=[np.zeros(2)] * 2, tile_options=[{}]))
