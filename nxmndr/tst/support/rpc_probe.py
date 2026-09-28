@@ -1,12 +1,12 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
 
-"""A model class that proves a spawned PyTorch RPC worker ran its target.
+"""A PyTorch RPC worker target that proves a spawned child ran it.
 
-The RPC worker constructs ``model_spec.model_class()`` before anything else. This
-class writes the file named by ``NXMNDR_TEST_RPC_MARKER`` and ends the child
-process there, so no torch RPC rendezvous is attempted. It lives in an importable
-module because a ``spawn`` child unpickles the spec by reference.
+``marker_worker`` has the signature of ``managers._run_rpc_worker``. It writes the
+file named by ``NXMNDR_TEST_RPC_MARKER`` and ends the child there, before the
+readiness handshake, so no torch RPC rendezvous is attempted. It lives in an
+importable module because a ``spawn`` child unpickles its target by reference.
 """
 
 from __future__ import annotations
@@ -17,7 +17,8 @@ from pathlib import Path
 MARKER_ENV = "NXMNDR_TEST_RPC_MARKER"
 
 
-class MarkerModel:
-    def __init__(self):
-        Path(os.environ[MARKER_ENV]).write_text(f"pid={os.getpid()}", encoding="utf-8")
-        raise SystemExit(0)
+def marker_worker(master_addr, master_port, ready_port, startup_timeout_s):
+    Path(os.environ[MARKER_ENV]).write_text(
+        f"pid={os.getpid()} ready_port={ready_port}", encoding="utf-8"
+    )
+    raise SystemExit(0)

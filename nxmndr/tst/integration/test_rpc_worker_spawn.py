@@ -3,33 +3,36 @@
 
 """RpcWorkerManager starts its PyTorch RPC worker under the ``spawn`` start method.
 
-``spawn`` is the default on macOS and Windows; it pickles the process target, so a
-nested function fails in the parent with "Can't pickle local object".
+``spawn`` pickles the process target, so a nested function fails in the parent with
+"Can't pickle local object". The manager always uses the ``spawn`` context: the
+child must not inherit the server's gRPC and torch threads, as ``fork`` would do.
+The worker's arguments are plain values (no model spec: models are loaded later by
+model ID). The full start, with the real rendezvous, runs in
+tst/integration/test_rpc_pytorch_service.py.
 """
 
 from __future__ import annotations
 
-import multiprocessing
 import os
 import pickle
 from multiprocessing.reduction import ForkingPickler
 
 import pytest
 
-from nxmndr.models import PytorchModelSpec
 from nxmndr.server import managers
-from tst.support.rpc_probe import MARKER_ENV, MarkerModel
+from tst.support.rpc_probe import MARKER_ENV, marker_worker
 
 pytestmark = pytest.mark.integration
 
 
 class _RecordedProcess:
-    """Stands in for multiprocessing.Process and keeps what it was given."""
+    """Stands in for a spawn-context Process and keeps what it was given."""
 
     made = []
 
-    def __init__(self, target=None, args=(), kwargs=None, daemon=None):
+    def __init__(self, target=None, args=(), kwargs=None, daemon=None, name=None):
         self.target, self.args, self.kwargs = target, tuple(args), dict(kwargs or {})
+        self.pid, self.exitcode = None, None
         _RecordedProcess.made.append(self)
 
     def start(self):
@@ -39,33 +42,48 @@ class _RecordedProcess:
         return False
 
 
-def test_worker_target_and_arguments_pickle_for_spawn(tmp_path, monkeypatch):
-    _RecordedProcess.made.clear()
-    monkeypatch.setattr(managers.multiprocessing, "Process", _RecordedProcess)
-    spec = PytorchModelSpec(model_class=MarkerModel, model_path=str(tmp_path / "w.pth"))
-    managers.RpcWorkerManager().ensure_worker(spec, master_addr="127.0.0.1", master_port=29555)
+class _RecordedContext:
+    methods = []
 
+    def __init__(self, method):
+        _RecordedContext.methods.append(method)
+        self.Process = _RecordedProcess
+
+
+@pytest.fixture
+def no_torch_group(monkeypatch):
+    """This pytest process may hold a group from another test; these starts never reach torch."""
+
+    monkeypatch.setattr(managers.dist, "is_initialized", lambda: False)
+    monkeypatch.setattr(managers.torch_rpc, "_is_current_rpc_agent_set", lambda: False)
+
+
+def test_worker_target_and_arguments_pickle_for_spawn(monkeypatch, no_torch_group):
+    _RecordedProcess.made.clear()
+    _RecordedContext.methods.clear()
+    monkeypatch.setattr(managers.multiprocessing, "get_context", _RecordedContext)
+    manager = managers.RpcWorkerManager(master_addr="127.0.0.1", master_port=29555, startup_timeout_s=7.0)
+    with pytest.raises(managers.RpcWorkerStartError, match="before it was ready"):
+        manager.ensure_started()
+
+    assert _RecordedContext.methods == ["spawn"]
     [proc] = _RecordedProcess.made
     payload = bytes(ForkingPickler.dumps((proc.target, proc.args, proc.kwargs)))
     target, args, kwargs = pickle.loads(payload)
     assert target is managers._run_rpc_worker
-    assert args[1:] == ("127.0.0.1", 29555) and args[0].model_class is MarkerModel
+    addr, port, ready_port, timeout = args
+    assert (addr, port, timeout) == ("127.0.0.1", 29555, 7.0) and isinstance(ready_port, int)
+    assert manager._state == "idle"  # the torch rendezvous was never entered: a retry may start again
 
 
-def test_worker_process_starts_and_runs_under_spawn(tmp_path, monkeypatch):
+def test_worker_process_starts_and_runs_under_spawn(tmp_path, monkeypatch, no_torch_group):
     marker = tmp_path / "rpc-worker-ran"
     monkeypatch.setenv(MARKER_ENV, str(marker))
-    monkeypatch.setattr(
-        managers.multiprocessing, "Process", multiprocessing.get_context("spawn").Process
-    )
-    spec = PytorchModelSpec(model_class=MarkerModel, model_path=str(tmp_path / "w.pth"))
-    manager = managers.RpcWorkerManager()
-    manager.ensure_worker(spec, master_addr="127.0.0.1", master_port=29555)
-    proc = manager._proc
-    try:
-        proc.join(timeout=120)
-        assert proc.exitcode == 0, f"spawned worker exit code {proc.exitcode}"
-        assert marker.read_text(encoding="utf-8") == f"pid={proc.pid}"
-        assert proc.pid != os.getpid()
-    finally:
-        manager.stop()  # terminates only this manager's own child if still alive
+    monkeypatch.setattr(managers.RpcWorkerManager, "worker_target", staticmethod(marker_worker))
+    manager = managers.RpcWorkerManager(master_addr="127.0.0.1", startup_timeout_s=120.0)
+    with pytest.raises(managers.RpcWorkerStartError, match="exited with code 0 before it was ready"):
+        manager.ensure_started()
+    text = marker.read_text(encoding="utf-8")
+    pid = int(text.split()[0].split("=")[1])
+    assert pid != os.getpid() and "ready_port=" in text
+    assert manager._proc is None and not manager.is_alive()

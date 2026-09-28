@@ -396,9 +396,12 @@ class TorchRpcInferenceProvider(InferenceProvider):
             tensor = tensor.float()
         if tensor.device.type != "cpu":
             tensor = tensor.cpu()
-        from ..server.rpc_worker import _rpc_infer
+        from ..server.rpc_worker import DEFAULT_MODEL_ID, _rpc_infer
 
-        result = torch_rpc.rpc_sync(self.worker_name, _rpc_infer, args=(tensor, self.device))
+        # The provider's single model: preloaded by run_worker or set by load_spec.
+        result = torch_rpc.rpc_sync(
+            self.worker_name, _rpc_infer, args=(DEFAULT_MODEL_ID, tensor, self.device)
+        )
         if torch.is_tensor(result):
             return result.detach().cpu().numpy()
         return result

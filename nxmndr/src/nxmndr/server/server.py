@@ -59,7 +59,6 @@ import sys
 import threading
 import time
 import uuid
-import random
 import re
 from concurrent import futures
 from dataclasses import dataclass, field
@@ -102,7 +101,6 @@ else:
 logger = get_logger("nxmndr.server")
 
 GRPC_MAX_MESSAGE_LENGTH = 128 * 1024 * 1024  # 128MB ceiling for large tensor payloads
-RPC_READY_TIMEOUT_SECONDS = 5.0  # Timeout for RPC worker readiness checks
 RPC_INFER_TIMEOUT_SECONDS = 5.0  # Timeout for individual RPC inference calls
 DEFAULT_MODEL_CACHE_CAPACITY = 10  # plan: LRU model cache capacity (NXMNDR_MODEL_CACHE_CAPACITY)
 SERVER_STOP_GRACE_SECONDS = 5.0  # grace for in-flight RPCs, then cache shutdown drains leases
@@ -113,11 +111,20 @@ GRPC_OPTIONS = [
 
 
 def _shutdown_rpc_driver_if_needed():
-    """Best-effort RPC shutdown to avoid hanging pytest due to TensorPipe threads."""
+    """At exit: stop this process's PyTorch RPC worker, then drop any leftover RPC state.
+
+    The worker is stopped first (``_rpc_stop``, then a bounded graceful shutdown on
+    both ranks). A leftover agent is shut down locally, never gracefully, because a
+    graceful shutdown waits without limit for a peer that may be gone.
+    """
 
     try:
+        managers.shutdown_process_rpc_worker()
+    except Exception:
+        pass
+    try:
         if torch_rpc._is_current_rpc_agent_set():  # type: ignore[attr-defined]
-            torch_rpc.shutdown()
+            torch_rpc.shutdown(graceful=False)
     except Exception:
         pass
     try:
@@ -127,32 +134,8 @@ def _shutdown_rpc_driver_if_needed():
         # Swallow to avoid masking teardown
         pass
 
-    try:
-        # Attempt to stop worker process if manager exists on any instantiated service
-        svc = getattr(_shutdown_rpc_driver_if_needed, "_svc_ref", None)
-        if svc and getattr(svc, "rpc_manager", None):
-            svc.rpc_manager.shutdown()
-    except Exception:
-        pass
-
 
 atexit.register(_shutdown_rpc_driver_if_needed)
-
-
-def _await_rpc_worker_ready(timeout: float = 5.0, poll: float = 0.1) -> bool:
-    """Poll the RPC worker status until it reports ready or timeout."""
-
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            from .rpc_worker import _rpc_status
-
-            resp = torch_rpc.rpc_sync("worker", _rpc_status, args=(), timeout=poll)
-            if resp.get("status") == "ok" and resp.get("model_loaded"):
-                return True
-        except Exception:
-            time.sleep(poll)
-    return False
 
 
 # Invocation metadata keys whose values are never logged (credential-like).
@@ -180,6 +163,15 @@ class LoggingInterceptor(grpc.ServerInterceptor):
             _loggable_metadata(handler_call_details.invocation_metadata),
         )
         return continuation(handler_call_details)
+
+
+def _no_rpc_model(model_id: str):
+    """Aux factory for a PyTorch record without its worker-side model: never creates one."""
+
+    def factory():
+        raise RuntimeError(f"PyTorch model {model_id} has no model in the RPC worker")
+
+    return factory
 
 
 class _LoadRequestError(Exception):
@@ -272,21 +264,17 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
         self._model_cache_capacity = int(
             os.environ.get("NXMNDR_MODEL_CACHE_CAPACITY", str(DEFAULT_MODEL_CACHE_CAPACITY))
         )
+        # Generic PyTorch models live in this manager's RPC worker; each cache record
+        # owns its worker-side model (managers.RPC_MODEL_RESOURCE).
+        self.rpc_manager = RpcWorkerManager()
         self.model_manager = model_manager or managers.ModelManager(
             self.provider,
             capacity=self._model_cache_capacity,
             session_ttl_s=float(self._session_ttl_seconds),
+            rpc_workers=self.rpc_manager,
         )
-        self.rpc_manager = RpcWorkerManager()
         self.logger = logger
         self.rpc_worker = None  # deprecated in favor of rpc_manager
-        self._rpc_driver_initialized = False
-        self._rpc_master_addr = os.environ.get("MASTER_ADDR", "127.0.0.1")
-        self._rpc_master_port = int(
-            os.environ.get("MASTER_PORT", str(random.randint(40000, 50000)))
-        )
-        # Allow atexit to access this instance for cleanup
-        setattr(_shutdown_rpc_driver_if_needed, "_svc_ref", self)
         artifact_root = None
         if model_cache_dir:
             expanded = os.path.expandvars(os.path.expanduser(str(model_cache_dir)))
@@ -486,17 +474,6 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
             }
             if fmt_str in ("pytorch", "torchhub") and spec_msg.model_class and not yolo:
                 spec_dict["model_class"] = spec_msg.model_class
-        if fmt_str == "pytorch" and not yolo:
-            # Start RPC driver before spawning worker to avoid rendezvous hangs
-            try:
-                self._ensure_rpc_driver()
-                if not _await_rpc_worker_ready(timeout=RPC_READY_TIMEOUT_SECONDS):
-                    # Worker might not yet be started; allow LoadModel to continue and worker to start.
-                    pass
-            except Exception as exc:
-                raise _LoadRequestError(
-                    grpc.StatusCode.INTERNAL, "failed to initialize RPC driver"
-                ) from exc
 
         model_spec = Model.model_spec_from_json(json.dumps(spec_dict))
         model_type = model_spec.__class__.__name__
@@ -513,11 +490,7 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
         }
         model_metadata.update(metadata_updates)
         if model_type == "PytorchModelSpec":
-            self.rpc_manager.ensure_worker(
-                model_spec,
-                master_addr=self._rpc_master_addr,
-                master_port=self._rpc_master_port,
-            )
+            # The loader starts the RPC worker on first use and loads the model there.
             device_plan = None
         elif model_type in ("OnnxModelSpec", "HuggingFaceModelSpec"):
             # Pass device plan for multi-device model replication
@@ -664,23 +637,16 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
 
     # ---- Prediction ----
     def _ensure_pytorch_worker(self, record) -> Optional[str]:
-        """Make the PyTorch RPC worker usable; return an error label if it is not."""
+        """An error label if the PyTorch RPC worker holding this record's model is gone.
+
+        A PyTorch record exists only after its model was loaded in the running worker;
+        torch cannot rejoin an RPC group in this process, so a worker that exited is
+        not restarted here.
+        """
         if record.backend != "pytorch":
             return None
-        if not self._rpc_driver_initialized:
-            self._ensure_rpc_driver()
-            if not _await_rpc_worker_ready(timeout=RPC_READY_TIMEOUT_SECONDS):
-                return "rpc_worker_not_ready"
         if not self.rpc_manager.is_alive():
-            try:
-                self.rpc_manager.ensure_worker(
-                    record.spec,
-                    master_addr=self._rpc_master_addr,
-                    master_port=self._rpc_master_port,
-                )
-                _await_rpc_worker_ready(timeout=RPC_READY_TIMEOUT_SECONDS)
-            except Exception:
-                return "rpc_worker_not_available"
+            return "rpc_worker_not_available"
         return None
 
     def _dispatch(self, lease, input_array, options) -> "dispatch.DispatchResult":
@@ -693,9 +659,11 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
 
         def infer(array, return_embeddings):
             if backend == "pytorch":
+                # The record's own model in the RPC worker, routed by its model ID.
+                handle = lease.resource(managers.RPC_MODEL_RESOURCE, _no_rpc_model(lease.model_id))
                 input_tensor = torch.from_numpy(np.array(array, copy=True)).float()
-                output = torch_rpc.rpc_sync(
-                    "worker", "_rpc_infer", args=(input_tensor,), timeout=RPC_INFER_TIMEOUT_SECONDS
+                output = handle.infer(
+                    input_tensor, device_hint=torch_device, timeout=RPC_INFER_TIMEOUT_SECONDS
                 )
                 if torch.is_tensor(output):
                     output = output.detach().cpu().numpy()
@@ -782,35 +750,6 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
             )
         finally:
             lease.release()
-
-    def _ensure_rpc_driver(self):
-        """Initialize RPC driver for PyTorch RPC worker if not already running."""
-
-        if self._rpc_driver_initialized:
-            return
-
-        addr = os.environ.get("MASTER_ADDR", self._rpc_master_addr)
-        port = int(os.environ.get("MASTER_PORT", self._rpc_master_port))
-        self._rpc_master_addr, self._rpc_master_port = addr, port
-        init_method = f"tcp://{addr}:{port}"
-
-        try:
-            os.environ.setdefault("MASTER_ADDR", addr)
-            os.environ.setdefault("MASTER_PORT", str(port))
-
-            if dist.is_available() and not dist.is_initialized():
-                dist.init_process_group(
-                    backend="gloo", rank=0, world_size=2, init_method=init_method
-                )
-
-            if not torch_rpc._is_current_rpc_agent_set():  # type: ignore[attr-defined]
-                opts = torch_rpc.TensorPipeRpcBackendOptions(init_method=init_method)
-                torch_rpc.init_rpc("driver", rank=0, world_size=2, rpc_backend_options=opts)
-
-            self._rpc_driver_initialized = True
-        except Exception:
-            self.logger.exception("Failed to initialize RPC driver")
-            raise
 
     # ---- Streaming ----
     @staticmethod
