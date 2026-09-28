@@ -1,13 +1,14 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
 
-import io
 import json
 from pathlib import Path
-from typing import Dict, Iterable, Mapping, MutableMapping, Sequence, Tuple, Union
+from typing import Dict, Iterable, MutableMapping, Sequence, Tuple, Union
 
 import numpy as np
 from PIL import Image
+
+from ..tensor_bundle import pack_tensor_bundle, unpack_tensor_bundle
 
 
 def load_images_to_batch(
@@ -200,29 +201,6 @@ __all__ = [
     "parse_geotransform",
     "boxes_to_polygons",
 ]
-
-
-def pack_tensor_bundle(tensors: Mapping[str, np.ndarray]) -> bytes:
-    """Serialize a mapping of numpy arrays into a compressed NPZ payload."""
-
-    if not tensors:
-        raise ValueError("Tensor bundle cannot be empty")
-
-    buffer = io.BytesIO()
-    np.savez_compressed(buffer, **{key: np.ascontiguousarray(val) for key, val in tensors.items()})
-    buffer.seek(0)
-    return buffer.read()
-
-
-def unpack_tensor_bundle(payload: bytes) -> Dict[str, np.ndarray]:
-    """Deserialize a compressed NPZ payload into numpy arrays."""
-
-    if not payload:
-        return {}
-
-    buffer = io.BytesIO(payload)
-    with np.load(buffer, allow_pickle=False) as data:
-        return {key: data[key] for key in data.files}
 
 
 def parse_geotransform(

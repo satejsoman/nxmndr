@@ -1,0 +1,163 @@
+# Copyright (c) Microsoft Corporation. All rights reserved.
+# Licensed under the MIT License.
+
+"""InferenceGrpcClient request encoding, without a server (stub transport)."""
+
+import grpc
+import numpy as np
+import pytest
+
+from nxmndr.client import InferenceGrpcClient, InferenceGrpcError, prepare_tensor
+from nxmndr.inference import inference_pb2
+
+
+class _FakeRpcError(grpc.RpcError):
+    def __init__(self, code, message="boom"):
+        super().__init__()
+        self._code = code
+        self._message = message
+
+    def code(self):
+        return self._code
+
+    def details(self):
+        return self._message
+
+
+class _RecordingStub:
+    """Consumes the request stream and answers one response per tile."""
+
+    def __init__(self):
+        self.requests = []
+        self.open_requests = []
+        self.open_failures = 0
+
+    def StreamPredict(self, request_iterator, timeout=None):
+        tiles = []
+        for req in request_iterator:
+            self.requests.append(req)
+            if req.end_of_sequence:
+                tiles.append(req.context["tile_id"])
+        return iter(
+            inference_pb2.StreamPredictResponse(end_of_sequence=True, metadata={"tile_id": t})
+            for t in tiles
+        )
+
+    def OpenSession(self, request, timeout=None):
+        self.open_requests.append(request)
+        if self.open_failures:
+            self.open_failures -= 1
+            raise _FakeRpcError(grpc.StatusCode.UNAVAILABLE, "connection reset")
+        return inference_pb2.OpenSessionResponse(session_id=request.session_id, status="ok")
+
+
+@pytest.fixture
+def stubbed(monkeypatch):
+    stub = _RecordingStub()
+    client = InferenceGrpcClient("localhost:0", max_attempts=3, backoff_seconds=0)
+    monkeypatch.setattr(client, "_get_stub", lambda: stub)
+    return client, stub
+
+
+def test_options_go_on_the_first_message_of_each_tile_only(stubbed):
+    client, stub = stubbed
+    tiles = [np.arange(8, dtype=np.uint8), np.arange(8, dtype=np.uint8)]
+    resps = list(
+        client.stream_predict(
+            session_id="s1",
+            samples=tiles,
+            tile_ids=["r0_c0", "r0_c1"],
+            tile_options=[{"sam_text_prompt": "field", "return_embeddings": True}, None],
+            options={"task_type": "segmentation"},
+            chunk_bytes=3,
+        )
+    )
+    assert [r.metadata["tile_id"] for r in resps] == ["r0_c0", "r0_c1"]
+    by_tile = {}
+    for req in stub.requests:
+        by_tile.setdefault(req.context["tile_id"], []).append(req)
+    first, *rest = by_tile["r0_c0"]
+    assert dict(first.context) == {
+        "tile_id": "r0_c0",
+        "session_id": "s1",
+        "opt.task_type": "segmentation",
+        "opt.sam_text_prompt": "field",
+        "opt.return_embeddings": "True",
+    }
+    # 8 bytes in 3-byte chunks: 3 data messages, then EOS; later messages carry IDs only
+    assert [len(r.chunk) for r in by_tile["r0_c0"]] == [3, 3, 2, 0]
+    assert rest[-1].end_of_sequence
+    for req in rest:
+        assert dict(req.context) == {"tile_id": "r0_c0", "session_id": "s1"}
+    # the second tile gets only the request-wide option: nothing leaks from r0_c0
+    assert dict(by_tile["r0_c1"][0].context) == {
+        "tile_id": "r0_c1",
+        "session_id": "s1",
+        "opt.task_type": "segmentation",
+    }
+
+
+def test_default_tile_ids_are_always_sent(stubbed):
+    client, stub = stubbed
+    list(client.stream_predict(model_id="m", samples=[np.zeros(2, np.uint8)] * 2))
+    assert {req.context["tile_id"] for req in stub.requests} == {"tile-0", "tile-1"}
+    assert all("session_id" not in req.context for req in stub.requests)
+
+
+def test_reserved_option_name_is_an_error_not_a_silent_drop(stubbed):
+    client, _ = stubbed
+    with pytest.raises(ValueError, match="reserved"):
+        list(client.stream_predict(model_id="m", samples=[np.zeros(2)], options={"session_id": "x"}))
+
+
+def test_dtype_override_casts_the_bytes(stubbed):
+    client, stub = stubbed
+    values = np.array([0, 1, 200, 255], dtype=np.uint8)
+    list(client.stream_predict(model_id="m", samples=[values], dtype="float32"))
+    data = stub.requests[0]
+    assert data.dtype == "float32"
+    np.testing.assert_array_equal(np.frombuffer(data.chunk, dtype="<f4"), values.astype(np.float32))
+
+
+def test_lossy_dtype_override_is_rejected(stubbed):
+    client, stub = stubbed
+    with pytest.raises(ValueError, match="not lossless"):
+        list(client.stream_predict(model_id="m", samples=[np.array([0.5], np.float32)], dtype="uint8"))
+    with pytest.raises(ValueError):
+        prepare_tensor(np.array([1, 2], np.int16), "uint8")
+
+
+def test_big_endian_input_is_sent_little_endian():
+    arr = prepare_tensor(np.array([1.5, -2.0], dtype=">f4"))
+    assert arr.dtype.byteorder in ("<", "=") and arr.dtype.name == "float32"
+    np.testing.assert_array_equal(np.frombuffer(arr.tobytes(), "<f4"), [1.5, -2.0])
+
+
+def test_retried_open_session_reuses_one_generated_id(stubbed):
+    client, stub = stubbed
+    stub.open_failures = 1
+    resp = client.open_session(spec=inference_pb2.ModelSpec(model_id="m"))
+    ids = [req.session_id for req in stub.open_requests]
+    assert len(ids) == 2 and ids[0] == ids[1] and len(ids[0]) == 32
+    assert resp.session_id == ids[0]
+
+
+def test_deterministic_rejections_are_not_retried():
+    client = InferenceGrpcClient("localhost:0", max_attempts=3, backoff_seconds=0)
+    attempts = []
+
+    def call():
+        attempts.append(1)
+        raise _FakeRpcError(grpc.StatusCode.INVALID_ARGUMENT, "malformed_options")
+
+    with pytest.raises(InferenceGrpcError) as err:
+        client._with_retry(call)
+    assert len(attempts) == 1
+    assert err.value.code == grpc.StatusCode.INVALID_ARGUMENT
+
+
+def test_cancel_before_iteration_sends_nothing(stubbed):
+    client, stub = stubbed
+    call = client.stream_predict(model_id="m", samples=[np.zeros(2)])
+    call.cancel()
+    assert list(call) == [] and stub.requests == []

@@ -15,6 +15,22 @@ Examples:
     python server/server.py --grpc-port 6000            # gRPC server on custom port
     python server/server.py --azure-proxy               # Azure proxy HTTP server on port 8080
     python server/server.py --azure-proxy --http-port 9000  # Azure proxy HTTP server on port 9000
+
+Streaming (``StreamPredict``) contract v1:
+
+- A session stream names a session opened with ``OpenSession`` in
+  ``context["session_id"]``; an unknown ID fails the stream with NOT_FOUND. A
+  sessionless stream names ``model_id`` instead.
+- Every message of a tile carries ``context["tile_id"]``; the tile's first message
+  may carry per-tile options as ``context["opt.<name>"]``. Effective options are the
+  session options updated by that tile's own options.
+- Each tile gets exactly one response. Response metadata carries ``error``,
+  ``error_code`` and ``error_scope`` on failure: ``tile`` scope fails one tile and the
+  stream continues; ``stream`` scope ends the stream.
+- Limits: a message chunk over ``max_chunk_bytes`` and a tile over ``max_tile_bytes``
+  are tile-scope failures. The number of chunks per tile is not limited. The server
+  processes tiles in arrival order and answers each before reading on, so a client
+  window of ``max_inflight`` outstanding tiles cannot deadlock.
 """
 
 import asyncio
@@ -24,11 +40,14 @@ import os
 import inspect
 import logging
 import sys
+import threading
 import time
 import uuid
 import random
 from concurrent import futures
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Dict, List, Optional
 
 import grpc
 import atexit
@@ -41,16 +60,17 @@ from aiohttp import web
 from ..logging import get_logger
 
 from ..inference import LocalInferenceProvider, inference_pb2, inference_pb2_grpc
-from ..inference.image_utils import (
-    masks_to_bounding_boxes,
-    pack_tensor_bundle,
-    prepare_segmentation_mask,
-    prepare_segmentation_mask_with_confidence,
-)
 from ..models import Model
-from ..models.sam import is_sam_model, handle_sam_inference
+from ..models.sam import resolve_sam_capability
+from . import dispatch
+from . import managers
 from .azure_openai_proxy import AzureOpenAIProxy, setup_azure_proxy_routes
-from .managers import ModelManager, RpcWorkerManager
+from .managers import RpcWorkerManager
+
+# The model cache and session/execution lease API (ModelManager, cache_key_from_spec
+# and the ModelCacheError family) is used through the ``managers`` module at call
+# time, so processes that import this package only for other modules (for example
+# the PyTorch RPC worker) do not depend on it.
 
 if __package__ in {None, ""}:  # pragma: no cover - direct script execution support
     repo_root = Path(__file__).resolve().parents[2]
@@ -66,7 +86,8 @@ logger = get_logger("nxmndr.server")
 GRPC_MAX_MESSAGE_LENGTH = 128 * 1024 * 1024  # 128MB ceiling for large tensor payloads
 RPC_READY_TIMEOUT_SECONDS = 5.0  # Timeout for RPC worker readiness checks
 RPC_INFER_TIMEOUT_SECONDS = 5.0  # Timeout for individual RPC inference calls
-DEFAULT_BATCH_SIZE = 1  # Default batch size for single-sample prediction
+DEFAULT_MODEL_CACHE_CAPACITY = 10  # plan: LRU model cache capacity (NXMNDR_MODEL_CACHE_CAPACITY)
+SERVER_STOP_GRACE_SECONDS = 5.0  # grace for in-flight RPCs, then cache shutdown drains leases
 GRPC_OPTIONS = [
     ("grpc.max_send_message_length", GRPC_MAX_MESSAGE_LENGTH),
     ("grpc.max_receive_message_length", GRPC_MAX_MESSAGE_LENGTH),
@@ -127,32 +148,89 @@ class LoggingInterceptor(grpc.ServerInterceptor):
         return continuation(handler_call_details)
 
 
-# Helper: deserialize input_data (bytes) to numpy array
-def deserialize_input(input_bytes, shape, dtype):
-    arr = np.frombuffer(input_bytes, dtype=dtype)
-    return arr.reshape(shape)
+class _LoadRequestError(Exception):
+    """A ModelSpec that cannot be loaded as given (maps to a gRPC status)."""
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
 
 
-# Helper: serialize numpy array to bytes
-def serialize_output(output):
-    return output.tobytes()
+@dataclass
+class _PreparedLoad:
+    model_spec: object
+    key: object
+    metadata: Dict[str, object]
+    device_plan: Optional[List[Dict[str, object]]]
+    model_type: str
 
 
-def _parse_bool(value) -> bool:
-    if value is None:
-        return False
-    if isinstance(value, bool):
-        return value
-    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+@dataclass
+class _SessionBook:
+    """Server-side bookkeeping for one session: negotiated limits, options, summary.
+
+    The session's lifecycle (open/closed, model pin) lives in the ModelManager.
+    """
+
+    session_id: str
+    model_id: str
+    max_inflight: int
+    max_chunk_bytes: int
+    max_tile_bytes: int
+    options: Dict[str, str]
+    total_tiles: Optional[int]
+    created_at: float
+    ok_tiles: int = 0
+    failed_tiles: int = 0
+    errors: List[str] = field(default_factory=list)
+    seen_tiles: set = field(default_factory=set)
+    closed_seen_at: Optional[float] = None
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+
+class _TileBuffer:
+    """Bytes and first-message metadata of the tile currently being received."""
+
+    def __init__(self, tile_id: str):
+        self.tile_id = tile_id
+        self.data = bytearray()
+        self.shape = None
+        self.dtype = None
+        self.options: Dict[str, str] = {}
+        self.reported = False  # a (failure) response was already sent for this tile
+
+
+class _StreamEnd(Exception):
+    """Internal: the stream ends after the given stream-scope response."""
+
+    def __init__(self, response, *, status=None, details=""):
+        super().__init__(details)
+        self.response = response
+        self.status = status
+        self.details = details
 
 
 class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
-    def __init__(self, *, model_cache_dir: str | Path | None = None, max_cores: int = 4):
+    def __init__(
+        self,
+        *,
+        model_cache_dir: str | Path | None = None,
+        max_cores: int = 4,
+        model_manager=None,
+    ):
         # Cap max_cores at a minimum of 1
         self._max_cores = max(1, int(max_cores or 4))
 
         self.provider = LocalInferenceProvider()
-        self.model_manager = ModelManager(self.provider)
+        self._session_ttl_seconds = int(os.environ.get("NXMNDR_SESSION_TTL_SECONDS", "3600"))
+        self._model_cache_capacity = int(
+            os.environ.get("NXMNDR_MODEL_CACHE_CAPACITY", str(DEFAULT_MODEL_CACHE_CAPACITY))
+        )
+        self.model_manager = model_manager or managers.ModelManager(
+            self.provider,
+            capacity=self._model_cache_capacity,
+            session_ttl_s=float(self._session_ttl_seconds),
+        )
         self.rpc_manager = RpcWorkerManager()
         self.logger = logger
         self.rpc_worker = None  # deprecated in favor of rpc_manager
@@ -192,9 +270,9 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
                 {"type": "cpu", "ordinal": idx, "id": f"cpu:{idx}"} for idx in range(selected)
             ]
         self._device_cursor = 0
-        # Session registry: session_id -> {model_id, created_at}
-        self._sessions: dict[str, dict] = {}
-        self._session_ttl_seconds = int(os.environ.get("NXMNDR_SESSION_TTL_SECONDS", "3600"))
+        # Session bookkeeping (limits, options, summary); lifecycle lives in model_manager.
+        self._sessions: Dict[str, _SessionBook] = {}
+        self._sessions_lock = threading.Lock()
         self._last_session_cleanup = time.time()
         self._default_max_inflight = int(os.environ.get("NXMNDR_STREAM_MAX_INFLIGHT", "16"))
         self._default_chunk_bytes = int(
@@ -205,24 +283,37 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
         )
 
     def _cleanup_stale_sessions(self) -> int:
-        """Remove sessions that have exceeded TTL. Returns count of cleaned sessions."""
+        """Expire idle sessions in the model manager and drop stale bookkeeping.
+
+        Returns the number of sessions expired by this call.
+        """
         now = time.time()
         # Only run cleanup every 60 seconds at most
         if now - self._last_session_cleanup < 60:
             return 0
         self._last_session_cleanup = now
 
-        stale_ids = []
-        for sid, state in list(self._sessions.items()):
-            created = state.get("created_at", 0)
-            if now - created > self._session_ttl_seconds:
-                stale_ids.append(sid)
+        expired = self.model_manager.expire_sessions()
+        for sid in expired:
+            self.logger.info(f"Expired idle session: {sid}")
 
-        for sid in stale_ids:
-            self._sessions.pop(sid, None)
-            self.logger.info(f"Cleaned up stale session: {sid}")
+        with self._sessions_lock:
+            books = list(self._sessions.items())
+        for sid, book in books:
+            if self._session_state(sid) == "open":
+                continue
+            if book.closed_seen_at is None:
+                book.closed_seen_at = now
+            elif now - book.closed_seen_at > self._session_ttl_seconds:
+                with self._sessions_lock:
+                    self._sessions.pop(sid, None)
+        return len(expired)
 
-        return len(stale_ids)
+    def _session_state(self, session_id: str) -> str:
+        try:
+            return self.model_manager.session_state(session_id)
+        except managers.UnknownSessionError:
+            return "unknown"
 
     def _next_device(self):
         if not self._device_plan:
@@ -231,164 +322,209 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
         self._device_cursor += 1
         return device
 
+    def _device_plan_messages(self):
+        return [
+            inference_pb2.DeviceInfo(
+                id=d.get("id", ""),
+                type=d.get("type", ""),
+                ordinal=int(d.get("ordinal", 0)),
+                weight=int(d.get("weight", 1)),
+            )
+            for d in self._device_plan
+        ]
+
     # ---- Lifecycle ----
+    def _prepare_load(self, spec_msg, corr_id: str) -> _PreparedLoad:
+        """Turn a wire ModelSpec into what ModelManager.load/open_session need.
+
+        Raises _LoadRequestError for requests that cannot be loaded as given.
+        """
+        if spec_msg.format not in (
+            inference_pb2.PYTORCH,
+            inference_pb2.ONNX,
+            inference_pb2.HUGGINGFACE,
+            inference_pb2.TORCHHUB,
+        ):
+            raise _LoadRequestError(grpc.StatusCode.INVALID_ARGUMENT, "Unsupported model format enum")
+        # Map enum int -> registry type string expected by model_spec_from_json
+        format_map = {
+            inference_pb2.PYTORCH: "pytorch",
+            inference_pb2.ONNX: "onnx",
+            inference_pb2.HUGGINGFACE: "huggingface",
+            inference_pb2.TORCHHUB: "torchhub",
+        }
+        fmt_str = format_map[spec_msg.format]
+        # Determine artifact path (write ONNX artifact bytes if provided); special handling for huggingface
+        model_path = spec_msg.source or ""
+        metadata_updates = {}
+        artifact_sha = ""
+        if spec_msg.artifact:
+            artifact_bytes = spec_msg.artifact
+            artifact_sha = hashlib.sha256(artifact_bytes).hexdigest()
+            existing_entry = self.registry_store.find_by_artifact_sha(artifact_sha)
+            cached_path = None
+            if existing_entry:
+                cached_candidate = existing_entry.metadata.get("artifact_path")
+                if cached_candidate and Path(cached_candidate).exists():
+                    cached_path = Path(cached_candidate)
+            if cached_path is None:
+                ext_hint = {
+                    "onnx": "onnx",
+                    "pytorch": "pt",
+                    "torchhub": "pt",
+                    "huggingface": "bin",
+                }.get(fmt_str, "bin")
+                target_path = self.registry_store.resolve_artifact_path(artifact_sha, ext_hint)
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                if not target_path.exists() or target_path.stat().st_size != len(artifact_bytes):
+                    target_path.write_bytes(artifact_bytes)
+                cached_path = target_path
+            model_path = str(cached_path)
+            metadata_updates["artifact_path"] = str(cached_path)
+            metadata_updates["artifact_sha256"] = artifact_sha
+            if spec_msg.checksum:
+                metadata_updates["checksum"] = spec_msg.checksum
+        if fmt_str == "huggingface":
+            # For HuggingFace we serialize repo_id explicitly (avoid misuse of model_path)
+            # Let load_huggingface and AutoModel.from_pretrained handle weight file resolution
+            if not spec_msg.source:
+                raise _LoadRequestError(
+                    grpc.StatusCode.INVALID_ARGUMENT, "HuggingFace models require source (repo_id)"
+                )
+            spec_dict = {
+                "type": "huggingface",
+                "repo_id": spec_msg.source,
+                "name": spec_msg.name or spec_msg.source,
+            }
+            if spec_msg.version:
+                spec_dict["revision"] = spec_msg.version
+            token = (
+                spec_msg.token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
+            )
+            if token:
+                # The token lives only in the spec (HuggingFaceModelSpec.token, repr=False),
+                # never in record metadata, cache keys, the registry file or logs.
+                spec_dict["token"] = token
+                self.logger.debug("HuggingFace token provided", extra={"corr_id": corr_id})
+            else:
+                self.logger.warning(
+                    "No HuggingFace token in request for gated repo %s",
+                    spec_msg.source,
+                    extra={"corr_id": corr_id},
+                )
+        else:
+            spec_dict = {
+                "type": fmt_str,
+                "model_path": model_path,
+                "name": spec_msg.name or "",
+            }
+            if fmt_str in ("pytorch", "torchhub") and spec_msg.model_class:
+                spec_dict["model_class"] = spec_msg.model_class
+        if fmt_str == "pytorch":
+            # Start RPC driver before spawning worker to avoid rendezvous hangs
+            try:
+                self._ensure_rpc_driver()
+                if not _await_rpc_worker_ready(timeout=RPC_READY_TIMEOUT_SECONDS):
+                    # Worker might not yet be started; allow LoadModel to continue and worker to start.
+                    pass
+            except Exception as exc:
+                raise _LoadRequestError(
+                    grpc.StatusCode.INTERNAL, "failed to initialize RPC driver"
+                ) from exc
+
+        model_spec = Model.model_spec_from_json(json.dumps(spec_dict))
+        model_type = model_spec.__class__.__name__
+        try:
+            task_name = inference_pb2.TaskType.Name(spec_msg.task)
+        except ValueError:
+            task_name = "TASK_TYPE_UNSPECIFIED"
+        model_metadata = {
+            "task": int(spec_msg.task),
+            "task_name": task_name,
+            "format": fmt_str,
+            "name": spec_msg.name or "",
+            "source": spec_msg.source or "",
+        }
+        model_metadata.update(metadata_updates)
+        if model_type == "PytorchModelSpec":
+            self.rpc_manager.ensure_worker(
+                model_spec,
+                master_addr=self._rpc_master_addr,
+                master_port=self._rpc_master_port,
+            )
+            device_plan = None
+        elif model_type in ("OnnxModelSpec", "HuggingFaceModelSpec"):
+            # Pass device plan for multi-device model replication
+            device_plan = self._device_plan
+        else:
+            raise _LoadRequestError(grpc.StatusCode.INVALID_ARGUMENT, "Unsupported spec type")
+        key = managers.cache_key_from_spec(spec_msg, artifact_sha256=artifact_sha)
+        return _PreparedLoad(model_spec, key, model_metadata, device_plan, model_type)
+
+    @staticmethod
+    def _cache_error_status(exc):
+        if isinstance(exc, managers.CacheExhaustedError):
+            return grpc.StatusCode.RESOURCE_EXHAUSTED
+        if isinstance(exc, managers.ModelInUseError):
+            return grpc.StatusCode.FAILED_PRECONDITION
+        if isinstance(exc, managers.CacheShutdownError):
+            return grpc.StatusCode.UNAVAILABLE
+        if isinstance(exc, managers.SessionConflictError):
+            return grpc.StatusCode.ALREADY_EXISTS
+        if isinstance(exc, managers.SessionClosedError):
+            return grpc.StatusCode.FAILED_PRECONDITION
+        if isinstance(exc, (managers.UnknownModelError, managers.UnknownSessionError)):
+            return grpc.StatusCode.NOT_FOUND
+        return grpc.StatusCode.INTERNAL
+
+    def _capability_metadata(self, model_id: str):
+        record = self.model_manager.get(model_id)
+        if record is None:
+            return []
+        capability = resolve_sam_capability(record.model, record.spec)
+        if capability is None:
+            return []
+        return [inference_pb2.MetadataEntry(key="capability.sam", value=capability.family)]
+
     def LoadModel(self, request, context):
         corr_id = uuid.uuid4().hex[:8]
         self.logger.info("LoadModel called", extra={"corr_id": corr_id})
         try:
-            # Early validation of format
-            spec_msg = request.spec
-            if spec_msg.format not in (
-                inference_pb2.PYTORCH,
-                inference_pb2.ONNX,
-                inference_pb2.HUGGINGFACE,
-                inference_pb2.TORCHHUB,
-            ):
-                context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
-                context.set_details("Unsupported model format enum")
-                return inference_pb2.LoadModelResponse(
-                    success=False, model_id="", message="unsupported format"
-                )
-            # Map enum int -> registry type string expected by model_spec_from_json
-            format_map = {
-                inference_pb2.PYTORCH: "pytorch",
-                inference_pb2.ONNX: "onnx",
-                inference_pb2.HUGGINGFACE: "huggingface",
-                inference_pb2.TORCHHUB: "torchhub",
-            }
-            fmt_str = format_map[spec_msg.format]
-            # Determine artifact path (write ONNX artifact bytes if provided); special handling for huggingface
-            model_path = spec_msg.source or ""
-            metadata_updates = {}
-            if spec_msg.artifact:
-                artifact_bytes = spec_msg.artifact
-                artifact_sha = hashlib.sha256(artifact_bytes).hexdigest()
-                existing_entry = self.registry_store.find_by_artifact_sha(artifact_sha)
-                cached_path = None
-                if existing_entry:
-                    cached_candidate = existing_entry.metadata.get("artifact_path")
-                    if cached_candidate and Path(cached_candidate).exists():
-                        cached_path = Path(cached_candidate)
-                if cached_path is None:
-                    ext_hint = {
-                        "onnx": "onnx",
-                        "pytorch": "pt",
-                        "torchhub": "pt",
-                        "huggingface": "bin",
-                    }.get(fmt_str, "bin")
-                    target_path = self.registry_store.resolve_artifact_path(artifact_sha, ext_hint)
-                    target_path.parent.mkdir(parents=True, exist_ok=True)
-                    if not target_path.exists() or target_path.stat().st_size != len(
-                        artifact_bytes
-                    ):
-                        target_path.write_bytes(artifact_bytes)
-                    cached_path = target_path
-                model_path = str(cached_path)
-                metadata_updates["artifact_path"] = str(cached_path)
-                metadata_updates["artifact_sha256"] = artifact_sha
-                if spec_msg.checksum:
-                    metadata_updates["checksum"] = spec_msg.checksum
-            if fmt_str == "huggingface":
-                # For HuggingFace we serialize repo_id explicitly (avoid misuse of model_path)
-                # Let load_huggingface and AutoModel.from_pretrained handle weight file resolution
-                if not spec_msg.source:
-                    context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
-                    context.set_details("HuggingFace models require source (repo_id)")
-                    return inference_pb2.LoadModelResponse(
-                        success=False, model_id="", message="missing repo_id"
-                    )
-                spec_dict = {
-                    "type": "huggingface",
-                    "repo_id": spec_msg.source,
-                    "name": spec_msg.name or spec_msg.source,
-                }
-                token = (
-                    spec_msg.token
-                    or os.environ.get("HF_TOKEN")
-                    or os.environ.get("HUGGINGFACE_TOKEN")
-                )
-                if token:
-                    spec_dict["token"] = token
-                    self.logger.debug(
-                        "HuggingFace token provided (length: %d)",
-                        len(token),
-                        extra={"corr_id": corr_id},
-                    )
-                else:
-                    self.logger.warning(
-                        "No HuggingFace token in request for gated repo %s",
-                        spec_msg.source,
-                        extra={"corr_id": corr_id},
-                    )
-            else:
-                spec_dict = {
-                    "type": fmt_str,
-                    "model_path": model_path,
-                    "name": spec_msg.name or "",
-                }
-                if fmt_str in ("pytorch", "torchhub") and spec_msg.model_class:
-                    spec_dict["model_class"] = spec_msg.model_class
-            if fmt_str == "pytorch":
-                # Start RPC driver before spawning worker to avoid rendezvous hangs
-                try:
-                    self._ensure_rpc_driver()
-                    if not _await_rpc_worker_ready(timeout=RPC_READY_TIMEOUT_SECONDS):
-                        # Worker might not yet be started; allow LoadModel to continue and worker to start.
-                        pass
-                except Exception:
-                    context.set_code(grpc.StatusCode.INTERNAL)
-                    context.set_details("failed to initialize RPC driver")
-                    return inference_pb2.LoadModelResponse(
-                        success=False, model_id="", message="rpc_driver_init_failed"
-                    )
-            import json as _json  # local import for clarity
-
-            model_spec = Model.model_spec_from_json(_json.dumps(spec_dict))
-            model_id = spec_msg.model_id or uuid.uuid4().hex
-            model_type = model_spec.__class__.__name__
-            try:
-                task_name = inference_pb2.TaskType.Name(spec_msg.task)
-            except ValueError:
-                task_name = "TASK_TYPE_UNSPECIFIED"
-            model_metadata = {
-                "task": int(spec_msg.task),
-                "task_name": task_name,
-                "format": fmt_str,
-                "name": spec_msg.name or "",
-                "source": spec_msg.source or "",
-            }
-            # Copy token from spec_dict if present (for HuggingFace gated repos)
-            if "token" in spec_dict:
-                model_metadata["token"] = spec_dict["token"]
-            model_metadata.update(metadata_updates)
-            if model_type == "PytorchModelSpec":
-                self.rpc_manager.ensure_worker(
-                    model_spec,
-                    master_addr=self._rpc_master_addr,
-                    master_port=self._rpc_master_port,
-                )
-                model_id = self.model_manager.load_spec(model_spec, metadata=model_metadata)
-            elif model_type in ("OnnxModelSpec", "HuggingFaceModelSpec"):
-                # Pass device plan for multi-device model replication
-                model_id = self.model_manager.load_spec(
-                    model_spec,
-                    metadata=model_metadata,
-                    device_plan=self._device_plan,
-                )
-            else:
-                context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
-                context.set_details("Unsupported spec type")
-                return inference_pb2.LoadModelResponse(
-                    success=False, model_id="", message="unsupported spec type"
-                )
+            prepared = self._prepare_load(request.spec, corr_id)
+            result = self.model_manager.load(
+                prepared.model_spec,
+                key=prepared.key,
+                metadata=prepared.metadata,
+                device_plan=prepared.device_plan,
+                overwrite=bool(request.overwrite),
+            )
+            model_id = result.model_id
             self.logger.info(
-                f"Model loaded model_id={model_id} type={model_type}",
+                f"Model loaded model_id={model_id} type={prepared.model_type} "
+                f"cache_hit={result.cache_hit}",
                 extra={"corr_id": corr_id},
             )
-            self._record_registry_entry(model_id, model_metadata)
+            self._record_registry_entry(model_id, prepared.metadata)
             return inference_pb2.LoadModelResponse(
-                success=True, model_id=model_id, message="loaded"
+                success=True,
+                model_id=model_id,
+                message="loaded",
+                effective_metadata=[
+                    inference_pb2.MetadataEntry(
+                        key="model_cache_hit", value=str(result.cache_hit).lower()
+                    )
+                ]
+                + self._capability_metadata(model_id),
             )
+        except _LoadRequestError as e:
+            context.set_code(e.code)
+            context.set_details(str(e))
+            return inference_pb2.LoadModelResponse(success=False, model_id="", message=str(e))
+        except managers.ModelCacheError as e:
+            self.logger.warning("LoadModel failed: %s", e, extra={"corr_id": corr_id})
+            context.set_code(self._cache_error_status(e))
+            context.set_details(str(e))
+            return inference_pb2.LoadModelResponse(success=False, model_id="", message=str(e))
         except Exception as e:
             self.logger.exception("LoadModel failed", extra={"corr_id": corr_id})
             context.set_code(grpc.StatusCode.INTERNAL)
@@ -397,7 +533,13 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
 
     def UnloadModel(self, request, context):
         mid = request.model_id
-        if self.model_manager.unload(mid):
+        try:
+            unloaded = self.model_manager.unload(mid)
+        except managers.ModelInUseError as e:
+            context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+            context.set_details(str(e))
+            return inference_pb2.UnloadModelResponse(success=False, message=f"model in use: {e}")
+        if unloaded:
             return inference_pb2.UnloadModelResponse(success=True, message=f"unloaded {mid}")
         return inference_pb2.UnloadModelResponse(success=False, message="unknown model_id")
 
@@ -439,34 +581,15 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
         return inference_pb2.ListModelsResponse(models=infos)
 
     # ---- Prediction ----
-    def Predict(self, request, context):
-        corr_id = uuid.uuid4().hex[:8]
-        self.logger.info(
-            f"Predict called model_id={request.model_id} shape={list(request.shape)} dtype={request.dtype}",
-            extra={"corr_id": corr_id},
-        )
-        start_total = time.time()
-        record = self.model_manager.get(request.model_id)
-        if record is None:
-            context.set_code(grpc.StatusCode.NOT_FOUND)
-            context.set_details("model_id not found")
-            return inference_pb2.PredictResponse(
-                metadata={"error": "model_not_found", "corr_id": corr_id}
-            )
-        model_obj = record.model
-        mtype = record.backend
-        model_metadata = record.metadata or {}
-
-        # PyTorch: ensure RPC worker ready
-        if mtype == "pytorch" and not self._rpc_driver_initialized:
+    def _ensure_pytorch_worker(self, record) -> Optional[str]:
+        """Make the PyTorch RPC worker usable; return an error label if it is not."""
+        if record.backend != "pytorch":
+            return None
+        if not self._rpc_driver_initialized:
             self._ensure_rpc_driver()
             if not _await_rpc_worker_ready(timeout=RPC_READY_TIMEOUT_SECONDS):
-                context.set_code(grpc.StatusCode.UNAVAILABLE)
-                context.set_details("RPC worker not ready")
-                return inference_pb2.PredictResponse(
-                    metadata={"error": "rpc_worker_not_ready", "corr_id": corr_id}
-                )
-        if mtype == "pytorch" and not self.rpc_manager.is_alive():
+                return "rpc_worker_not_ready"
+        if not self.rpc_manager.is_alive():
             try:
                 self.rpc_manager.ensure_worker(
                     record.spec,
@@ -475,276 +598,108 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
                 )
                 _await_rpc_worker_ready(timeout=RPC_READY_TIMEOUT_SECONDS)
             except Exception:
-                context.set_code(grpc.StatusCode.UNAVAILABLE)
-                context.set_details("RPC worker not available")
-                return inference_pb2.PredictResponse(
-                    metadata={"error": "rpc_worker_not_available", "corr_id": corr_id}
-                )
+                return "rpc_worker_not_available"
+        return None
 
-        # Check if client requested embeddings
-        options = request.options or {}
-        return_embeddings = _parse_bool(options.get("return_embeddings"))
-
+    def _dispatch(self, lease, input_array, options) -> "dispatch.DispatchResult":
+        """Run the shared dispatcher on the next device of the plan."""
         device_sel = self._next_device()
         device_id = device_sel.get("id", "cpu")
+        torch_device = device_id if torch.cuda.is_available() else "cpu"
+        model_obj = lease.model_for_device(device_id)
+        backend = lease.record.backend
 
-        # Get device-specific model if available
-        device_model = self.model_manager.get_model_for_device(request.model_id, device_id)
-        if device_model is not None:
-            model_obj = device_model
-
-        try:
-            input_array = deserialize_input(
-                request.input, shape=tuple(request.shape), dtype=request.dtype
-            )
-
-            start_infer = time.time()
-
-            # Check if model supports SAM-style prompting and delegate
-            if is_sam_model(request.model_id, model_metadata):
-                # Delegate to SAM handler (returns None if no prompts)
-                token = (
-                    model_metadata.get("token")
-                    or os.environ.get("HF_TOKEN")
-                    or os.environ.get("HUGGINGFACE_TOKEN")
+        def infer(array, return_embeddings):
+            if backend == "pytorch":
+                input_tensor = torch.from_numpy(np.array(array, copy=True)).float()
+                output = torch_rpc.rpc_sync(
+                    "worker", "_rpc_infer", args=(input_tensor,), timeout=RPC_INFER_TIMEOUT_SECONDS
                 )
-                if not token:
-                    self.logger.warning("No HF token in model_metadata for SAM inference")
-                output = handle_sam_inference(
-                    model_id=request.model_id,
-                    model_spec=model_metadata,
-                    image_array=input_array,
-                    options=options,
-                    device=device_sel.get("id") if torch.cuda.is_available() else "cpu",
-                    logger=self.logger,
-                    token=token,
-                )
-
-                # If no SAM prompts were provided, fall through to standard inference
-                if output is None:
-                    if mtype == "pytorch":
-                        input_tensor = torch.from_numpy(input_array).float()
-                        output = torch_rpc.rpc_sync(
-                            "worker", "_rpc_infer", args=(input_tensor,), timeout=RPC_INFER_TIMEOUT_SECONDS
-                        )
-                        if torch.is_tensor(output):
-                            output = output.detach().cpu().numpy()
-                    else:
-                        output = model_obj.predict(input_array, return_embeddings=return_embeddings)
-            else:
-                # Normal inference path (no SAM prompts)
-                if mtype == "pytorch":
-                    input_tensor = torch.from_numpy(input_array).float()
-                    output = torch_rpc.rpc_sync(
-                        "worker", "_rpc_infer", args=(input_tensor,), timeout=RPC_INFER_TIMEOUT_SECONDS
-                    )
-                    if torch.is_tensor(output):
-                        output = output.detach().cpu().numpy()
-                else:
-                    # Pass return_embeddings to predict method
-                    output = model_obj.predict(input_array, return_embeddings=return_embeddings)
-
-            # Handle dict output from models that return multiple outputs
-            embeddings_from_model = None
-            if isinstance(output, dict):
-                if isinstance(output, dict):
-                    # Extract embeddings if present
-                    if "embeddings" in output:
-                        embeddings_from_model = output["embeddings"]
-
-                    # Extract output if present, otherwise use embeddings as output
-                    if "output" in output:
-                        output = output["output"]
-                        if embeddings_from_model is not None:
-                            self.logger.debug(
-                                "Model returned both output and embeddings. Output shape: %s, Embeddings shape: %s",
-                                output.shape,
-                                embeddings_from_model.shape,
-                            )
-                    elif embeddings_from_model is not None:
-                        output = embeddings_from_model  # Use embeddings as primary output if no other output
-
-                if isinstance(output, list) and len(output) == 1:
-                    output = output[0]
                 if torch.is_tensor(output):
                     output = output.detach().cpu().numpy()
-            infer_ms = (time.time() - start_infer) * 1000.0
-            if not isinstance(output, np.ndarray):
-                output = np.array(output)
-            base_output = np.ascontiguousarray(output)
+                return output
+            return model_obj.predict(array, return_embeddings=return_embeddings)
 
-            # Store embeddings for later bundling if they were returned by the model
-            if embeddings_from_model is not None:
-                if torch.is_tensor(embeddings_from_model):
-                    embeddings_from_model = embeddings_from_model.detach().cpu().numpy()
-                if not isinstance(embeddings_from_model, np.ndarray):
-                    embeddings_from_model = np.array(embeddings_from_model)
-                embeddings_from_model = np.ascontiguousarray(embeddings_from_model)
-
-            options = request.options or {}
-            task_type = (options.get("task_type") or "").strip().lower()
-            self.logger.info(
-                f"[Server Predict] Received task_type from options: {task_type!r}",
-                extra={"corr_id": corr_id},
-            )
-            if not task_type:
-                task_hint = model_metadata.get("task_name")
-                if isinstance(task_hint, str) and task_hint:
-                    task_type = task_hint.lower()
-                else:
-                    raw_task = model_metadata.get("task")
-                    if isinstance(raw_task, int) and raw_task:
-                        try:
-                            task_type = inference_pb2.TaskType.Name(raw_task).lower()
-                        except ValueError:
-                            task_type = ""
-                self.logger.info(
-                    f"[Server Predict] task_type after fallback: {task_type!r}",
-                    extra={"corr_id": corr_id},
-                )
-            return_embeddings = _parse_bool(options.get("return_embeddings"))
-            embedding_only = task_type in {
-                "embedding",
-                "embeddings",
-                "feature",
-                "features",
-            }
-            geotransform_opt = options.get("geotransform")
-            projection_opt = (
-                options.get("projection") or options.get("crs") or options.get("crs_wkt")
-            )
-
-            response_array = base_output
-            meta = {
-                "corr_id": corr_id,
-                "latency_infer_ms": f"{infer_ms:.2f}",
-                "model_type": mtype,
-                "model_id": request.model_id,
+        result = dispatch.run_prediction(
+            lease,
+            image=input_array,
+            options=options,
+            device_id=device_id,
+            torch_device=torch_device,
+            infer=infer,
+            logger=self.logger,
+        )
+        result.metadata.update(
+            {
+                "model_type": backend,
+                "model_id": lease.model_id,
                 "device_id": device_sel.get("id"),
                 "device_type": device_sel.get("type"),
             }
+        )
+        return result
 
-            if task_type:
-                meta["task_type"] = task_type
-
-            model_task_name = model_metadata.get("task_name")
-            if model_task_name:
-                meta.setdefault("model_task", model_task_name)
-
-            if embedding_only:
-                meta["result_type"] = "embeddings"
-                meta["return_embeddings"] = "true"
-                meta["embeddings_available"] = "true"
-                meta["embeddings_shape"] = json.dumps(list(base_output.shape))
-                meta["embeddings_dtype"] = str(base_output.dtype)
-
-            if embedding_only:
-                bundle_payload = {"embeddings": base_output}
-            else:
-                # Use embeddings from model if available, otherwise use base_output if requested
-                if embeddings_from_model is not None:
-                    bundle_payload = (
-                        {"embeddings": embeddings_from_model} if return_embeddings else None
-                    )
-                else:
-                    bundle_payload = {"embeddings": base_output} if return_embeddings else None
-
-            if not embedding_only and task_type == "segmentation":
-                self.logger.info(
-                    f"[Server Predict] Applying prepare_segmentation_mask for task_type='segmentation', base_output shape: {base_output.shape}",
-                    extra={"corr_id": corr_id},
-                )
-                try:
-                    masks = prepare_segmentation_mask(base_output)
-                    response_array = masks
-                    meta["result_type"] = "segmentation_mask"
-                    meta["mask_shape"] = str(list(masks.shape))
-                    meta["mask_dtype"] = str(masks.dtype)
-                    self.logger.info(
-                        f"[Server Predict] prepare_segmentation_mask succeeded, masks shape: {masks.shape}, dtype: {masks.dtype}",
-                        extra={"corr_id": corr_id},
-                    )
-                except Exception as exc:  # pragma: no cover - defensive
-                    self.logger.warning(
-                        f"[Server Predict] prepare_segmentation_mask failed: {exc}",
-                        extra={"corr_id": corr_id},
-                    )
-                    meta["result_type"] = "raw"
-                    meta["task_warning"] = f"segmentation_fallback:{exc}"
-                    response_array = output
-            elif not embedding_only and task_type in {
-                "object_detection",
-                "object-detection",
-                "detection",
-            }:
-                try:
-                    masks = prepare_segmentation_mask(base_output)
-                    boxes = masks_to_bounding_boxes(masks)
-                    response_array = boxes
-                    meta["result_type"] = "bounding_boxes"
-                    meta["boxes_count"] = str(boxes.shape[0])
-                    meta["box_format"] = "batch_index,class_id,x_min,y_min,x_max,y_max"
-                except Exception as exc:  # pragma: no cover - defensive
-                    meta["result_type"] = "raw"
-                    meta["task_warning"] = f"detection_fallback:{exc}"
-                    response_array = output
-            else:
-                self.logger.info(
-                    f"[Server Predict] NOT applying segmentation mask. embedding_only={embedding_only}, task_type={task_type!r}, response_array shape: {response_array.shape}",
-                    extra={"corr_id": corr_id},
-                )
-                if task_type:
-                    meta.setdefault("result_type", "raw")
-
-            bundle_requested = return_embeddings and not embedding_only
-
-            if geotransform_opt:
-                meta.setdefault("geotransform", str(geotransform_opt))
-            if projection_opt:
-                meta.setdefault("projection", str(projection_opt))
-            if return_embeddings or embedding_only:
-                meta["return_embeddings"] = "true"
-
-            if bundle_requested:
-                bundle = bundle_payload or {"embeddings": base_output}
-                result_type = meta.get("result_type", "raw")
-                if result_type == "segmentation_mask":
-                    bundle["mask"] = np.ascontiguousarray(response_array)
-                elif result_type == "bounding_boxes":
-                    bundle["detections"] = np.ascontiguousarray(response_array)
-                bundle_bytes = pack_tensor_bundle(bundle)
-                response_array = np.frombuffer(bundle_bytes, dtype=np.uint8)
-                meta["payload_format"] = "npz"
-                meta["bundle_size_bytes"] = str(len(bundle_bytes))
-                meta["bundle_keys"] = ",".join(sorted(bundle.keys()))
-                meta["embeddings_available"] = "true"
-                meta["embeddings_shape"] = json.dumps(list(base_output.shape))
-                meta["embeddings_dtype"] = str(base_output.dtype)
-            elif embedding_only and bundle_payload is not None:
-                bundle_bytes = pack_tensor_bundle(bundle_payload)
-                response_array = np.frombuffer(bundle_bytes, dtype=np.uint8)
-                meta["payload_format"] = "npz"
-                meta["bundle_size_bytes"] = str(len(bundle_bytes))
-                meta["bundle_keys"] = ",".join(sorted(bundle_payload.keys()))
-
-            response_array = np.ascontiguousarray(response_array)
-            meta.setdefault("result_type", "raw")
-            total_ms = (time.time() - start_total) * 1000.0
-            meta["latency_total_ms"] = f"{total_ms:.2f}"
-
-            self._record_registry_entry(request.model_id, model_metadata)
-
+    def Predict(self, request, context):
+        corr_id = uuid.uuid4().hex[:8]
+        self.logger.info(
+            f"Predict called model_id={request.model_id} shape={list(request.shape)} dtype={request.dtype}",
+            extra={"corr_id": corr_id},
+        )
+        start_total = time.time()
+        try:
+            lease = self.model_manager.acquire_execution(model_id=request.model_id)
+        except (managers.UnknownModelError, ValueError):
+            context.set_code(grpc.StatusCode.NOT_FOUND)
+            context.set_details("model_id not found")
             return inference_pb2.PredictResponse(
-                output=serialize_output(response_array),
-                shape=list(response_array.shape),
-                dtype=str(response_array.dtype),
+                metadata={"error": "model_not_found", "corr_id": corr_id}
+            )
+        except managers.ModelCacheError as e:
+            context.set_code(self._cache_error_status(e))
+            context.set_details(str(e))
+            return inference_pb2.PredictResponse(metadata={"error": str(e), "corr_id": corr_id})
+
+        try:
+            record = lease.record
+            worker_error = self._ensure_pytorch_worker(record)
+            if worker_error:
+                context.set_code(grpc.StatusCode.UNAVAILABLE)
+                context.set_details(worker_error.replace("_", " "))
+                return inference_pb2.PredictResponse(
+                    metadata={"error": worker_error, "corr_id": corr_id}
+                )
+            input_array = dispatch.decode_input(request.input, tuple(request.shape), request.dtype)
+            result = self._dispatch(lease, input_array, dict(request.options))
+            meta = dict(result.metadata)
+            meta["corr_id"] = corr_id
+            meta["latency_total_ms"] = f"{(time.time() - start_total) * 1000.0:.2f}"
+            self._record_registry_entry(request.model_id, record.metadata or {})
+            return inference_pb2.PredictResponse(
+                output=result.output,
+                shape=result.shape,
+                dtype=result.dtype,
                 metadata=meta,
+            )
+        except dispatch.DispatchError as e:
+            self.logger.warning("Predict rejected: %s", e, extra={"corr_id": corr_id})
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            context.set_details(str(e))
+            return inference_pb2.PredictResponse(
+                metadata={"error": str(e), "error_code": e.code, "corr_id": corr_id}
             )
         except Exception as e:
             self.logger.exception("Predict failed", extra={"corr_id": corr_id})
             context.set_code(grpc.StatusCode.INTERNAL)
             context.set_details(str(e))
-            return inference_pb2.PredictResponse(metadata={"error": str(e), "corr_id": corr_id})
+            return inference_pb2.PredictResponse(
+                metadata={
+                    "error": str(e),
+                    "error_code": dispatch.ERROR_INFERENCE_FAILED,
+                    "corr_id": corr_id,
+                }
+            )
+        finally:
+            lease.release()
 
     def _ensure_rpc_driver(self):
         """Initialize RPC driver for PyTorch RPC worker if not already running."""
@@ -775,517 +730,298 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
             self.logger.exception("Failed to initialize RPC driver")
             raise
 
+    # ---- Streaming ----
+    @staticmethod
+    def _stream_response(session_id, meta, corr_id):
+        meta = dict(meta)
+        meta["corr_id"] = corr_id
+        if session_id:
+            meta["session_id"] = session_id
+        return inference_pb2.StreamPredictResponse(metadata=meta, end_of_sequence=True)
+
+    def _stream_error(self, book, session_id, corr_id, code, message):
+        """A stream-scope failure: no tile_id; the host marks every unresolved tile error."""
+        if book is not None:
+            with book.lock:
+                book.errors.append(f"{code}: {message}")
+        meta = {
+            "error": message,
+            "error_code": code,
+            "error_scope": dispatch.SCOPE_STREAM,
+        }
+        return self._stream_response(session_id, meta, corr_id)
+
+    def _tile_error(self, book, session_id, corr_id, tile_id, code, message):
+        """A tile-scope failure: only this tile failed; the stream continues."""
+        with book.lock:
+            book.failed_tiles += 1
+            book.errors.append(f"{tile_id}: {code}: {message}")
+        meta = {
+            "error": message,
+            "error_code": code,
+            "error_scope": dispatch.SCOPE_TILE,
+            "tile_id": tile_id,
+        }
+        return self._stream_response(session_id, meta, corr_id)
+
+    def _begin_stream(self, first_request, session_id: str):
+        """Acquire the execution lease and limits for a stream. Raises manager errors."""
+        if session_id:
+            lease = self.model_manager.acquire_execution(session_id=session_id)
+            with self._sessions_lock:
+                book = self._sessions.get(session_id)
+            if book is None:  # pragma: no cover - session opened on the manager directly
+                book = self._new_book(session_id, lease.model_id, {}, None, 0, 0)
+                with self._sessions_lock:
+                    self._sessions.setdefault(session_id, book)
+            return lease, book
+        model_id = first_request.model_id
+        if not model_id:
+            raise managers.UnknownModelError("model_id is required for a stream without session_id")
+        lease = self.model_manager.acquire_execution(model_id=model_id)
+        book = self._new_book("", model_id, {}, None, 0, 0)
+        return lease, book
+
+    def _new_book(
+        self, session_id, model_id, options, total_tiles, max_inflight, max_chunk_bytes,
+        max_tile_bytes=0,
+    ):
+        default_tile_bytes = min(self._default_tile_bytes, GRPC_MAX_MESSAGE_LENGTH)
+        return _SessionBook(
+            session_id=session_id,
+            model_id=model_id,
+            max_inflight=int(max_inflight or self._default_max_inflight),
+            max_chunk_bytes=int(max_chunk_bytes or self._default_chunk_bytes),
+            max_tile_bytes=int(max_tile_bytes or default_tile_bytes),
+            options=dispatch.session_inference_options(options),
+            total_tiles=total_tiles,
+            created_at=time.time(),
+        )
+
+    def _start_tile(self, tile, context_map, book):
+        """Record a tile's first message; return (code, message) if the tile already failed."""
+        with book.lock:
+            duplicate = tile.tile_id in book.seen_tiles
+            book.seen_tiles.add(tile.tile_id)
+        if duplicate:
+            return dispatch.ERROR_DUPLICATE_TILE_ID, f"tile {tile.tile_id} was already sent"
+        try:
+            decoded = dispatch.decode_tile_context(context_map)
+        except dispatch.MalformedOptionsError as exc:
+            return exc.code, str(exc)
+        tile.options = decoded.options
+        return None
+
+    def _add_chunk(self, tile, req, book):
+        """Append one data message to the tile; return (code, message) on a tile failure."""
+        chunk = req.chunk or b""
+        if len(chunk) > book.max_chunk_bytes:
+            return (
+                dispatch.ERROR_CHUNK_TOO_LARGE,
+                f"chunk exceeds max_chunk_bytes: {len(chunk)} > {book.max_chunk_bytes}",
+            )
+        if len(tile.data) + len(chunk) > book.max_tile_bytes:
+            return (
+                dispatch.ERROR_TILE_TOO_LARGE,
+                f"tile exceeds max_tile_bytes: {len(tile.data) + len(chunk)} > {book.max_tile_bytes}",
+            )
+        shape = tuple(int(d) for d in req.shape) if req.shape else None
+        dtype = req.dtype or None
+        if shape is not None:
+            if tile.shape is None:
+                tile.shape = shape
+            elif shape != tile.shape:
+                return dispatch.ERROR_MALFORMED_PAYLOAD, "shape changed within a tile"
+        if dtype is not None:
+            if tile.dtype is None:
+                tile.dtype = dtype
+            elif dtype != tile.dtype:
+                return dispatch.ERROR_MALFORMED_PAYLOAD, "dtype changed within a tile"
+        tile.data.extend(chunk)
+        return None
+
+    def _run_tile(self, lease, book, session_id, tile, corr_id):
+        """Dispatch one complete tile and return its response (success or tile error)."""
+        try:
+            input_array = dispatch.decode_input(bytes(tile.data), tile.shape, tile.dtype)
+            options = dispatch.effective_tile_options(book.options, tile.options)
+            result = self._dispatch(lease, input_array, options)
+        except dispatch.DispatchError as exc:
+            return self._tile_error(book, session_id, corr_id, tile.tile_id, exc.code, str(exc))
+        except Exception as exc:
+            self.logger.exception("StreamPredict tile %s failed", tile.tile_id, extra={"corr_id": corr_id})
+            return self._tile_error(
+                book, session_id, corr_id, tile.tile_id, dispatch.ERROR_INFERENCE_FAILED, str(exc)
+            )
+        with book.lock:
+            book.ok_tiles += 1
+            done = book.ok_tiles + book.failed_tiles
+        meta = dict(result.metadata)
+        meta["tile_id"] = tile.tile_id
+        if book.total_tiles:
+            meta["progress"] = f"{done}/{book.total_tiles}"
+        response = self._stream_response(session_id, meta, corr_id)
+        response.output = result.output
+        response.shape.extend(result.shape)
+        response.dtype = result.dtype
+        return response
+
+    def _check_session_open(self, book, session_id, corr_id):
+        """None while the session is open, else the stream-scope error to send."""
+        state = self._session_state(session_id)
+        if state == "open":
+            return None
+        return self._session_closed_error(book, session_id, corr_id, state)
+
+    def _session_closed_error(self, book, session_id, corr_id, state=None):
+        state = state or self._session_state(session_id)
+        code = dispatch.ERROR_CANCELLED if state == "cancelled" else dispatch.ERROR_SESSION_NOT_OPEN
+        return self._stream_error(book, session_id, corr_id, code, f"session {session_id} is {state}")
+
     def StreamPredict(self, request_iterator, context):
-        """Streaming prediction supporting chunked input and streamed output.
+        """Bidirectional streaming prediction; see the module docstring for the v1 contract.
 
-        Supports multiple logical samples per stream, delimited by end_of_sequence flags.
-        Enforces basic size limits and respects client cancellation.
-
-        Batch Processing:
-            When batch_size > 1 is specified via session options or context,
-            tiles are accumulated and processed together for efficiency.
-            Results are still yielded individually to maintain streaming semantics.
+        Each tile is dispatched through the same code path as unary Predict. A session
+        stream holds one execution lease on the session's model from the first message
+        until the stream ends, checks that the session is still open before every
+        message, and closes the session with reason ``disconnected`` if the client
+        goes away or ``failed`` after a stream-scope server error.
         """
 
         corr_id = uuid.uuid4().hex[:8]
         self.logger.info("StreamPredict called", extra={"corr_id": corr_id})
 
-        buffer = []
-        shape = None
-        dtype = None
-        options = {}
-        model_id = None
-        model_obj = None
-        mtype = None
-        model_metadata = None
-        record = None
-        session_id = None
-        session_state = None
-        max_tile_bytes = self._default_tile_bytes
-        max_inflight = self._default_max_inflight
-        max_chunk_bytes = self._default_chunk_bytes
-        last_tile_id = None
-
-        # Batching state
-        batch_size = DEFAULT_BATCH_SIZE
-        pending_tiles = []  # List of (tile_id, input_bytes, shape, dtype, options)
-
-        def _process_batch(tiles):
-            """Process multiple tiles in a batch and yield individual responses.
-
-            Args:
-                tiles: List of (tile_id, input_bytes, shape, dtype, tile_options) tuples
-
-            Yields:
-                StreamPredictResponse for each tile in the batch
-            """
-            nonlocal model_id, model_obj, mtype, model_metadata, session_state, session_id
-
-            if not tiles:
-                return
-
-            device_sel = self._next_device()
-            device_id = device_sel.get("id", "cpu")
-
-            # Get device-specific model if available
-            device_model = self.model_manager.get_model_for_device(model_id, device_id)
-            effective_model = device_model if device_model is not None else model_obj
-
-            task_type = (options.get("task_type") or model_metadata.get("task_name") or "").lower()
-
-            # Process each tile (future: could batch into single model call for compatible models)
-            for tile_id, input_bytes, tile_shape, tile_dtype, tile_opts in tiles:
-                try:
-                    if len(input_bytes) > max_tile_bytes:
-                        meta = {
-                            "error": f"tile exceeds max bytes: {len(input_bytes)} > {max_tile_bytes}",
-                            "corr_id": corr_id,
-                        }
-                        if session_id:
-                            meta["session_id"] = session_id
-                        if tile_id:
-                            meta["tile_id"] = tile_id
-                        if session_state is not None:
-                            session_state["failed_tiles"] = session_state.get("failed_tiles", 0) + 1
-                            session_state.setdefault("errors", []).append(meta["error"])
-                        yield inference_pb2.StreamPredictResponse(
-                            metadata=meta,
-                            end_of_sequence=True,
-                        )
-                        continue
-
-                    input_array = deserialize_input(input_bytes, shape=tile_shape, dtype=tile_dtype)
-
-                    # Inference
-                    if mtype == "pytorch":
-                        input_tensor = torch.from_numpy(input_array).float()
-                        output = torch_rpc.rpc_sync(
-                            "worker", "_rpc_infer", args=(input_tensor,), timeout=RPC_INFER_TIMEOUT_SECONDS
-                        )
-                        if torch.is_tensor(output):
-                            output = output.detach().cpu().numpy()
-                    else:
-                        output = effective_model.predict(input_array, return_embeddings=False)
-
-                    if not isinstance(output, np.ndarray):
-                        output = np.array(output)
-
-                    meta = {
-                        "corr_id": corr_id,
-                        "model_type": mtype,
-                        "model_id": model_id,
-                        "device_id": device_sel.get("id"),
-                        "device_type": device_sel.get("type"),
-                        "batch_size": str(len(tiles)),
-                    }
-                    if session_id:
-                        meta["session_id"] = session_id
-                    if tile_id:
-                        meta["tile_id"] = tile_id
-                    if session_state:
-                        total_tiles = session_state.get("total_tiles")
-                        done = (
-                            session_state.get("ok_tiles", 0)
-                            + session_state.get("failed_tiles", 0)
-                            + 1
-                        )
-                        if total_tiles:
-                            meta["progress"] = f"{done}/{total_tiles}"
-
-                    response_array = output
-                    confidence_array = None
-                    if task_type == "segmentation":
-                        try:
-                            # Use confidence-preserving version
-                            masks, confidence_array = prepare_segmentation_mask_with_confidence(
-                                output
-                            )
-                            response_array = masks
-                            meta["result_type"] = "segmentation_mask"
-                            meta["mask_shape"] = str(list(masks.shape))
-                            meta["mask_dtype"] = str(masks.dtype)
-                            # Include confidence stats in metadata
-                            if confidence_array is not None:
-                                meta["confidence_min"] = f"{float(confidence_array.min()):.4f}"
-                                meta["confidence_max"] = f"{float(confidence_array.max()):.4f}"
-                                meta["confidence_mean"] = f"{float(confidence_array.mean()):.4f}"
-                                meta["has_confidence"] = "true"
-                        except Exception as exc:
-                            meta["result_type"] = "raw"
-                            meta["task_warning"] = f"segmentation_fallback:{exc}"
-
-                    # Pack response with optional confidence data
-                    response_array = np.ascontiguousarray(response_array)
-                    if session_state is not None:
-                        session_state["ok_tiles"] = session_state.get("ok_tiles", 0) + 1
-
-                    # If confidence available, pack both mask and confidence into bundle
-                    if confidence_array is not None:
-                        bundle = pack_tensor_bundle(
-                            {
-                                "mask": response_array,
-                                "confidence": np.ascontiguousarray(confidence_array),
-                            }
-                        )
-                        meta["packed_bundle"] = "true"
-                        yield inference_pb2.StreamPredictResponse(
-                            output=bundle,
-                            shape=list(response_array.shape),
-                            dtype=str(response_array.dtype),
-                            end_of_sequence=True,
-                            metadata=meta,
-                        )
-                    else:
-                        yield inference_pb2.StreamPredictResponse(
-                            output=serialize_output(response_array),
-                            shape=list(response_array.shape),
-                            dtype=str(response_array.dtype),
-                            end_of_sequence=True,
-                            metadata=meta,
-                        )
-                except Exception as exc:
-                    if session_state is not None:
-                        session_state["failed_tiles"] = session_state.get("failed_tiles", 0) + 1
-                        session_state.setdefault("errors", []).append(str(exc))
-                    error_meta = {"error": str(exc), "corr_id": corr_id}
-                    if session_id:
-                        error_meta["session_id"] = session_id
-                    if tile_id:
-                        error_meta["tile_id"] = tile_id
-                    yield inference_pb2.StreamPredictResponse(
-                        metadata=error_meta,
-                        end_of_sequence=True,
-                    )
-
-        def _flush_sample(tile_id: str | None = None):
-            nonlocal \
-                buffer, \
-                shape, \
-                dtype, \
-                options, \
-                model_id, \
-                model_obj, \
-                mtype, \
-                model_metadata, \
-                session_state
-
-            if not buffer:
-                return None
-            if not shape or not dtype:
-                raise ValueError("missing shape or dtype in stream")
-
-            device_sel = self._next_device()
-            device_id = device_sel.get("id", "cpu")
-
-            # Get device-specific model if available
-            device_model = self.model_manager.get_model_for_device(model_id, device_id)
-            effective_model = device_model if device_model is not None else model_obj
-
-            input_bytes = b"".join(buffer)
-            if len(input_bytes) > max_tile_bytes:
-                meta = {
-                    "error": f"stream sample exceeds max message limit: {len(input_bytes)} > {max_tile_bytes}",
-                    "corr_id": corr_id,
-                }
-                if session_id:
-                    meta["session_id"] = session_id
-                if tile_id:
-                    meta["tile_id"] = tile_id
-                if session_state is not None:
-                    session_state["failed_tiles"] = session_state.get("failed_tiles", 0) + 1
-                    session_state.setdefault("errors", []).append(meta["error"])
-                buffer = []
-                return inference_pb2.StreamPredictResponse(
-                    metadata=meta,
-                    end_of_sequence=True,
-                )
-
-            input_array = deserialize_input(input_bytes, shape=shape, dtype=dtype)
-
-            # Inference using device-specific model
-            if mtype == "pytorch":
-                input_tensor = torch.from_numpy(input_array).float()
-                output = torch_rpc.rpc_sync(
-                    "worker", "_rpc_infer", args=(input_tensor,), timeout=RPC_INFER_TIMEOUT_SECONDS
-                )
-                if torch.is_tensor(output):
-                    output = output.detach().cpu().numpy()
-            else:
-                output = effective_model.predict(input_array, return_embeddings=False)
-
-            if not isinstance(output, np.ndarray):
-                output = np.array(output)
-
-            task_type = (options.get("task_type") or model_metadata.get("task_name") or "").lower()
-            meta = {
-                "corr_id": corr_id,
-                "model_type": mtype,
-                "model_id": model_id,
-                "device_id": device_sel.get("id"),
-                "device_type": device_sel.get("type"),
-            }
-            if session_id:
-                meta["session_id"] = session_id
-            if tile_id:
-                meta["tile_id"] = tile_id
-            if session_state:
-                total_tiles = session_state.get("total_tiles")
-                done = session_state.get("ok_tiles", 0) + session_state.get("failed_tiles", 0) + 1
-                if total_tiles:
-                    meta["progress"] = f"{done}/{total_tiles}"
-
-            response_array = output
-            if task_type == "segmentation":
-                try:
-                    masks = prepare_segmentation_mask(output)
-                    response_array = masks
-                    meta["result_type"] = "segmentation_mask"
-                    meta["mask_shape"] = str(list(masks.shape))
-                    meta["mask_dtype"] = str(masks.dtype)
-                except Exception as exc:
-                    meta["result_type"] = "raw"
-                    meta["task_warning"] = f"segmentation_fallback:{exc}"
-
-            response_array = np.ascontiguousarray(response_array)
-            resp = inference_pb2.StreamPredictResponse(
-                output=serialize_output(response_array),
-                shape=list(response_array.shape),
-                dtype=str(response_array.dtype),
-                end_of_sequence=True,
-                metadata=meta,
-            )
-            buffer = []
-            return resp
-
+        lease = None
+        book = None
+        session_id = ""
+        outcome = "disconnected"  # until the request stream ends or a stream error is sent
+        tile = None
         try:
             for req in request_iterator:
-                if hasattr(context, "cancelled") and callable(getattr(context, "cancelled")):
-                    cancelled_flag = False
+                ctx = dict(req.context)
+                if lease is None:
+                    session_id = ctx.get(dispatch.CONTEXT_SESSION_ID, "")
                     try:
-                        cancelled_flag = bool(context.cancelled())
-                    except Exception:
-                        cancelled_flag = False
-                    if cancelled_flag:
-                        # Flush any pending batch before cancellation
-                        if pending_tiles:
-                            for resp in _process_batch(pending_tiles):
-                                yield resp
-                            pending_tiles = []
-                        raise RuntimeError("client_cancelled")
-                if model_id is None:
-                    model_id = req.model_id
-                    session_id = req.context.get("session_id") if req.context else None
-                    # Extract batch_size from context
-                    if req.context and req.context.get("batch_size"):
-                        try:
-                            batch_size = max(1, int(req.context.get("batch_size")))
-                        except (ValueError, TypeError):
-                            batch_size = DEFAULT_BATCH_SIZE
-                    if session_id:
-                        session_state = self._sessions.get(session_id)
-                        if session_state is None:
-                            session_state = {
-                                "model_id": model_id,
-                                "created_at": time.time(),
-                                "max_inflight": max_inflight,
-                                "max_chunk_bytes": max_chunk_bytes,
-                                "max_tile_bytes": max_tile_bytes,
-                                "batch_size": batch_size,
-                                "ok_tiles": 0,
-                                "failed_tiles": 0,
-                                "errors": [],
-                            }
-                            self._sessions[session_id] = session_state
-                        max_inflight = int(session_state.get("max_inflight", max_inflight))
-                        max_tile_bytes = int(session_state.get("max_tile_bytes", max_tile_bytes))
-                        max_chunk_bytes = int(session_state.get("max_chunk_bytes", max_chunk_bytes))
-                        batch_size = int(session_state.get("batch_size", batch_size))
-                    record = self.model_manager.get(model_id)
-                    if record is None:
-                        raise RuntimeError("model_id not found")
-                    model_obj = record.model
-                    mtype = record.backend
-                    model_metadata = record.metadata or {}
-                    if mtype == "pytorch":
-                        if not self._rpc_driver_initialized:
-                            self._ensure_rpc_driver()
-                        if not self.rpc_manager.is_alive():
-                            self.rpc_manager.ensure_worker(
-                                record.spec,
-                                master_addr=self._rpc_master_addr,
-                                master_port=self._rpc_master_port,
-                            )
-                        if not _await_rpc_worker_ready(timeout=RPC_READY_TIMEOUT_SECONDS):
-                            raise RuntimeError("RPC worker not ready")
-                if shape is None:
-                    shape = tuple(req.shape) if req.shape else None
-                if dtype is None:
-                    dtype = req.dtype or "float32"
-                if not options and req.context:
-                    options = dict(req.context)
-
-                if req.context and req.context.get("tile_id"):
-                    last_tile_id = req.context.get("tile_id")
-
-                chunk = req.chunk or b""
-                if len(chunk) > max_chunk_bytes:
-                    if session_state is not None:
-                        session_state["failed_tiles"] = session_state.get("failed_tiles", 0) + 1
-                        session_state.setdefault("errors", []).append(
-                            f"chunk_over_limit:{len(chunk)}"
+                        lease, book = self._begin_stream(req, session_id)
+                    except managers.UnknownSessionError:
+                        context.set_code(grpc.StatusCode.NOT_FOUND)
+                        context.set_details(f"unknown_session: {session_id}")
+                        outcome = "rejected"
+                        yield self._stream_error(
+                            None, session_id, corr_id, dispatch.ERROR_UNKNOWN_SESSION,
+                            f"session {session_id} was not opened with OpenSession",
                         )
-                    error_meta = {
-                        "error": f"chunk exceeds max_chunk_bytes: {len(chunk)} > {max_chunk_bytes}",
-                        "corr_id": corr_id,
-                    }
-                    if session_id:
-                        error_meta["session_id"] = session_id
-                    if last_tile_id:
-                        error_meta["tile_id"] = last_tile_id
-                    resp = inference_pb2.StreamPredictResponse(
-                        metadata=error_meta,
-                        end_of_sequence=True,
+                        return
+                    except managers.SessionClosedError:
+                        outcome = "rejected"
+                        yield self._session_closed_error(None, session_id, corr_id)
+                        return
+                    except managers.UnknownModelError:
+                        outcome = "rejected"
+                        context.set_code(grpc.StatusCode.NOT_FOUND)
+                        context.set_details("model_id not found")
+                        return
+                    except managers.ModelCacheError as exc:
+                        outcome = "rejected"
+                        context.set_code(self._cache_error_status(exc))
+                        context.set_details(str(exc))
+                        return
+                    if session_id and req.model_id and req.model_id != lease.model_id:
+                        outcome = "failed"
+                        yield self._stream_error(
+                            book, session_id, corr_id, dispatch.ERROR_MALFORMED_PAYLOAD,
+                            "model_id does not match the session's model",
+                        )
+                        return
+                    worker_error = self._ensure_pytorch_worker(lease.record)
+                    if worker_error:
+                        outcome = "failed"
+                        yield self._stream_error(
+                            book, session_id, corr_id, dispatch.ERROR_INTERNAL, worker_error
+                        )
+                        return
+
+                if session_id:
+                    msg_sid = ctx.get(dispatch.CONTEXT_SESSION_ID, "")
+                    if msg_sid and msg_sid != session_id:
+                        outcome = "failed"
+                        yield self._stream_error(
+                            book, session_id, corr_id, dispatch.ERROR_MALFORMED_PAYLOAD,
+                            "session_id changed within a stream",
+                        )
+                        return
+                    closed = self._check_session_open(book, session_id, corr_id)
+                    if closed is not None:
+                        outcome = "failed"
+                        yield closed
+                        return
+
+                tile_id = ctx.get(dispatch.CONTEXT_TILE_ID, "")
+                if not tile_id and tile is not None and req.end_of_sequence and not req.chunk:
+                    tile_id = tile.tile_id  # legacy end-of-sequence message without tile_id
+                if not tile_id:
+                    outcome = "failed"
+                    yield self._stream_error(
+                        book, session_id, corr_id, dispatch.ERROR_MISSING_TILE_ID,
+                        "message without context['tile_id']",
                     )
-                    # count as failed
-                    if session_state is not None:
-                        session_state["failed_tiles"] = session_state.get("failed_tiles", 0) + 0
-                    yield resp
-                    buffer = []
-                    shape = None
-                    dtype = None
-                    options = {}
                     return
 
-                buffer.append(chunk)
+                if tile is not None and tile.tile_id != tile_id:
+                    if not tile.reported:
+                        yield self._tile_error(
+                            book, session_id, corr_id, tile.tile_id,
+                            dispatch.ERROR_MALFORMED_PAYLOAD, "tile ended without end_of_sequence",
+                        )
+                    tile = None
+                if tile is None:
+                    tile = _TileBuffer(tile_id)
+                    failure = self._start_tile(tile, ctx, book)
+                    if failure is not None:
+                        tile.reported = True
+                        yield self._tile_error(book, session_id, corr_id, tile_id, *failure)
 
-                if len(buffer) > max_inflight:
-                    error_meta = {
-                        "error": "backpressure: too many buffered chunks",
-                        "corr_id": corr_id,
-                    }
-                    if session_id:
-                        error_meta["session_id"] = session_id
-                    if last_tile_id:
-                        error_meta["tile_id"] = last_tile_id
-                    resp = inference_pb2.StreamPredictResponse(
-                        metadata=error_meta, end_of_sequence=True
-                    )
-                    if session_state is not None:
-                        session_state["failed_tiles"] = session_state.get("failed_tiles", 0) + 1
-                        session_state.setdefault("errors", []).append(error_meta["error"])
-                    yield resp
-                    buffer = []
-                    shape = None
-                    dtype = None
-                    options = {}
-                    return
+                if not tile.reported and (req.chunk or not req.end_of_sequence):
+                    failure = self._add_chunk(tile, req, book)
+                    if failure is not None:
+                        tile.reported = True
+                        tile.data = bytearray()  # drop the partial tile; drain until its EOS
+                        yield self._tile_error(book, session_id, corr_id, tile_id, *failure)
 
                 if req.end_of_sequence:
-                    tile_id = None
-                    if req.context and req.context.get("tile_id"):
-                        tile_id = req.context.get("tile_id")
-                    if tile_id is None:
-                        tile_id = last_tile_id
-                    last_tile_id = tile_id or last_tile_id
+                    if not tile.reported:
+                        is_active = getattr(context, "is_active", None)
+                        if callable(is_active) and not is_active():
+                            return  # the client is gone: do not run inference for nobody
+                        if session_id:
+                            self.model_manager.touch_session(session_id)
+                        yield self._run_tile(lease, book, session_id, tile, corr_id)
+                    tile = None
 
-                    # Accumulate tile for batching
-                    input_bytes = b"".join(buffer)
-                    tile_shape = shape
-                    tile_dtype = dtype
-                    tile_opts = dict(options)
-                    pending_tiles.append((tile_id, input_bytes, tile_shape, tile_dtype, tile_opts))
-
-                    # Reset buffer for next tile
-                    buffer = []
-                    shape = None
-                    dtype = None
-                    options = {}
-
-                    # Process batch when full
-                    if len(pending_tiles) >= batch_size:
-                        try:
-                            for result in _process_batch(pending_tiles):
-                                yield result
-                        except Exception as exc:
-                            if session_state is not None:
-                                session_state["failed_tiles"] = session_state.get(
-                                    "failed_tiles", 0
-                                ) + len(pending_tiles)
-                                session_state.setdefault("errors", []).append(str(exc))
-                            raise
-                        finally:
-                            pending_tiles = []
-        except Exception as exc:  # pragma: no cover - defensive
+            if tile is not None and not tile.reported:
+                yield self._tile_error(
+                    book, session_id, corr_id, tile.tile_id,
+                    dispatch.ERROR_MALFORMED_PAYLOAD, "stream ended before end_of_sequence",
+                )
+            outcome = "completed"
+        except grpc.RpcError:
+            # The client cancelled or disconnected while the server waited for a message.
+            outcome = "disconnected"
+        except Exception as exc:
             self.logger.exception("StreamPredict failed", extra={"corr_id": corr_id})
-            # Flush pending tiles before error response
-            if pending_tiles:
-                try:
-                    for result in _process_batch(pending_tiles):
-                        yield result
-                except Exception:
-                    pass
-                pending_tiles = []
-            if session_state is not None:
-                session_state["failed_tiles"] = session_state.get("failed_tiles", 0) + 1
-                session_state.setdefault("errors", []).append(str(exc))
-            error_meta = {"error": str(exc), "corr_id": corr_id}
-            if session_id:
-                error_meta["session_id"] = session_id
-            if last_tile_id:
-                error_meta["tile_id"] = last_tile_id
-            # Clear buffer to avoid double-flush after error
-            buffer = []
-            shape = None
-            dtype = None
-            options = {}
-            yield inference_pb2.StreamPredictResponse(metadata=error_meta, end_of_sequence=True)
-            return
-
-        # Flush any pending batch tiles
-        if pending_tiles:
-            try:
-                for result in _process_batch(pending_tiles):
-                    yield result
-            except Exception as exc:  # pragma: no cover - defensive
-                self.logger.exception(
-                    "StreamPredict failed flushing pending batch", extra={"corr_id": corr_id}
-                )
-                if session_state is not None:
-                    session_state["failed_tiles"] = session_state.get("failed_tiles", 0) + len(
-                        pending_tiles
-                    )
-                    session_state.setdefault("errors", []).append(str(exc))
-                error_meta = {"error": str(exc), "corr_id": corr_id}
+            outcome = "failed"
+            yield self._stream_error(book, session_id, corr_id, dispatch.ERROR_INTERNAL, str(exc))
+        finally:
+            if lease is not None:
+                lease.release()
                 if session_id:
-                    error_meta["session_id"] = session_id
-                yield inference_pb2.StreamPredictResponse(metadata=error_meta, end_of_sequence=True)
-            finally:
-                pending_tiles = []
-
-        # Flush any trailing buffer without end_of_sequence (legacy support)
-        if buffer:
-            # Add to pending and process
-            input_bytes = b"".join(buffer)
-            pending_tiles.append((last_tile_id, input_bytes, shape, dtype, dict(options)))
-            try:
-                for result in _process_batch(pending_tiles):
-                    yield result
-            except Exception as exc:  # pragma: no cover - defensive
-                self.logger.exception(
-                    "StreamPredict failed in trailing flush", extra={"corr_id": corr_id}
-                )
-                if session_state is not None:
-                    session_state["failed_tiles"] = session_state.get("failed_tiles", 0) + 1
-                    session_state.setdefault("errors", []).append(str(exc))
-                error_meta = {"error": str(exc), "corr_id": corr_id}
-                if session_id:
-                    error_meta["session_id"] = session_id
-                if last_tile_id:
-                    error_meta["tile_id"] = last_tile_id
-                yield inference_pb2.StreamPredictResponse(metadata=error_meta, end_of_sequence=True)
-                return
-        # Reset buffer
-        buffer = []
+                    if outcome == "failed":
+                        self.model_manager.close_session(session_id, reason="failed")
+                    elif outcome == "disconnected":
+                        self.model_manager.close_session(session_id, reason="disconnected")
+            self.logger.info(
+                "StreamPredict ended: %s", outcome, extra={"corr_id": corr_id}
+            )
 
     # ---- Registry RPCs ----
     def ListModelRegistry(self, request, context):
@@ -1330,108 +1066,95 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
         # Opportunistically clean up stale sessions
         cleaned = self._cleanup_stale_sessions()
         if cleaned:
-            self.logger.debug(f"Cleaned {cleaned} stale sessions", extra={"corr_id": corr_id})
+            self.logger.debug(f"Expired {cleaned} idle sessions", extra={"corr_id": corr_id})
 
         session_id = request.session_id or uuid.uuid4().hex
-        transport = request.transport
-        max_inflight = transport.max_inflight or self._default_max_inflight
-        max_chunk_bytes = transport.chunk_bytes or self._default_chunk_bytes
-        max_tile_bytes = min(self._default_tile_bytes, GRPC_MAX_MESSAGE_LENGTH)
-        if request.options.get("max_tile_bytes"):
-            try:
-                max_tile_bytes = min(max_tile_bytes, int(request.options.get("max_tile_bytes")))
-            except Exception:
-                pass
 
-        if session_id in self._sessions:
-            state = self._sessions[session_id]
-            device_plan = [
-                inference_pb2.DeviceInfo(
-                    id=d.get("id", ""),
-                    type=d.get("type", ""),
-                    ordinal=int(d.get("ordinal", 0)),
-                    weight=int(d.get("weight", 1)),
-                )
-                for d in self._device_plan
-            ]
+        def _fail(code, message, status="error"):
+            context.set_code(code)
+            context.set_details(message)
             return inference_pb2.OpenSessionResponse(
-                session_id=session_id,
-                device_plan=device_plan,
-                model_cache_hit=True,
-                max_inflight=int(state.get("max_inflight", max_inflight)),
-                max_tile_bytes=int(state.get("max_tile_bytes", max_tile_bytes)),
-                status="ok",
+                session_id=session_id, status=status, error=message
             )
+
+        transport = request.transport
+        max_inflight = min(
+            transport.max_inflight or self._default_max_inflight, self._default_max_inflight
+        )
+        # A requested chunk size is honored as sent, so the negotiated value is exactly
+        # what the client asked for; without one the server default applies.
+        max_chunk_bytes = transport.chunk_bytes or self._default_chunk_bytes
+        if transport.chunk_bytes < 0 or transport.chunk_bytes > GRPC_MAX_MESSAGE_LENGTH:
+            return _fail(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                f"transport.chunk_bytes {transport.chunk_bytes} is outside 0..{GRPC_MAX_MESSAGE_LENGTH} "
+                "(Capabilities stream_max_chunk_bytes)",
+            )
+        max_tile_bytes = min(self._default_tile_bytes, GRPC_MAX_MESSAGE_LENGTH)
+        if "max_tile_bytes" in request.options:
+            try:
+                requested = int(request.options["max_tile_bytes"])
+            except ValueError:
+                return _fail(
+                    grpc.StatusCode.INVALID_ARGUMENT,
+                    f"options.max_tile_bytes {request.options['max_tile_bytes']!r} is not an integer",
+                )
+            if requested <= 0:
+                return _fail(grpc.StatusCode.INVALID_ARGUMENT, "options.max_tile_bytes must be > 0")
+            max_tile_bytes = min(max_tile_bytes, requested)
 
         spec = request.spec
-        if not spec.model_id and not spec.source:
-            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
-            context.set_details("session requires model_id or spec.source")
-            return inference_pb2.OpenSessionResponse(
-                session_id=session_id, status="error", error="missing model"
-            )
+        if not spec.model_id and not spec.source and not spec.artifact:
+            return _fail(grpc.StatusCode.INVALID_ARGUMENT, "session requires model_id or spec.source")
 
-        model_cache_hit = False
-        model_id = spec.model_id or ""
-        record = self.model_manager.get(model_id) if model_id else None
-        if record is not None:
-            model_cache_hit = True
-            model_id = model_id or record.model_id if hasattr(record, "model_id") else spec.model_id
-        else:
-
-            class _ContextProxy:
-                def __init__(self):
-                    self.code = None
-                    self.details = None
-
-                def set_code(self, code):
-                    self.code = code
-
-                def set_details(self, details):
-                    self.details = details
-
-            proxy_ctx = _ContextProxy()
-            load_resp = self.LoadModel(inference_pb2.LoadModelRequest(spec=spec), proxy_ctx)
-            if not getattr(load_resp, "success", False):
-                context.set_code(proxy_ctx.code or grpc.StatusCode.INTERNAL)
-                context.set_details(proxy_ctx.details or load_resp.message or "load failed")
-                return inference_pb2.OpenSessionResponse(
-                    session_id=session_id,
-                    status="error",
-                    error=proxy_ctx.details or load_resp.message or "load failed",
+        try:
+            lease = None
+            if spec.model_id:
+                try:
+                    lease = self.model_manager.open_session(session_id, model_id=spec.model_id)
+                except managers.UnknownModelError:
+                    if not spec.source and not spec.artifact:
+                        raise
+            if lease is None:
+                prepared = self._prepare_load(spec, corr_id)
+                lease = self.model_manager.open_session(
+                    session_id,
+                    model_spec=prepared.model_spec,
+                    key=prepared.key,
+                    metadata=prepared.metadata,
+                    device_plan=prepared.device_plan,
                 )
-            model_id = load_resp.model_id
+                self._record_registry_entry(lease.model_id, prepared.metadata)
+        except _LoadRequestError as e:
+            return _fail(e.code, str(e))
+        except managers.ModelCacheError as e:
+            self.logger.warning("OpenSession failed: %s", e, extra={"corr_id": corr_id})
+            return _fail(self._cache_error_status(e), str(e))
+        except Exception as e:
+            self.logger.exception("OpenSession failed", extra={"corr_id": corr_id})
+            return _fail(grpc.StatusCode.INTERNAL, str(e))
 
-        device_plan = [
-            inference_pb2.DeviceInfo(
-                id=d.get("id", ""),
-                type=d.get("type", ""),
-                ordinal=int(d.get("ordinal", 0)),
-                weight=int(d.get("weight", 1)),
-            )
-            for d in self._device_plan
-        ]
-
-        total_tiles = request.manifest.total_tiles if request.manifest else None
-        self._sessions[session_id] = {
-            "model_id": model_id,
-            "created_at": time.time(),
-            "max_inflight": int(max_inflight),
-            "max_chunk_bytes": int(max_chunk_bytes),
-            "max_tile_bytes": int(max_tile_bytes),
-            "total_tiles": int(total_tiles) if total_tiles else None,
-            "ok_tiles": 0,
-            "failed_tiles": 0,
-            "errors": [],
-            "status": "open",
-        }
+        with self._sessions_lock:
+            book = self._sessions.get(session_id) if lease.reused else None
+            if book is None:
+                total_tiles = request.manifest.total_tiles if request.HasField("manifest") else 0
+                book = self._new_book(
+                    session_id,
+                    lease.model_id,
+                    dict(request.options),
+                    int(total_tiles) if total_tiles else None,
+                    max_inflight,
+                    max_chunk_bytes,
+                    max_tile_bytes,
+                )
+                self._sessions[session_id] = book
 
         return inference_pb2.OpenSessionResponse(
             session_id=session_id,
-            device_plan=device_plan,
-            model_cache_hit=model_cache_hit,
-            max_inflight=int(max_inflight),
-            max_tile_bytes=int(max_tile_bytes),
+            device_plan=self._device_plan_messages(),
+            model_cache_hit=bool(lease.cache_hit),
+            max_inflight=int(book.max_inflight),
+            max_tile_bytes=int(book.max_tile_bytes),
             status="ok",
         )
 
@@ -1442,25 +1165,24 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
             context.set_details("session_id is required")
             return inference_pb2.CloseSessionResponse(status="error", error="missing session_id")
 
-        state = self._sessions.pop(session_id, None)
-        if not state:
+        closed = self.model_manager.close_session(session_id, reason="closed")
+        with self._sessions_lock:
+            book = self._sessions.pop(session_id, None)
+        state = self._session_state(session_id)
+        if not closed and book is None and state == "unknown":
             context.set_code(grpc.StatusCode.NOT_FOUND)
             context.set_details("session_id not found")
             return inference_pb2.CloseSessionResponse(status="not_found", error="session not found")
 
-        # Mark terminal status before summarizing and removing
-        if state.get("status") != "cancelled":
-            state["status"] = "closed"
-
-        duration_ms = int((time.time() - state.get("created_at", time.time())) * 1000)
-        summary = inference_pb2.SessionSummary(
-            session_id=session_id,
-            ok_tiles=int(state.get("ok_tiles", 0)),
-            failed_tiles=int(state.get("failed_tiles", 0)),
-            duration_ms=duration_ms,
-            errors=list(state.get("errors", [])),
-        )
-        status_label = state.get("status") or "closed"
+        # A session that was cancelled, failed or disconnected keeps that status.
+        status_label = "closed" if closed else state
+        summary = inference_pb2.SessionSummary(session_id=session_id)
+        if book is not None:
+            with book.lock:
+                summary.ok_tiles = int(book.ok_tiles)
+                summary.failed_tiles = int(book.failed_tiles)
+                summary.duration_ms = int((time.time() - book.created_at) * 1000)
+                summary.errors.extend(book.errors)
         return inference_pb2.CloseSessionResponse(status=status_label, summary=summary)
 
     def CancelSession(self, request, context):
@@ -1470,18 +1192,21 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
             context.set_details("session_id is required")
             return inference_pb2.CancelSessionResponse(status="error", error="missing session_id")
 
-        state = self._sessions.get(session_id)
-        if not state:
+        cancelled = self.model_manager.close_session(session_id, reason="cancelled")
+        with self._sessions_lock:
+            book = self._sessions.get(session_id)
+        state = self._session_state(session_id)
+        if not cancelled and book is None and state == "unknown":
             context.set_code(grpc.StatusCode.NOT_FOUND)
             context.set_details("session_id not found")
             return inference_pb2.CancelSessionResponse(
                 status="not_found", error="session not found"
             )
-
-        state["status"] = "cancelled"
-        reason = request.reason or "client_cancelled"
-        state.setdefault("errors", []).append(reason)
-        return inference_pb2.CancelSessionResponse(status="cancelled")
+        if cancelled and book is not None:
+            with book.lock:
+                book.errors.append(request.reason or "client_cancelled")
+        # The active stream of this session stops before its next message or dispatch.
+        return inference_pb2.CancelSessionResponse(status="cancelled" if cancelled else state)
 
     # ---- Helpers ----
     def _record_registry_entry(self, model_id: str, metadata: dict) -> None:
@@ -1529,6 +1254,22 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
         caps = [
             inference_pb2.CapabilityInfo(key="cuda", value=str(torch.cuda.is_available()).lower()),
             inference_pb2.CapabilityInfo(key="max_cores", value=str(self._max_cores)),
+            inference_pb2.CapabilityInfo(
+                key="stream_context_version", value=dispatch.STREAM_CONTEXT_VERSION
+            ),
+            inference_pb2.CapabilityInfo(
+                key="stream_default_chunk_bytes", value=str(self._default_chunk_bytes)
+            ),
+            inference_pb2.CapabilityInfo(
+                key="stream_max_chunk_bytes", value=str(GRPC_MAX_MESSAGE_LENGTH)
+            ),
+            inference_pb2.CapabilityInfo(
+                key="stream_max_tile_bytes",
+                value=str(min(self._default_tile_bytes, GRPC_MAX_MESSAGE_LENGTH)),
+            ),
+            inference_pb2.CapabilityInfo(
+                key="stream_max_inflight", value=str(self._default_max_inflight)
+            ),
         ]
         if self._device_plan:
             caps.append(
@@ -1542,6 +1283,10 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
     def Health(self, request, context):
         return inference_pb2.HealthResponse(ready=True, message="ok")
 
+    def shutdown(self, grace: float | None = SERVER_STOP_GRACE_SECONDS) -> None:
+        """Close all sessions and dispose every model after running predictions drain."""
+        self.model_manager.shutdown(drain_timeout_s=grace)
+
 
 def serve(
     port: int = 50051,
@@ -1550,6 +1295,7 @@ def serve(
     startup_event=None,
     stop_event=None,
     max_cores: int = 4,
+    stop_grace: float = SERVER_STOP_GRACE_SECONDS,
 ) -> int:
     """Start the gRPC inference server.
 
@@ -1557,6 +1303,8 @@ def serve(
             port: TCP port to bind (50051 default). Use 0 for ephemeral.
             startup_event: threading.Event that will be set once the server is started.
             stop_event: threading.Event; if provided, the server thread will block until it is set then shut down.
+            stop_grace: seconds running RPCs get at shutdown; the model cache then drains
+                execution leases for at most the same time before disposing models.
 
     Returns:
             The actual bound port (useful if port=0 was passed).
@@ -1580,12 +1328,19 @@ def serve(
     if stop_event is None:
         frame = inspect.currentframe().f_back
         stop_event = frame.f_locals.get("stop_event", None)
-    if stop_event is not None:
-        stop_event.wait()
-        logging.info("Shutting down gRPC server after test.")
-        server.stop(0)
-    else:
-        server.wait_for_termination()
+    try:
+        if stop_event is not None:
+            stop_event.wait()
+            logging.info("Shutting down gRPC server after test.")
+        else:
+            server.wait_for_termination()
+    except KeyboardInterrupt:
+        logger.info("gRPC server interrupted")
+    finally:
+        # Stop accepting RPCs, give running ones the grace period, then close sessions and
+        # dispose models once their execution leases have drained.
+        server.stop(stop_grace).wait()
+        service.shutdown(grace=stop_grace)
     return bound_port
 
 
