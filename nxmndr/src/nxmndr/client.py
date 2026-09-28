@@ -10,6 +10,13 @@ Streaming context v1: every message of a tile carries ``context["tile_id"]`` and
 for session streams, ``context["session_id"]``. Per-tile inference options travel
 as ``context["opt.<name>"]`` on the tile's first message only; unprefixed keys are
 reserved. The declared dtype always describes the bytes actually sent.
+
+Transport follows the endpoint (``parse_endpoint``): ``https://host[:port]`` opens a
+TLS channel (default port 443; the server certificate is checked against ``host``
+with the default root certificates unless ``credentials`` are given);
+``http://host[:port]`` (default port 80), ``grpc://host[:port]`` and a bare
+``host:port`` open a plaintext channel. An https endpoint never falls back to
+plaintext.
 """
 
 from __future__ import annotations
@@ -79,6 +86,65 @@ def _rpc_error_parts(err) -> tuple:
     code_fn = getattr(err, "code", None)
     code = code_fn() if callable(code_fn) else None
     return message, code
+
+
+@dataclass(frozen=True)
+class Endpoint:
+    """How a client endpoint is dialed: gRPC ``target`` and whether TLS is used."""
+
+    target: str
+    tls: bool
+    host: str
+
+
+_PLAINTEXT_SCHEMES = {"http": 80, "grpc": None}
+
+
+def _split_host_port(authority: str, endpoint: str):
+    if authority.startswith("["):  # [IPv6]:port
+        close = authority.find("]")
+        if close < 0:
+            raise ValueError(f"endpoint {endpoint!r}: unclosed '[' in the host")
+        host, rest = authority[: close + 1], authority[close + 1 :]
+        if rest and not rest.startswith(":"):
+            raise ValueError(f"endpoint {endpoint!r}: unexpected {rest!r} after the host")
+        port = rest[1:] if rest else ""
+    else:
+        host, _, port = authority.partition(":")
+    if not host or host == "[]":
+        raise ValueError(f"endpoint {endpoint!r} has no host")
+    if port and not port.isdigit():
+        raise ValueError(f"endpoint {endpoint!r}: port {port!r} is not a number")
+    return host, (int(port) if port else None)
+
+
+def parse_endpoint(endpoint: str) -> Endpoint:
+    """The gRPC target and transport an endpoint names (see the module docstring).
+
+    ``https://`` means TLS, ``http://`` and ``grpc://`` mean plaintext; a trailing
+    ``/`` is dropped and any other path is an error. An endpoint without one of
+    these schemes (``host:port``, or a gRPC target such as ``unix:///path``) is
+    dialed as given, in plaintext.
+    """
+
+    text = str(endpoint or "").strip()
+    if not text:
+        raise ValueError("endpoint is required")
+    scheme, sep, rest = text.partition("://")
+    scheme = scheme.lower()
+    if not sep or (scheme != "https" and scheme not in _PLAINTEXT_SCHEMES):
+        return Endpoint(target=text, tls=False, host="")
+    authority, _, path = rest.partition("/")
+    if path.strip("/") or "?" in authority or "#" in authority or "@" in authority:
+        raise ValueError(
+            f"endpoint {endpoint!r}: a gRPC endpoint is {scheme}://host[:port], without "
+            "a path, query or user"
+        )
+    host, port = _split_host_port(authority, endpoint)
+    if port is None:
+        port = 443 if scheme == "https" else _PLAINTEXT_SCHEMES[scheme]
+    target = f"{host}:{port}" if port is not None else host
+    return Endpoint(target=target, tls=scheme == "https", host=host.strip("[]"))
 
 
 def validate_option_name(name: str) -> str:
@@ -180,7 +246,10 @@ class ModelRegistryEntry:
 class InferenceGrpcClient:
     """Simple wrapper around the nxmndr inference gRPC service.
 
-    Maintains a persistent channel with lazy reconnection on failure.
+    Maintains a persistent channel with lazy reconnection on failure. The endpoint
+    selects the transport (``parse_endpoint``): ``https://`` is TLS, with
+    ``credentials`` if given, else ``grpc.ssl_channel_credentials()`` (default
+    roots); ``credentials`` given with a plaintext endpoint also select TLS.
     """
 
     def __init__(
@@ -194,10 +263,11 @@ class InferenceGrpcClient:
     ) -> None:
         if not endpoint:
             raise ValueError("endpoint is required")
-        # Strip http:// or https:// prefix if present (gRPC doesn't use these)
-        endpoint = endpoint.replace("https://", "").replace("http://", "")
-        self._endpoint = endpoint
+        parsed = parse_endpoint(endpoint)
+        self._endpoint = parsed.target
         self._timeout = timeout
+        if credentials is None and parsed.tls:
+            credentials = grpc.ssl_channel_credentials()
         self._credentials = credentials
         self._max_attempts = max(1, int(max_attempts or 1))
         self._backoff_seconds = max(0.0, float(backoff_seconds or 0.0))
@@ -844,6 +914,8 @@ __all__ = [
     "ModelRegistryEntry",
     "StreamPredictCall",
     "encode_tile_context",
+    "Endpoint",
+    "parse_endpoint",
     "prepare_tensor",
     "validate_option_name",
     "STREAM_CONTEXT_CAPABILITY",
