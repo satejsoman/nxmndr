@@ -37,7 +37,7 @@ backend's ``src`` directory and the directory that contains ``tst`` on
     original stdout, so a module that speaks a protocol on stdout keeps it clean.
 
 ``--stats FILE`` writes counters as JSON when the process exits: YOLO checkpoints
-opened, SAM doubles built, SAM variant loads and disposals per (variant, device),
+opened, the distinct YOLO ``conf``/``iou``/``max_det`` predict arguments, SAM doubles built, SAM variant loads and disposals per (variant, device),
 unprompted SAM calls. Tests use them to prove that models load once per job.
 """
 
@@ -71,8 +71,14 @@ class Installed:
         variants = self.variants
         with self.lock:
             sam_models = list(self.sam_models)
+        options = []
+        with FakeYOLO.lock:
+            for entry in FakeYOLO.predict_options:
+                if entry not in options:
+                    options.append(dict(entry))
         return {
             "yolo_checkpoints_opened": list(FakeYOLO.constructed),
+            "yolo_predict_options": options,  # distinct conf/iou/max_det arguments, first-seen order
             "sam_models_built": len(sam_models),
             "sam_unprompted_calls": sum(m.unprompted_calls for m in sam_models),
             "sam_variant_loads": {f"{v}@{d}": n for (v, d), n in sorted(variants.calls.items())},

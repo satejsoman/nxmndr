@@ -160,6 +160,7 @@ def test_prompted_sam_and_yolo_run_in_a_separate_worker_process(tmp_path, worker
     stats = json.loads(stats_path.read_text())
     assert stats == {
         "yolo_checkpoints_opened": [str(ckpt)],
+        "yolo_predict_options": [{"conf": 0.1, "iou": 0.7, "max_det": 300}],  # the adapter's defaults
         "sam_models_built": 1,
         "sam_unprompted_calls": 2,
         "sam_variant_loads": {f"sam3_tracker@{device}": 1},  # geometry variant: once per record

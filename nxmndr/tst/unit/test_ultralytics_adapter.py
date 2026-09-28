@@ -46,6 +46,11 @@ def _expected(chip):
     return np.stack([(band == v) for v in (1, 2, 3)]).astype(np.uint8)
 
 
+# The detection settings every predict call gets when the request names none: the paper's
+# DelineateAnything run (conf 0.1) and Ultralytics' iou and max_det defaults.
+DEFAULT_DETECTION = {"conf": 0.1, "iou": 0.7, "max_det": 300}
+
+
 # ------------------------------------------------------------------ chip conversion
 
 
@@ -89,7 +94,7 @@ def test_instances_come_back_at_chip_size_in_model_order(tmp_path, fake_ultralyt
     np.testing.assert_array_equal(masks, _expected(chip))
     assert fake_ultralytics.constructed == [str(tmp_path / "yolo.pt")]
     call = model.yolo.calls[0]
-    assert call["kwargs"] == {"verbose": False, "retina_masks": True}
+    assert call["kwargs"] == {"verbose": False, "retina_masks": True, **DEFAULT_DETECTION}
     assert call["shape"] == (16, 16, 3) and call["dtype"] == "uint8"
 
 
@@ -143,7 +148,16 @@ def test_a_build_without_retina_masks_is_called_again_without_it(tmp_path, fake_
     model = _load(tmp_path, retina_masks_supported=False)
     chip = _blocks()
     np.testing.assert_array_equal(model.predict(chip), _expected(chip))
-    assert [c["kwargs"] for c in model.yolo.calls] == [{"verbose": False}]
+    assert [c["kwargs"] for c in model.yolo.calls] == [{"verbose": False, **DEFAULT_DETECTION}]
+
+
+def test_detection_settings_reach_predict(tmp_path, fake_ultralytics):
+    model = _load(tmp_path)
+    model.predict(_blocks(), conf=0.25, iou=0.5, max_det=7)
+    assert model.yolo.calls[0]["kwargs"] == {"verbose": False, "retina_masks": True, "conf": 0.25, "iou": 0.5,
+                                             "max_det": 7}
+    assert (yolo_adapter.DEFAULT_CONF, yolo_adapter.DEFAULT_IOU, yolo_adapter.DEFAULT_MAX_DET) == (0.1, 0.7, 300)
+    assert fake_ultralytics.predict_options == [DEFAULT_DETECTION | {"conf": 0.25, "iou": 0.5, "max_det": 7}]
 
 
 def test_predict_refuses_embeddings(tmp_path, fake_ultralytics):

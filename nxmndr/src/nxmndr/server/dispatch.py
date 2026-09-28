@@ -17,6 +17,7 @@ prefix, and every other unprefixed key is reserved and never used as an option.
 from __future__ import annotations
 
 import json
+import math
 import re
 import time
 from dataclasses import dataclass, field
@@ -168,6 +169,36 @@ def option_bool(options: Mapping[str, str], name: str) -> bool:
     if value in _FALSE:
         return False
     raise MalformedOptionsError(f"option {name}={raw!r} must be true or false")
+
+
+def option_fraction(options: Mapping[str, str], name: str, default: float) -> float:
+    """A decimal option in ``[0, 1]``; ``default`` when absent."""
+
+    raw = options.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(str(raw).strip())
+    except ValueError:
+        value = math.nan
+    if not (0.0 <= value <= 1.0):
+        raise MalformedOptionsError(f"option {name}={raw!r} must be a decimal in [0, 1]")
+    return value
+
+
+def option_positive_int(options: Mapping[str, str], name: str, default: int) -> int:
+    """An integer option >= 1; ``default`` when absent."""
+
+    raw = options.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        value = 0
+    if value < 1:
+        raise MalformedOptionsError(f"option {name}={raw!r} must be an integer >= 1")
+    return value
 
 
 # ------------------------------------------------------------------ dispatch
@@ -367,7 +398,8 @@ def _run_instance_prediction(model_obj, image, options, model_metadata, logger) 
     Embeddings and per-pixel confidence do not exist for these models, so
     ``return_embeddings``, ``return_confidence`` and an embedding task are refused
     (``malformed_options``) instead of being ignored. Option ``drop_group_masks``
-    (boolean, default true) controls the group-mask filter.
+    (boolean, default true) controls the group-mask filter; ``conf``, ``iou`` and
+    ``max_det`` go to ``YOLO.predict`` (defaults in ``nxmndr.models.ultralytics_yolo``).
     """
 
     if (
@@ -382,9 +414,14 @@ def _run_instance_prediction(model_obj, image, options, model_metadata, logger) 
     drop = True
     if ultralytics_yolo.OPTION_DROP_GROUP_MASKS in options:
         drop = option_bool(options, ultralytics_yolo.OPTION_DROP_GROUP_MASKS)
+    detection = {
+        "conf": option_fraction(options, ultralytics_yolo.OPTION_CONF, ultralytics_yolo.DEFAULT_CONF),
+        "iou": option_fraction(options, ultralytics_yolo.OPTION_IOU, ultralytics_yolo.DEFAULT_IOU),
+        "max_det": option_positive_int(options, ultralytics_yolo.OPTION_MAX_DET, ultralytics_yolo.DEFAULT_MAX_DET),
+    }
     start = time.monotonic()
     try:
-        masks = model_obj.predict(image, drop_group_masks=drop)
+        masks = model_obj.predict(image, drop_group_masks=drop, **detection)
     except ultralytics_yolo.InstanceInputError as exc:
         raise MalformedPayloadError(str(exc)) from exc
     infer_ms = (time.monotonic() - start) * 1000.0
@@ -469,6 +506,8 @@ __all__ = [
     "effective_tile_options",
     "decode_input",
     "option_bool",
+    "option_fraction",
+    "option_positive_int",
     "shape_result",
     "run_prediction",
 ]

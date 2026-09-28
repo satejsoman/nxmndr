@@ -78,12 +78,19 @@ class FakeResult:
         self.orig_shape = orig_shape
 
 
+# The detection settings a caller passes to ``predict`` (recorded in ``predict_options``).
+DETECTION_KWARGS = ("conf", "iou", "max_det")
+
+
 class FakeYOLO:
     """``ultralytics.YOLO`` stand-in. Class-level counters are shared by every
-    instance in the process: ``constructed`` lists the checkpoint paths opened."""
+    instance in the process: ``constructed`` lists the checkpoint paths opened,
+    ``predict_options`` the ``conf``/``iou``/``max_det`` arguments of every ``predict``
+    call (the double does not apply them: it has no scores)."""
 
     lock = threading.Lock()
     constructed: List[str] = []
+    predict_options: List[Dict[str, Any]] = []
 
     def __init__(self, model: str = "", task=None, verbose: bool = False):
         settings = json.loads(Path(model).read_text())
@@ -99,6 +106,7 @@ class FakeYOLO:
     def reset(cls) -> None:
         with cls.lock:
             cls.constructed = []
+            cls.predict_options = []
 
     def predict(self, source=None, **kwargs):
         if "retina_masks" in kwargs and not self.settings["retina_masks_supported"]:
@@ -106,6 +114,8 @@ class FakeYOLO:
         chip = np.asarray(source)
         self.calls.append({"kwargs": dict(kwargs), "shape": chip.shape, "dtype": str(chip.dtype),
                            "chip": chip.copy()})
+        with FakeYOLO.lock:
+            FakeYOLO.predict_options.append({k: kwargs[k] for k in DETECTION_KWARGS if k in kwargs})
         h, w = chip.shape[0], chip.shape[1]
         if self.task != "segment":
             return [FakeResult(None, (h, w))]
@@ -135,4 +145,4 @@ def make_module() -> types.ModuleType:
     return module
 
 
-__all__ = ["CHECKPOINT_MARKER", "FakeYOLO", "make_module", "write_checkpoint"]
+__all__ = ["CHECKPOINT_MARKER", "DETECTION_KWARGS", "FakeYOLO", "make_module", "write_checkpoint"]

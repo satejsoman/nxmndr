@@ -107,7 +107,8 @@ def test_session_tiles_return_instance_stacks_and_reuse_one_loaded_model(tmp_pat
         record = service.model_manager.get(mid)
         assert record.backend == "ultralytics" and record.device_models == {}
 
-        opened = client.open_session(session_id="yolo-a", spec=_spec(ckpt), options={"task_type": "segmentation"})
+        opened = client.open_session(session_id="yolo-a", spec=_spec(ckpt),
+                                     options={"task_type": "segmentation", "conf": "0.3"})
         assert opened.status == "ok" and opened.model_cache_hit
         assert service.model_manager.pin_count(mid) == 1
 
@@ -115,7 +116,7 @@ def test_session_tiles_return_instance_stacks_and_reuse_one_loaded_model(tmp_pat
         tiles = [
             ("r0_c0", chip, None),  # group mask present, dropped by default
             ("r0_c1", np.zeros((H, W, 3), np.uint8), None),  # nothing found
-            ("r1_c0", chip, {"drop_group_masks": "false"}),
+            ("r1_c0", chip, {"drop_group_masks": "false", "iou": "0.5", "max_det": "7"}),
             ("r1_c1", _blocks((5, 6, 7)).astype(np.uint16), None),  # other dtype, other values
         ]
         resps = list(
@@ -147,7 +148,10 @@ def test_session_tiles_return_instance_stacks_and_reuse_one_loaded_model(tmp_pat
         assert second.model_cache_hit and service.model_manager.pin_count(mid) == 2
         assert fake_ultralytics.constructed == [str(ckpt)]
         yolo = record.model.yolo
-        assert [c["kwargs"] for c in yolo.calls] == [{"verbose": False, "retina_masks": True}] * 4
+        # conf from the session options, iou and max_det from r1_c0's own options, else the defaults
+        session_kwargs = {"verbose": False, "retina_masks": True, "conf": 0.3, "iou": 0.7, "max_det": 300}
+        assert [c["kwargs"] for c in yolo.calls] == [
+            session_kwargs, session_kwargs, {**session_kwargs, "iou": 0.5, "max_det": 7}, session_kwargs]
         assert yolo.calls[3]["dtype"] == "uint8"  # the adapter's conversion, not the wire dtype
 
         for sid in ("yolo-a", "yolo-b"):
@@ -190,6 +194,9 @@ def test_unavailable_options_and_bad_chips_fail_their_tile_only(tmp_path, fake_u
             ("conf", chip, {"return_confidence": "true"}),
             ("task", chip, {"task_type": "embedding"}),
             ("flag", chip, {"drop_group_masks": "maybe"}),
+            ("conf_range", chip, {"conf": "1.5"}),
+            ("iou_text", chip, {"iou": "high"}),
+            ("max_det_zero", chip, {"max_det": "0"}),
             ("bands", np.zeros((H, W, 2), np.uint8), None),
             ("ok", chip, None),
         ]
@@ -207,6 +214,9 @@ def test_unavailable_options_and_bad_chips_fail_their_tile_only(tmp_path, fake_u
         "conf": ("malformed_options", "tile"),
         "task": ("malformed_options", "tile"),
         "flag": ("malformed_options", "tile"),
+        "conf_range": ("malformed_options", "tile"),
+        "iou_text": ("malformed_options", "tile"),
+        "max_det_zero": ("malformed_options", "tile"),
         "bands": ("malformed_payload", "tile"),
         "ok": (None, None),
     }

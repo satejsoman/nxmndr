@@ -20,8 +20,14 @@ Ported from the plugin's former in-QGIS path (nxmndr-qgis ``inference/backends.p
   ``uint8`` becomes float, NaN becomes 0, values are multiplied by 255 when the
   maximum lies in (0, 1], then clipped to [0, 255] and cast to ``uint8``. Bands are
   passed in the order received.
-- ``YOLO.predict(chip, verbose=False, retina_masks=True)``. A YOLO build that rejects
-  ``retina_masks`` (``TypeError``) is called again without it.
+- ``YOLO.predict(chip, verbose=False, retina_masks=True, conf=..., iou=..., max_det=...)``.
+  A YOLO build that rejects ``retina_masks`` (``TypeError``) is called again without it.
+  ``conf``, ``iou`` and ``max_det`` are per-request options (the pre-rebuild plugin read
+  them from ``model_info``). Their defaults are the paper's DelineateAnything run: a
+  detection confidence threshold of 0.1 (``anaximander/arxiv/nxmndr.tex:263``), and
+  Ultralytics' own predict defaults for the other two, which that run left unchanged
+  (``ultralytics`` 8.4.142 ``cfg/default.yaml``: ``iou: 0.7``, ``max_det: 300``;
+  Ultralytics' own ``conf`` default is 0.25).
 - ``results[0].masks.data`` is the stack. No result, ``masks is None`` or zero masks
   is a valid empty result ``(0, H, W)``.
 - Group masks, which contain two or more other instances, are dropped with
@@ -61,6 +67,15 @@ ULTRALYTICS_BACKEND = "ultralytics"
 SEGMENT_TASK = "segment"
 # Per-request option (default true), as the plugin's ``model_info["drop_group_masks"]``.
 OPTION_DROP_GROUP_MASKS = "drop_group_masks"
+# Per-request detection options passed to ``YOLO.predict`` and their defaults (module
+# docstring): confidence and NMS IoU thresholds (decimals in [0, 1]) and the maximum
+# number of detections per chip (integer >= 1).
+OPTION_CONF = "conf"
+OPTION_IOU = "iou"
+OPTION_MAX_DET = "max_det"
+DEFAULT_CONF = 0.1
+DEFAULT_IOU = 0.7
+DEFAULT_MAX_DET = 300
 
 
 class InstanceInputError(ValueError):
@@ -176,14 +191,23 @@ class UltralyticsYoloModel(Model):
     def postprocess(self, model_output, task=None):
         return model_output
 
-    def predict(self, input_data, return_embeddings: bool = False, *, drop_group_masks: bool = True):
+    def predict(
+        self,
+        input_data,
+        return_embeddings: bool = False,
+        *,
+        drop_group_masks: bool = True,
+        conf: float = DEFAULT_CONF,
+        iou: float = DEFAULT_IOU,
+        max_det: int = DEFAULT_MAX_DET,
+    ):
         """``(N, H, W)`` uint8 instance masks at the chip's height and width."""
 
         if return_embeddings:
             raise ValueError("ultralytics_yolo models return instance masks only, no embeddings")
         chip = self.preprocess(input_data)
         height, width = chip.shape[0], chip.shape[1]
-        kwargs = {"verbose": False, "retina_masks": True}
+        kwargs = {"verbose": False, "retina_masks": True, "conf": conf, "iou": iou, "max_det": max_det}
         with self._lock:
             try:
                 results = self.yolo.predict(chip, **kwargs)
@@ -218,6 +242,12 @@ __all__ = [
     "ULTRALYTICS_FORMATS",
     "ULTRALYTICS_BACKEND",
     "OPTION_DROP_GROUP_MASKS",
+    "OPTION_CONF",
+    "OPTION_IOU",
+    "OPTION_MAX_DET",
+    "DEFAULT_CONF",
+    "DEFAULT_IOU",
+    "DEFAULT_MAX_DET",
     "InstanceInputError",
     "UltralyticsModelSpec",
     "UltralyticsYoloModel",
