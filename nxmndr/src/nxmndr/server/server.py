@@ -31,6 +31,22 @@ Streaming (``StreamPredict``) contract v1:
   are tile-scope failures. The number of chunks per tile is not limited. The server
   processes tiles in arrival order and answers each before reading on, so a client
   window of ``max_inflight`` outstanding tiles cannot deadlock.
+
+Model input (``Predict`` and every ``StreamPredict`` tile):
+
+- The server gives the model the chip exactly as sent: the declared ``shape`` (for
+  QGIS chips ``[H, W, C]``, bands in the host's order) and ``dtype``, with no batch
+  dimension added and no band selection, scaling, normalization or transpose. ONNX
+  models receive that array; the PyTorch RPC worker receives it as a float32 tensor
+  of the same shape.
+- Hugging Face models apply their own processor, SAM 3 prompts go through
+  ``nxmndr.models.sam``, and ``ultralytics_yolo`` models convert the chip as
+  ``nxmndr.models.ultralytics_yolo`` documents.
+- ``ModelSpec.preprocessing`` and ``ModelSpec.postprocessing`` are not supported:
+  ``LoadModel`` and ``OpenSession`` refuse a non-empty list with INVALID_ARGUMENT
+  rather than ignore it. A model that needs other input (for example NCHW float
+  normalized with ImageNet statistics, which the plugin's removed in-QGIS path
+  computed) must carry that preprocessing inside the exported model.
 """
 
 import asyncio
@@ -172,6 +188,18 @@ class _LoadRequestError(Exception):
     def __init__(self, code, message):
         super().__init__(message)
         self.code = code
+
+
+def _transform_specs_error(spec_msg) -> str:
+    """The refusal message for a ModelSpec that declares transforms, else ""."""
+
+    if not (spec_msg.preprocessing or spec_msg.postprocessing):
+        return ""
+    return (
+        "ModelSpec.preprocessing and postprocessing are not supported: the server gives the "
+        "model each chip exactly as sent (declared shape and dtype, no batch dimension, no "
+        "scaling or normalization); build other preprocessing into the model"
+    )
 
 
 @dataclass
@@ -357,6 +385,9 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
 
         Raises _LoadRequestError for requests that cannot be loaded as given.
         """
+        transforms_error = _transform_specs_error(spec_msg)
+        if transforms_error:
+            raise _LoadRequestError(grpc.StatusCode.INVALID_ARGUMENT, transforms_error)
         if spec_msg.format not in (
             inference_pb2.PYTORCH,
             inference_pb2.ONNX,
@@ -1163,6 +1194,9 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
         spec = request.spec
         if not spec.model_id and not spec.source and not spec.artifact:
             return _fail(grpc.StatusCode.INVALID_ARGUMENT, "session requires model_id or spec.source")
+        transforms_error = _transform_specs_error(spec)
+        if transforms_error:
+            return _fail(grpc.StatusCode.INVALID_ARGUMENT, transforms_error)
 
         try:
             lease = None
