@@ -562,6 +562,18 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
             return []
         return [inference_pb2.MetadataEntry(key="capability.sam", value=capability.family)]
 
+    def _catalog_metadata(self, model_id: str):
+        """A catalog model's model_family, model_class, num_classes ("" without a class
+        head) and in_channels, as built in the RPC worker (nxmndr.models.catalog)."""
+        record = self.model_manager.get(model_id)
+        metadata = (record.metadata or {}) if record is not None else {}
+        if not metadata.get("model_family"):
+            return []
+        return [
+            inference_pb2.MetadataEntry(key=key, value=str(metadata.get(key, "")))
+            for key in ("model_family", "model_class", "num_classes", "in_channels")
+        ]
+
     def LoadModel(self, request, context):
         corr_id = uuid.uuid4().hex[:8]
         self.logger.info("LoadModel called", extra={"corr_id": corr_id})
@@ -590,7 +602,8 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
                         key="model_cache_hit", value=str(result.cache_hit).lower()
                     )
                 ]
-                + self._capability_metadata(model_id),
+                + self._capability_metadata(model_id)
+                + self._catalog_metadata(model_id),
             )
         except _LoadRequestError as e:
             context.set_code(e.code)
@@ -1332,6 +1345,12 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
                 value=ultralytics_yolo.ULTRALYTICS_YOLO
                 if ultralytics_yolo.ultralytics_available()
                 else "",
+            ),
+            # PYTORCH model_class catalog names this server builds and runs
+            # (nxmndr.models.catalog), comma-separated, ordered by family, then name;
+            # a family whose package is missing gives none.
+            inference_pb2.CapabilityInfo(
+                key="pytorch_model_classes", value=",".join(catalog.list_model_classes())
             ),
         ]
         if self._device_plan:
