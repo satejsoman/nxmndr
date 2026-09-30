@@ -9,7 +9,8 @@
   served or excluded with a reason.
 - ``resolve``/``build``: the errors for unknown, unserved and unavailable names and
   for bad metadata; constructor arguments from metadata or from the weights file;
-  a weights file that does not match fails with the class and the differing entries.
+  a weights file that does not match fails with the class, its arguments and the
+  first differing entry, in one line.
 - ``dispatch.run_prediction`` on a catalog record: class vector, label map and
   embedding families, and the shapes that fit none.
 
@@ -195,22 +196,28 @@ def test_build_reads_the_aux_head_of_torchvision_segmentation(tmp_path):
         torch.testing.assert_close(model(chip), reference(chip.permute(2, 0, 1)[None])["out"])
 
 
-def test_a_weights_file_that_does_not_match_fails_with_the_differing_entries(tmp_path):
-    path = _save(torchvision.models.resnet18(weights=None, num_classes=5), tmp_path / "r18.pt")
+def test_a_weights_file_that_does_not_match_fails_with_the_first_differing_entry(tmp_path):
+    model = torchvision.models.resnet18(weights=None, num_classes=5)
+    path = _save(model, tmp_path / "r18.pt")
     with pytest.raises(catalog.CatalogError) as wrong_classes:
         catalog.build("torchvision:resnet18", path, {"num_classes": "7"})
-    message = str(wrong_classes.value)
-    assert "does not match torchvision:resnet18(num_classes=7) (strict load)" in message
-    assert (
-        "shape mismatch fc.weight file [5, 512] model [7, 512], fc.bias file [5] model [7]"
-        in message
+    assert str(wrong_classes.value) == (
+        f"weights file {path} does not match torchvision:resnet18(num_classes=7) (strict load): "
+        "shape mismatch fc.weight file [5, 512] model [7, 512] "
+        "(first of 2 differing entries: 2 with another shape)"
     )
 
     with pytest.raises(catalog.CatalogError) as other_architecture:
         catalog.build("torchvision:resnet34", path)
-    message = str(other_architecture.value)
-    assert "does not match torchvision:resnet34(num_classes=5)" in message
-    assert "missing layer1.2.conv1.weight" in message and "in all)" in message
+    resnet34 = torchvision.models.resnet34(weights=None, num_classes=5).state_dict()
+    missing = [key for key in resnet34 if key not in model.state_dict()]
+    assert missing[0] == "layer1.2.conv1.weight" and len(missing) > 1
+    assert all(key in resnet34 for key in model.state_dict())  # nothing unexpected
+    assert str(other_architecture.value) == (
+        f"weights file {path} does not match torchvision:resnet34(num_classes=5) (strict load): "
+        f"missing layer1.2.conv1.weight (first of {len(missing)} differing entries: "
+        f"{len(missing)} missing)"
+    )
 
     blob = tmp_path / "model.pt"
     torch.save({"state_dict": {"w": torch.zeros(1)}, "epoch": 3}, str(blob))
@@ -220,6 +227,22 @@ def test_a_weights_file_that_does_not_match_fails_with_the_differing_entries(tmp
         catalog.build("torchvision:resnet18", str(blob))
     with pytest.raises(catalog.CatalogError, match="not found"):
         catalog.build("torchvision:resnet18", str(tmp_path / "absent.pt"))
+
+    # A whole pickled model: torch's refusal runs to many lines of advice; the error
+    # keeps its reason, in one line.
+    pickled = tmp_path / "pickled.pt"
+    torch.save(model, str(pickled))
+    with pytest.raises(catalog.CatalogError) as whole_model:
+        catalog.build("torchvision:resnet18", str(pickled))
+    assert str(whole_model.value) == (
+        f"torchvision:resnet18: weights file {pickled} is not a PyTorch state dict "
+        "(UnpicklingError: Unsupported global: GLOBAL torchvision.models.resnet.ResNet was not "
+        "an allowed global by default)"
+    )
+
+
+def test_catalog_error_messages_are_one_line():
+    assert str(catalog.CatalogError("a\n\tb  c\n")) == "a b c"
 
 
 @needs_torchgeo

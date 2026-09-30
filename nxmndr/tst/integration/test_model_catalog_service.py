@@ -13,9 +13,11 @@ mocked. Weights are random, made and saved by each test; nothing is downloaded.
   same chip, also with ``return_confidence`` (unary and streamed).
 - torchgeo unet (4 bands, 3 classes): label maps equal the direct per-pixel argmax.
 - Capabilities ``pytorch_model_classes`` is the catalog of the server's environment.
-- A weights file that does not match fails the load with the differing entries;
-  unknown and unserved names fail with INVALID_ARGUMENT; an output that fits no
-  family is INVALID_ARGUMENT (unary) or a tile error ``inference_failed``.
+- A weights file that does not match fails the load with INVALID_ARGUMENT and one
+  line naming the class, its arguments and the first differing entry; the wire
+  client's retries (it retries INTERNAL) do not build the model again. Unknown and
+  unserved names fail with INVALID_ARGUMENT; an output that fits no family is
+  INVALID_ARGUMENT (unary) or a tile error ``inference_failed``.
 - Every served name (``catalog.list_model_classes()``) loads without metadata from
   weights built with 5 classes (and 5 bands where the model takes a band count),
   runs one chip, and returns the result family and values of the direct computation.
@@ -33,7 +35,7 @@ import pytest
 import torch
 import torchvision
 
-from nxmndr.client import InferenceGrpcError
+from nxmndr.client import InferenceGrpcClient, InferenceGrpcError
 from nxmndr.inference import inference_pb2
 from nxmndr.models import catalog
 from nxmndr.server import dispatch
@@ -245,20 +247,32 @@ def test_capabilities_list_the_catalog_of_the_server_environment(server):
 # ------------------------------------------------------------ (d): load errors
 
 
-def test_a_mismatched_weights_file_fails_the_load_with_the_differing_entries(server, resnet18):
+def _wrong_classes_message(path):
+    return (
+        f"weights file {path} does not match torchvision:resnet18(num_classes=7) (strict load): "
+        "shape mismatch fc.weight file [5, 512] model [7, 512] "
+        "(first of 2 differing entries: 2 with another shape)"
+    )
+
+
+def test_a_mismatched_weights_file_fails_the_load_with_the_first_differing_entry(
+    server, resnet18
+):
     path = resnet18[0]
     with server.client() as client:
         resident = _resident(client)
         with pytest.raises(InferenceGrpcError) as wrong_classes:
             client.load_model_result("", _spec(path, "torchvision:resnet18", num_classes=7))
-        message = str(wrong_classes.value)
-        assert "does not match torchvision:resnet18(num_classes=7) (strict load)" in message
-        assert "shape mismatch fc.weight file [5, 512] model [7, 512]" in message
+        assert wrong_classes.value.code == grpc.StatusCode.INVALID_ARGUMENT
+        assert str(wrong_classes.value) == _wrong_classes_message(path)
 
         with pytest.raises(InferenceGrpcError) as other_class:
             client.load_model_result("", _spec(path, "torchvision:resnet34"))
-        assert "does not match torchvision:resnet34(num_classes=5)" in str(other_class.value)
-        assert "missing layer1.2.conv1.weight" in str(other_class.value)
+        assert other_class.value.code == grpc.StatusCode.INVALID_ARGUMENT
+        assert str(other_class.value).startswith(
+            f"weights file {path} does not match torchvision:resnet34(num_classes=5) "
+            "(strict load): missing layer1.2.conv1.weight (first of "
+        )
 
         for model_class, text in (
             ("resnet18", "is not a catalog name"),
@@ -272,6 +286,45 @@ def test_a_mismatched_weights_file_fails_the_load_with_the_differing_entries(ser
             assert text in str(refused.value)
         # None of these loads left a model resident.
         assert _resident(client) == resident
+
+
+def _load_calls(server):
+    """``_rpc_load`` calls the server's PyTorch RPC worker has served (0 before it starts)."""
+
+    reply = server.command("status")
+    if "worker" not in reply:
+        assert not reply["alive"], reply  # no worker yet, so nothing was built
+        return 0
+    return reply["worker"]["load_calls"]
+
+
+def test_a_refused_load_is_built_once_and_answered_in_one_line(server, resnet18):
+    """The wire client retries INTERNAL but not INVALID_ARGUMENT (``nxmndr.client``), so
+    a load the worker refuses is built once per request, and the message the plugin
+    shows is the catalog's one line, without the worker's traceback."""
+
+    path = resnet18[0]
+    spec = _spec(path, "torchvision:resnet18", num_classes=7)
+    with InferenceGrpcClient(server.endpoint, timeout=120) as client:  # 3 attempts, as shipped
+        before = _load_calls(server)
+        with pytest.raises(InferenceGrpcError) as load:
+            client.load_model_result("", spec)
+        after_load = _load_calls(server)
+        with pytest.raises(InferenceGrpcError) as session:
+            client.open_session(session_id="s-refused", spec=spec)
+        after_session = _load_calls(server)
+        if not HAVE_TORCHGEO:  # a missing family package: refused before any build
+            with pytest.raises(InferenceGrpcError) as missing:
+                client.load_model_result("", _spec(path, "torchgeo:unet"))
+            assert missing.value.code == grpc.StatusCode.FAILED_PRECONDITION
+            assert "torchgeo (the nxmndr[geo] extra)" in str(missing.value)
+            assert _load_calls(server) == after_session
+    assert (after_load - before, after_session - after_load) == (1, 1)
+    for refused in (load.value, session.value):
+        assert refused.code == grpc.StatusCode.INVALID_ARGUMENT
+        message = str(refused)
+        assert "\n" not in message and "Traceback" not in message and "WorkerInfo" not in message
+        assert message == _wrong_classes_message(path)
 
 
 def test_an_output_that_fits_no_family_is_rejected_with_its_shape(server, tmp_path):

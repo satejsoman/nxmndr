@@ -529,7 +529,30 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
             raise _LoadRequestError(grpc.StatusCode.INVALID_ARGUMENT, str(exc)) from exc
 
     @staticmethod
-    def _cache_error_status(exc):
+    def _catalog_refusal(exc) -> Optional[catalog.CatalogError]:
+        """The catalog error behind a failed load, or None.
+
+        The PyTorch worker refuses a catalog model it cannot build as requested
+        (weights that do not match the class or its arguments; ``RpcWorkerManager.load``
+        raises that ``CatalogError``), and the model cache raises it as the cause of
+        ``ModelLoadError``, also for a waiter on the same load.
+        """
+        cause = exc.__cause__ if isinstance(exc, managers.ModelLoadError) else None
+        return cause if isinstance(cause, catalog.CatalogError) else None
+
+    @classmethod
+    def _cache_error_details(cls, exc) -> str:
+        """The status details of a cache error: a catalog refusal's own one-line message."""
+        refusal = cls._catalog_refusal(exc)
+        return str(refusal) if refusal is not None else str(exc)
+
+    @classmethod
+    def _cache_error_status(cls, exc):
+        refusal = cls._catalog_refusal(exc)
+        if isinstance(refusal, catalog.CatalogUnavailableError):
+            return grpc.StatusCode.FAILED_PRECONDITION
+        if refusal is not None:  # a request the catalog cannot serve: retrying cannot help
+            return grpc.StatusCode.INVALID_ARGUMENT
         if isinstance(exc, managers.CacheExhaustedError):
             return grpc.StatusCode.RESOURCE_EXHAUSTED
         if isinstance(exc, managers.ModelInUseError):
@@ -611,9 +634,10 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
             return inference_pb2.LoadModelResponse(success=False, model_id="", message=str(e))
         except managers.ModelCacheError as e:
             self.logger.warning("LoadModel failed: %s", e, extra={"corr_id": corr_id})
+            details = self._cache_error_details(e)
             context.set_code(self._cache_error_status(e))
-            context.set_details(str(e))
-            return inference_pb2.LoadModelResponse(success=False, model_id="", message=str(e))
+            context.set_details(details)
+            return inference_pb2.LoadModelResponse(success=False, model_id="", message=details)
         except Exception as e:
             self.logger.exception("LoadModel failed", extra={"corr_id": corr_id})
             context.set_code(grpc.StatusCode.INTERNAL)
@@ -1197,7 +1221,7 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
             return _fail(e.code, str(e))
         except managers.ModelCacheError as e:
             self.logger.warning("OpenSession failed: %s", e, extra={"corr_id": corr_id})
-            return _fail(self._cache_error_status(e), str(e))
+            return _fail(self._cache_error_status(e), self._cache_error_details(e))
         except Exception as e:
             self.logger.exception("OpenSession failed", extra={"corr_id": corr_id})
             return _fail(grpc.StatusCode.INTERNAL, str(e))

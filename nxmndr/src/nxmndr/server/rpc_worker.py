@@ -11,6 +11,12 @@ Models are routed by identity: the worker keeps a registry keyed by the model ca
 record's model ID. ``_rpc_load(model_id, spec)`` builds one model, ``_rpc_infer``
 runs exactly that model (``UnknownModelError`` if it is not loaded), ``_rpc_unload``
 frees it, ``_rpc_stop`` ends the worker. One ID never names two models.
+
+A catalog model that cannot be built as requested (``nxmndr.models.catalog.CatalogError``:
+weights that do not match the class or its arguments, a missing family package) is
+returned as a refusal, not raised: torch RPC would re-raise the error in the server
+with this process's traceback in its message. ``RpcWorkerManager.load`` raises it
+there again with the one-line message and logs the traceback at DEBUG.
 """
 
 import hashlib
@@ -18,6 +24,7 @@ import os
 import socket
 import threading
 import time
+import traceback
 from datetime import timedelta
 from pathlib import Path
 
@@ -52,6 +59,7 @@ class _LoadedModel:
 _worker_state = {
     "models": {},  # model_id -> _LoadedModel
     "loading": set(),  # model IDs whose _rpc_load is running
+    "load_calls": 0,  # _rpc_load calls served, refused ones included (_rpc_status)
     "spec": None,
     "initialized": False,
     "stop_requested": False,
@@ -138,6 +146,20 @@ def _rpc_ping():
     return {"status": "ok", "timestamp": time.time()}
 
 
+def _catalog_refusal(exc: Exception):
+    """The refusal ``_rpc_load`` returns for a catalog build error, or None for any other."""
+
+    from ..models import catalog
+
+    if not isinstance(exc, catalog.CatalogError):
+        return None
+    return {
+        "message": str(exc),
+        "unavailable": isinstance(exc, catalog.CatalogUnavailableError),
+        "traceback": traceback.format_exc(),
+    }
+
+
 def _rpc_load(model_id, spec, device="cpu"):
     """Build the model of ``spec`` under ``model_id``; return its device and fingerprint.
 
@@ -145,16 +167,27 @@ def _rpc_load(model_id, spec, device="cpu"):
     ``catalog_args``), ``model_path`` and ``name``, as a mapping or as attributes. A
     model ID that is loaded or loading is refused, so one ID never names two models.
     A catalog model's result also has ``catalog`` (``CatalogModel.catalog_info``).
+    A catalog model that cannot be built is not loaded; the result is then
+    ``{"model_id", "refused": {"message", "unavailable", "traceback"}}``, with the
+    ``CatalogError`` message and whether its family package is missing.
     """
 
     if not isinstance(model_id, str) or not model_id:
         raise ValueError("model_id must be a non-empty string")
     with _models_lock:
+        _worker_state["load_calls"] += 1
         if model_id in _worker_state["models"] or model_id in _worker_state["loading"]:
             raise ValueError(f"model {model_id} is already loaded in this PyTorch RPC worker")
         _worker_state["loading"].add(model_id)
     try:
-        info = _register(model_id, _load_model(spec, device))
+        try:
+            model = _load_model(spec, device)
+        except Exception as exc:
+            refusal = _catalog_refusal(exc)
+            if refusal is None:
+                raise
+            return {"model_id": model_id, "refused": refusal}
+        info = _register(model_id, model)
     finally:
         with _models_lock:
             _worker_state["loading"].discard(model_id)
@@ -264,6 +297,7 @@ def _rpc_status():
         "status": "ok" if state.get("rpc_initialized") else "initializing",
         "model_loaded": bool(models),
         "models": models,
+        "load_calls": state.get("load_calls", 0),
         "stop_requested": state.get("stop_requested"),
         "pid": os.getpid(),
     }

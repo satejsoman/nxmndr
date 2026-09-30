@@ -439,7 +439,10 @@ class RpcWorkerManager:
     def load(self, model_id: str, model_spec) -> Dict[str, object]:
         """Build ``model_spec`` in the worker under ``model_id`` (starting the worker first).
 
-        Returns the worker's ``{"model_id", "device", "fingerprint"}``.
+        Returns the worker's ``{"model_id", "device", "fingerprint"}``. A catalog model
+        the worker refused raises ``catalog.CatalogError`` (``CatalogUnavailableError``
+        when its family package is missing) with the worker's one-line message; the
+        worker's traceback is logged here at DEBUG.
         """
 
         from ..models import catalog
@@ -460,7 +463,18 @@ class RpcWorkerManager:
         self.ensure_started()
         from .rpc_worker import _rpc_load
 
-        return torch_rpc.rpc_sync(RPC_WORKER_NAME, _rpc_load, args=(model_id, payload))
+        info = torch_rpc.rpc_sync(RPC_WORKER_NAME, _rpc_load, args=(model_id, payload))
+        refused = info.get("refused") if isinstance(info, dict) else None
+        if refused:
+            logger.debug(
+                "the PyTorch RPC worker refused model %s:\n%s",
+                model_id,
+                refused.get("traceback", ""),
+            )
+            if refused.get("unavailable"):
+                raise catalog.CatalogUnavailableError(refused.get("message", ""))
+            raise catalog.CatalogError(refused.get("message", ""))
+        return info
 
     def infer(self, model_id: str, tensor, *, device_hint: str = "cpu", timeout: float):
         """Run the worker's model ``model_id`` (``rpc_worker.UnknownModelError`` if absent)."""

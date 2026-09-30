@@ -39,8 +39,8 @@ no pretrained weights are downloaded (torchvision segmentation builders also get
 
 torchvision segmentation builders get ``aux_loss=True`` when the weights file has
 ``aux_classifier.*`` entries. The weights load with ``strict=True``. A file that
-does not match is a :class:`CatalogError` that names the class, its arguments and
-the differing entries.
+does not match is a :class:`CatalogError` that names the class, its arguments, the
+first differing entry and the count of all. Every ``CatalogError`` message is one line.
 
 Input and output: the built model is a :class:`CatalogModel`. It takes the chip as
 the server sends it (``[H, W, C]`` float32, no scaling or normalization; CONTRACTS.md
@@ -54,6 +54,7 @@ from __future__ import annotations
 import functools
 import importlib
 import inspect
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
@@ -81,7 +82,14 @@ _INSTALL_HINT = {
 
 
 class CatalogError(ValueError):
-    """A catalog name or its constructor arguments cannot be served as given."""
+    """A catalog name, its constructor arguments or its weights file cannot be served as given.
+
+    The message is one line (runs of whitespace, newlines included, become one space):
+    the server sends it to the client as the status details of the failed load.
+    """
+
+    def __init__(self, message):
+        super().__init__(" ".join(str(message).split()))
 
 
 class CatalogUnavailableError(CatalogError):
@@ -341,6 +349,31 @@ def _dimension(shapes: Mapping, keys, axis: int) -> Optional[int]:
     return None
 
 
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
+# torch.load(weights_only=True) states why it refused a file on the line that starts so.
+_WEIGHTS_ONLY_REASON = "WeightsUnpickler error:"
+
+
+def _first_line(exc: BaseException) -> str:
+    """``Type: reason`` in one line; torch's load errors run to many lines of advice.
+
+    The reason is the first sentence of torch's ``WeightsUnpickler error:`` line when
+    there is one (a file that holds other pickled objects than tensors), else the first
+    line of the message.
+    """
+
+    lines = [line.strip() for line in _ANSI_ESCAPE.sub("", str(exc)).splitlines() if line.strip()]
+    reason = next(
+        (
+            line[len(_WEIGHTS_ONLY_REASON):].split(". ", 1)[0].strip()
+            for line in lines
+            if line.startswith(_WEIGHTS_ONLY_REASON)
+        ),
+        lines[0] if lines else "",
+    )
+    return f"{type(exc).__name__}: {reason}" if reason else type(exc).__name__
+
+
 def _load_state(model_class: str, weights_path) -> Mapping:
     try:
         state = torch.load(str(weights_path), map_location="cpu", weights_only=True)
@@ -349,7 +382,7 @@ def _load_state(model_class: str, weights_path) -> Mapping:
     except Exception as exc:
         raise CatalogError(
             f"{model_class}: weights file {weights_path} is not a PyTorch state dict "
-            f"({type(exc).__name__}: {exc})"
+            f"({_first_line(exc)})"
         ) from exc
     if not isinstance(state, Mapping) or not all(
         isinstance(key, str) and torch.is_tensor(value) for key, value in state.items()
@@ -362,30 +395,33 @@ def _load_state(model_class: str, weights_path) -> Mapping:
     return state
 
 
-def _few(items) -> str:
-    items = list(items)
-    shown = ", ".join(items[:5])
-    return shown + (f", ... ({len(items)} in all)" if len(items) > 5 else "")
-
-
 def _mismatch(model_state: Mapping, state: Mapping) -> str:
-    """The entries that keep ``state`` from loading strictly, or ""."""
+    """The first entry that keeps ``state`` from loading strictly and the count of all, or "".
 
-    missing = [key for key in model_state if key not in state]
-    unexpected = [key for key in state if key not in model_state]
+    Entries are taken in this order: missing from the file (in the model's order), not
+    in the model (in the file's order), then present in both with another shape.
+    """
+
+    missing = [f"missing {key}" for key in model_state if key not in state]
+    unexpected = [f"unexpected {key}" for key in state if key not in model_state]
     shapes = [
-        f"{key} file {list(state[key].shape)} model {list(value.shape)}"
+        f"shape mismatch {key} file {list(state[key].shape)} model {list(value.shape)}"
         for key, value in model_state.items()
         if key in state and tuple(state[key].shape) != tuple(value.shape)
     ]
-    parts = []
-    if missing:
-        parts.append(f"missing {_few(missing)}")
-    if unexpected:
-        parts.append(f"unexpected {_few(unexpected)}")
-    if shapes:
-        parts.append(f"shape mismatch {_few(shapes)}")
-    return "; ".join(parts)
+    differing = missing + unexpected + shapes
+    if not differing:
+        return ""
+    counts = ", ".join(
+        f"{len(group)} {label}"
+        for group, label in (
+            (missing, "missing"),
+            (unexpected, "unexpected"),
+            (shapes, "with another shape"),
+        )
+        if group
+    )
+    return f"{differing[0]} (first of {len(differing)} differing entries: {counts})"
 
 
 class CatalogModel(torch.nn.Module):
@@ -469,7 +505,7 @@ def build(model_class: str, weights_path, metadata: Optional[Mapping] = None) ->
     try:
         model = _construct(family, name, {**base, **arguments})
     except Exception as exc:
-        raise CatalogError(f"{signature} could not be built: {type(exc).__name__}: {exc}") from exc
+        raise CatalogError(f"{signature} could not be built: {_first_line(exc)}") from exc
     model_state = model.state_dict()
     mismatch = _mismatch(model_state, state)
     if mismatch:
@@ -480,7 +516,7 @@ def build(model_class: str, weights_path, metadata: Optional[Mapping] = None) ->
         model.load_state_dict(state, strict=True)
     except Exception as exc:
         raise CatalogError(
-            f"weights file {weights_path} does not load into {signature}: {exc}"
+            f"weights file {weights_path} does not load into {signature}: {_first_line(exc)}"
         ) from exc
     model.eval()
 
