@@ -4,9 +4,9 @@
 """Shared prediction dispatch for unary ``Predict`` and every ``StreamPredict`` tile.
 
 One code path turns (leased model record, decoded input, effective options) into a
-response array plus metadata: SAM prompt routing, the unprompted fallback, task
-shaping (segmentation masks and confidence, detection boxes, embeddings) and NPZ
-tensor bundles. The gRPC layer only decodes transport, holds leases and adds
+response array plus metadata: SAM prompt routing, the unprompted fallback, the result
+family of a catalog model's output (``catalog_output``), task shaping (segmentation
+masks and confidence, detection boxes, embeddings) and NPZ tensor bundles. The gRPC layer only decodes transport, holds leases and adds
 correlation metadata, so unary and streaming results cannot drift apart.
 
 Stream context v1 (``StreamPredictRequest.context``) is also decoded here:
@@ -253,11 +253,15 @@ def shape_result(
     model_metadata: Mapping[str, object],
     logger=None,
     instance_masks: bool = False,
+    label_confidence: Optional[np.ndarray] = None,
 ) -> DispatchResult:
     """Task shaping and serialization shared by every prediction path.
 
     ``instance_masks``: ``output`` is an ``(N, H, W)`` instance stack that stays as it
     is (no argmax, no squeeze) as a ``segmentation_mask`` result.
+    ``label_confidence``: the confidence tile of a segmentation ``output`` that is
+    already a label tile (a catalog class vector, ``catalog_output``), used when
+    ``return_confidence`` is set.
     """
 
     embeddings_from_model = None
@@ -294,6 +298,9 @@ def shape_result(
         try:
             if instance_masks:
                 masks = np.ascontiguousarray(base_output)
+            elif return_confidence and label_confidence is not None:
+                masks = prepare_segmentation_mask(base_output)
+                confidence = np.asarray(label_confidence, dtype=np.float32)
             elif return_confidence:
                 masks, confidence = prepare_segmentation_mask_with_confidence(base_output)
             else:
@@ -390,6 +397,94 @@ def _sam_variant_getter(lease, capability, device_id: str, torch_device: str):
 # The embedding-only task names of shape_result.
 _EMBEDDING_TASKS = {"embedding", "embeddings", "feature", "features"}
 
+# ------------------------------------------------------------ catalog output families
+
+OUTPUT_CLASS_VECTOR = "class_vector"
+OUTPUT_LABEL_MAP = "label_map"
+OUTPUT_EMBEDDINGS = "embeddings"
+_UINT16_LABELS = 65536
+
+
+class UnsupportedOutputError(DispatchError):
+    """A catalog model's output fits no result family (unary Predict: INVALID_ARGUMENT)."""
+
+    code = ERROR_INFERENCE_FAILED
+
+
+def _class_count(model_metadata: Mapping[str, object]) -> int:
+    try:
+        return int(str(model_metadata.get("num_classes") or "0"))
+    except ValueError:
+        return 0
+
+
+def catalog_output(output, chip_shape: Sequence[int], options, model_metadata):
+    """The result family of a catalog model's output (``nxmndr.models.catalog``).
+
+    The chip is ``[H, W, C]`` and the model returns one tensor with batch 1. The model
+    has a class head when its load metadata ``num_classes`` is K >= 1 (the class count
+    it was built with). The family is decided by that and by the output's shape:
+
+    - Task ``embedding`` (option ``task_type`` or ModelSpec task), or no class head:
+      ``[1, D]`` or ``[1, D, h, w]`` is ``embeddings`` (``result_type=embeddings``).
+    - Class head, ``[1, K]``: a class vector. The paper's rule, a bare class vector
+      becomes a constant tile: a ``segmentation_mask`` whose ``[H, W]`` uint16 tile is
+      the argmax class everywhere, so the host writes that class over the chip's
+      written window. With ``return_confidence`` the confidence tile is that class's
+      softmax probability everywhere.
+    - Class head, ``[1, K, H, W]``: per-pixel logits, the label-map path of every
+      segmentation model (per-pixel argmax; with ``return_confidence`` the per-pixel
+      softmax maximum).
+    - Anything else is rejected with ``UnsupportedOutputError`` naming the shape: other
+      ranks, batch other than 1, K other than ``num_classes``, logits that are not
+      chip-sized (the host places only chip-sized outputs), and K = 1 (one logit has no
+      argmax).
+
+    With ``return_embeddings`` the bundle's ``embeddings`` is the model output.
+    Returns ``(output, options, confidence, family)``: the first three for
+    ``shape_result`` (``options`` with the family's ``task_type``; ``confidence`` only
+    for a class vector), and the family name (response metadata ``output_family``).
+    """
+
+    arr = _to_numpy(output)
+    shape = list(arr.shape)
+    height, width = int(chip_shape[0]), int(chip_shape[1])
+    classes = _class_count(model_metadata)
+    embedding_task = _task_type(options, model_metadata) in _EMBEDDING_TASKS
+
+    def unsupported(why: str) -> UnsupportedOutputError:
+        return UnsupportedOutputError(
+            f"{model_metadata.get('model_class', 'the model')} returned shape {shape} "
+            f"({arr.dtype}), which fits no result family: {why}"
+        )
+
+    if arr.ndim not in (2, 4) or shape[0] != 1:
+        raise unsupported("the families are [1, K], [1, K, H, W], [1, D] and [1, D, h, w]")
+    shaping = dict(options)
+    if embedding_task or classes < 1:
+        shaping["task_type"] = "embedding"
+        return arr, shaping, None, OUTPUT_EMBEDDINGS
+    if shape[1] != classes:
+        raise unsupported(f"the model was built with num_classes={classes}")
+    if classes == 1:
+        raise unsupported("one class logit has no argmax")
+    shaping["task_type"] = "segmentation"
+    if arr.ndim == 4:
+        if shape[2:] != [height, width]:
+            raise unsupported(f"per-pixel logits must be chip-sized ({height}x{width})")
+        return arr, shaping, None, OUTPUT_LABEL_MAP
+    if classes > _UINT16_LABELS:
+        raise unsupported(f"more than {_UINT16_LABELS} classes do not fit a uint16 label tile")
+    scores = arr[0].astype(np.float64)
+    label = int(np.argmax(scores))
+    tile = np.full((height, width), label, dtype=np.uint16)
+    confidence = None
+    if option_bool(options, "return_confidence"):
+        exp = np.exp(scores - scores.max())
+        probability = float(exp[label] / exp.sum())
+        confidence = np.full((height, width), probability, dtype=np.float32)
+    return {"output": tile, "embeddings": arr}, shaping, confidence, OUTPUT_CLASS_VECTOR
+
 
 def _run_instance_prediction(model_obj, image, options, model_metadata, logger) -> DispatchResult:
     """An instance-mask model (``ultralytics_yolo``): always a ``segmentation_mask``
@@ -482,7 +577,20 @@ def run_prediction(
         output = infer(image, option_bool(options, "return_embeddings"))
     infer_ms = (time.monotonic() - start) * 1000.0
 
-    result = shape_result(output, options=options, model_metadata=model_metadata, logger=logger)
+    confidence, family = None, ""
+    if model_metadata.get("model_family"):  # a catalog model: catalog_output's rule
+        output, options, confidence, family = catalog_output(
+            output, image.shape, options, model_metadata
+        )
+    result = shape_result(
+        output,
+        options=options,
+        model_metadata=model_metadata,
+        logger=logger,
+        label_confidence=confidence,
+    )
+    if family:
+        result.metadata["output_family"] = family
     result.metadata["latency_infer_ms"] = f"{infer_ms:.2f}"
     if capability is not None:
         result.metadata["sam_prompt"] = sam_mode or "none"
@@ -510,4 +618,9 @@ __all__ = [
     "option_positive_int",
     "shape_result",
     "run_prediction",
+    "catalog_output",
+    "UnsupportedOutputError",
+    "OUTPUT_CLASS_VECTOR",
+    "OUTPUT_LABEL_MAP",
+    "OUTPUT_EMBEDDINGS",
 ]
