@@ -4,8 +4,9 @@
 """Shared prediction dispatch for unary ``Predict`` and every ``StreamPredict`` tile.
 
 One code path turns (leased model record, decoded input, effective options) into a
-response array plus metadata: SAM prompt routing, the unprompted fallback, the result
-family of a catalog model's output (``catalog_output``), task shaping (segmentation
+response array plus metadata: SAM prompt routing, the unprompted fallback, the chip
+size of a fixed-size catalog model (``check_catalog_chip``), the result family of a
+catalog model's output (``catalog_output``), task shaping (segmentation
 masks and confidence, detection boxes, embeddings) and NPZ tensor bundles. The gRPC
 layer only decodes transport, holds leases and adds correlation metadata, so unary
 and streaming results cannot drift apart.
@@ -419,6 +420,27 @@ def _class_count(model_metadata: Mapping[str, object]) -> int:
         return 0
 
 
+def check_catalog_chip(chip_shape: Sequence[int], model_metadata: Mapping[str, object]) -> None:
+    """Refuse a chip that a fixed-size catalog model cannot take (``MalformedPayloadError``).
+
+    A catalog record's ``input_size`` is the square chip size its model requires
+    (``nxmndr.models.catalog.input_size``; empty when it takes any size). A chip of
+    another height or width is refused here, before it reaches the PyTorch worker, so
+    the error names the size: unary ``Predict`` answers INVALID_ARGUMENT and a stream
+    answers a tile-scope ``malformed_payload``.
+    """
+
+    size = str(model_metadata.get("input_size") or "")
+    if not size or len(chip_shape) < 2:
+        return
+    height, width = int(chip_shape[0]), int(chip_shape[1])
+    if (height, width) != (int(size), int(size)):
+        raise MalformedPayloadError(
+            f"{model_metadata.get('model_class', 'the model')} takes only {size} x {size} "
+            f"chips; this chip is {height} x {width}"
+        )
+
+
 def catalog_output(output, chip_shape: Sequence[int], options, model_metadata):
     """The result family of a catalog model's output (``nxmndr.models.catalog``).
 
@@ -555,6 +577,8 @@ def run_prediction(
         )
     capability = sam_support.resolve_sam_capability(record.model, record.spec)
 
+    if model_metadata.get("model_family"):  # a catalog model
+        check_catalog_chip(image.shape, model_metadata)
     start = time.monotonic()
     output = None
     sam_mode = ""
@@ -620,6 +644,7 @@ __all__ = [
     "shape_result",
     "run_prediction",
     "catalog_output",
+    "check_catalog_chip",
     "UnsupportedOutputError",
     "OUTPUT_CLASS_VECTOR",
     "OUTPUT_LABEL_MAP",

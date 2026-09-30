@@ -12,7 +12,10 @@ mocked. Weights are random, made and saved by each test; nothing is downloaded.
   over 4 chips; each tile is the constant argmax class computed with torch on the
   same chip, also with ``return_confidence`` (unary and streamed).
 - torchgeo unet (4 bands, 3 classes): label maps equal the direct per-pixel argmax.
-- Capabilities ``pytorch_model_classes`` is the catalog of the server's environment.
+- Capabilities ``pytorch_model_classes`` is the catalog of the server's environment;
+  ``pytorch_model_input_sizes`` names its fixed-size models with their size.
+- torchvision vit_b_32 (fixed at 224): a 224 chip runs; a 512 chip fails its tile
+  alone (``malformed_payload``, naming 224) and unary Predict with INVALID_ARGUMENT.
 - A weights file that does not match fails the load with INVALID_ARGUMENT and one
   line naming the class, its arguments and the first differing entry; the wire
   client's retries (it retries INTERNAL) do not build the model again. Unknown and
@@ -20,7 +23,8 @@ mocked. Weights are random, made and saved by each test; nothing is downloaded.
   INVALID_ARGUMENT (unary) or a tile error ``inference_failed``.
 - Every served name (``catalog.list_model_classes()``) loads without metadata from
   weights built with 5 classes (and 5 bands where the model takes a band count),
-  runs one chip, and returns the result family and values of the direct computation.
+  runs one chip (of its ``catalog.input_size``, else 224), and returns the result
+  family and values of the direct computation.
 """
 
 from __future__ import annotations
@@ -244,6 +248,72 @@ def test_capabilities_list_the_catalog_of_the_server_environment(server):
     assert any(n.startswith("torchgeo:") for n in advertised) == HAVE_TORCHGEO
 
 
+def test_capabilities_list_the_fixed_input_sizes(server):
+    with server.client() as client:
+        value = client.capabilities()["pytorch_model_input_sizes"]
+    torchvision_sizes = [
+        "torchvision:maxvit_t=224",
+        "torchvision:vit_b_16=224",
+        "torchvision:vit_b_32=224",
+        "torchvision:vit_h_14=224",
+        "torchvision:vit_l_16=224",
+        "torchvision:vit_l_32=224",
+    ]
+    torchgeo_sizes = [
+        "torchgeo:earthloc=320",
+        "torchgeo:scalemae_large_patch16=224",
+        "torchgeo:vit_base_patch14_dinov2=518",
+        "torchgeo:vit_base_patch16_224=224",
+        "torchgeo:vit_huge_patch14_224=224",
+        "torchgeo:vit_large_patch16_224=224",
+        "torchgeo:vit_small_patch14_dinov2=518",
+        "torchgeo:vit_small_patch16_224=224",
+    ]
+    assert value.split(",") == (torchgeo_sizes if HAVE_TORCHGEO else []) + torchvision_sizes
+    assert value == ",".join(f"{name}={size}" for name, size in catalog.list_input_sizes())
+
+
+def test_a_fixed_size_class_runs_at_its_size_and_refuses_other_chips(server, tmp_path):
+    torch.manual_seed(1)
+    model = torchvision.models.vit_b_32(weights=None, num_classes=5).eval()
+    torch.nn.init.normal_(model.heads.head.weight)  # torchvision zeroes the class head
+    path = tmp_path / "vit_b_32.pt"
+    torch.save(model.state_dict(), str(path))
+    rng = np.random.default_rng(1)
+    chip = rng.random((224, 224, 3)).astype(np.float32)
+    wrong = rng.random((512, 512, 3)).astype(np.float32)
+    label = int(np.argmax(_direct(model, chip)[0]))
+    refusal = "torchvision:vit_b_32 takes only 224 x 224 chips; this chip is 512 x 512"
+    with server.client() as client:
+        model_id = client.load_model_result("", _spec(path, "torchvision:vit_b_32")).model_id
+        opened = client.open_session(
+            session_id="s-vit", spec=inference_pb2.ModelSpec(model_id=model_id)
+        )
+        assert opened.status == "ok", opened.error
+        answers = {}
+        for resp in client.stream_predict(
+            session_id="s-vit", samples=[wrong, chip], tile_ids=["wrong", "right"]
+        ):
+            answers[dict(resp.metadata)["tile_id"]] = resp
+        failed = dict(answers["wrong"].metadata)
+        assert (failed["error_scope"], failed["error_code"]) == (
+            "tile",
+            dispatch.ERROR_MALFORMED_PAYLOAD,
+        )
+        assert failed["error"] == refusal
+        ran = dict(answers["right"].metadata)  # the stream went on after the refused tile
+        assert "error" not in ran and ran["output_family"] == dispatch.OUTPUT_CLASS_VECTOR
+        tile = _array(answers["right"].output, answers["right"].shape, answers["right"].dtype)
+        assert tile.shape == (224, 224) and (tile == label).all()
+        assert client.close_session("s-vit").status == "closed"
+
+        with pytest.raises(InferenceGrpcError) as unary:
+            client.predict(model_id, wrong)
+        assert unary.value.code == grpc.StatusCode.INVALID_ARGUMENT
+        assert str(unary.value) == refusal
+        _unload(client, model_id)
+
+
 # ------------------------------------------------------------ (d): load errors
 
 
@@ -351,14 +421,9 @@ def test_an_output_that_fits_no_family_is_rejected_with_its_shape(server, tmp_pa
 
 # ---------------------------------------------------------- every served name
 
-# Chip sizes of models with a fixed input size: EarthLoc's default image_size is 320;
-# timm's DINOv2 ViTs are built for 518 (both from their builders' defaults). The rest
-# run on 224, the size torchvision and timm build their classifiers for.
-PROOF_CHIP = {
-    "torchgeo:earthloc": 320,
-    "torchgeo:vit_base_patch14_dinov2": 518,
-    "torchgeo:vit_small_patch14_dinov2": 518,
-}
+# Models with a fixed input size run on that size (catalog.input_size); the rest run on
+# 224, the size torchvision and timm build their classifiers for.
+PROOF_CHIP = 224
 PROOF_CLASSES = 5  # the family defaults are 1000, 21, 1 or 0 classes
 PROOF_BANDS = 5  # the family defaults are 3 or 4 bands
 
@@ -385,7 +450,7 @@ def _reference(model_class):
         if entry.channel_arg:
             kwargs[entry.channel_arg] = bands = PROOF_BANDS
         model = torchgeo.models.get_model(name, **kwargs)
-    return model.eval(), PROOF_CHIP.get(model_class, 224), bands
+    return model.eval(), catalog.input_size(model_class) or PROOF_CHIP, bands
 
 
 def _close(got, want):

@@ -1376,6 +1376,13 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
             inference_pb2.CapabilityInfo(
                 key="pytorch_model_classes", value=",".join(catalog.list_model_classes())
             ),
+            # The names of pytorch_model_classes whose model takes one square chip size
+            # only (nxmndr.models.catalog.input_size), as '<name>=<pixels>',
+            # comma-separated, in the same order; a chip of another size fails its tile.
+            inference_pb2.CapabilityInfo(
+                key="pytorch_model_input_sizes",
+                value=",".join(f"{name}={size}" for name, size in catalog.list_input_sizes()),
+            ),
         ]
         if self._device_plan:
             caps.append(

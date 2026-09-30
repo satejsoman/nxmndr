@@ -91,7 +91,7 @@ def _build_pytorch_record(rpc_workers, model_spec, metadata: Dict[str, object]) 
         record_metadata = dict(metadata)
         record_metadata["rpc_device"] = str(info.get("device", ""))
         record_metadata["rpc_fingerprint"] = str(info.get("fingerprint", ""))
-        # A catalog model: model_family, model_class, num_classes, in_channels.
+        # A catalog model: model_family, model_class, num_classes, in_channels, input_size.
         record_metadata.update(info.get("catalog") or {})
         record = ModelRecord(None, "pytorch", record_metadata, model_spec)
         handle = _RpcModelHandle(rpc_workers, model_id, info)

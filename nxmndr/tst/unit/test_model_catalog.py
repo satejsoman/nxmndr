@@ -11,8 +11,13 @@
   for bad metadata; constructor arguments from metadata or from the weights file;
   a weights file that does not match fails with the class, its arguments and the
   first differing entry, in one line.
+- ``input_size``/``list_input_sizes``: the served names that take one chip size, each
+  of which runs at that size and fails at 512 (the plugin's default chip), while every
+  other served name runs at 224 and at 512 (models built on the ``meta`` device where
+  their builder allows).
 - ``dispatch.run_prediction`` on a catalog record: class vector, label map and
-  embedding families, and the shapes that fit none.
+  embedding families, the shapes that fit none, and a chip of another size than a
+  fixed-size model takes.
 
 Weights are random and saved by each test; nothing is downloaded. The gRPC service
 and the RPC worker run in tst/integration/test_model_catalog_service.py.
@@ -48,6 +53,8 @@ def _clear_caches():
     catalog._family_models.cache_clear()
     catalog._family_names.cache_clear()
     catalog.list_model_classes.cache_clear()
+    catalog.input_size.cache_clear()
+    catalog.list_input_sizes.cache_clear()
 
 
 @pytest.fixture
@@ -159,6 +166,7 @@ def test_build_takes_the_class_count_from_the_weights_file_or_the_metadata(tmp_p
             "model_class": "torchvision:resnet18",
             "num_classes": "5",
             "in_channels": "3",
+            "input_size": "",
         }
         with torch.no_grad():
             torch.testing.assert_close(model(chip), expected)
@@ -256,12 +264,115 @@ def test_torchgeo_unet_takes_classes_and_bands_from_the_weights_file(tmp_path):
         "model_class": "torchgeo:unet",
         "num_classes": "3",
         "in_channels": "4",
+        "input_size": "",
     }
     chip = torch.rand(64, 64, 4)
     with torch.no_grad():
         torch.testing.assert_close(model(chip), reference(chip.permute(2, 0, 1)[None]))
     with pytest.raises(catalog.CatalogError, match="has no class head"):
         catalog.build("torchgeo:tilenet", path, {"num_classes": "3"})
+
+
+# ------------------------------------------------------------- fixed input sizes
+
+# The served names that take one square chip size, with that size: torchvision's
+# VisionTransformer (image_size) and MaxVit (INPUT_SIZES_NOT_ON_THE_MODEL), torchgeo's
+# timm ViTs, DINOv2 ViTs and ScaleMAE (strict patch_embed.img_size) and EarthLoc
+# (image_size). test_every_served_name_runs_at_its_input_size_only proves the list.
+FIXED_INPUT_SIZES = {
+    "torchgeo:earthloc": 320,
+    "torchgeo:scalemae_large_patch16": 224,
+    "torchgeo:vit_base_patch14_dinov2": 518,
+    "torchgeo:vit_base_patch16_224": 224,
+    "torchgeo:vit_huge_patch14_224": 224,
+    "torchgeo:vit_large_patch16_224": 224,
+    "torchgeo:vit_small_patch14_dinov2": 518,
+    "torchgeo:vit_small_patch16_224": 224,
+    "torchvision:maxvit_t": 224,
+    "torchvision:vit_b_16": 224,
+    "torchvision:vit_b_32": 224,
+    "torchvision:vit_h_14": 224,
+    "torchvision:vit_l_16": 224,
+    "torchvision:vit_l_32": 224,
+}
+OTHER_SIZE = 512  # the plugin's default chip size; no fixed size above is 512
+
+
+def test_the_fixed_input_sizes_are_listed_in_catalog_order(fresh_catalog):
+    names = catalog.list_model_classes()
+    expected = [(name, FIXED_INPUT_SIZES[name]) for name in names if name in FIXED_INPUT_SIZES]
+    assert list(catalog.list_input_sizes()) == expected
+    assert len(expected) == (14 if torchgeo_models is not None else 6)
+    assert catalog.input_size("torchvision:resnet18") is None
+    with pytest.raises(catalog.CatalogError, match="is not served"):
+        catalog.input_size("torchvision:raft_large")
+
+
+def _runs(model, bands, size, device):
+    try:
+        with torch.no_grad():
+            model(torch.zeros(1, bands, size, size, device=device))
+    except Exception:  # the model refuses the size: an assertion, a shape error
+        return False
+    return True
+
+
+@pytest.mark.parametrize("model_class", catalog.list_model_classes())
+def test_every_served_name_runs_at_its_input_size_only(model_class):
+    family, name = catalog.resolve(model_class)
+    kwargs = catalog._builder_kwargs(family, name, {})
+    bands = 3
+    if family == catalog.FAMILY_TORCHGEO and catalog.TORCHGEO_SERVED[name].channel_arg:
+        kwargs[catalog.TORCHGEO_SERVED[name].channel_arg] = bands  # tilenet's default is 4
+    try:
+        with torch.device("meta"):
+            model = catalog._construct(family, name, kwargs).eval()
+        device = "meta"
+    except (NotImplementedError, RuntimeError):  # torchvision RegNet builds on the CPU
+        model = catalog._construct(family, name, kwargs).eval()
+        device = "cpu"
+    size = catalog.input_size(model_class)
+    assert size == FIXED_INPUT_SIZES.get(model_class)
+    if size is None:
+        assert _runs(model, bands, 224, device) and _runs(model, bands, OTHER_SIZE, device)
+    else:
+        assert _runs(model, bands, size, device) and not _runs(model, bands, OTHER_SIZE, device)
+
+
+def test_a_fixed_size_model_refuses_a_chip_of_another_size():
+    calls = []
+
+    def run(chip, metadata):
+        record = SimpleNamespace(backend="pytorch", metadata=metadata, model=None, spec=None)
+        return dispatch.run_prediction(
+            SimpleNamespace(record=record),
+            image=np.zeros(chip, dtype=np.float32),
+            options={},
+            device_id="cpu:0",
+            torch_device="cpu",
+            infer=lambda array, return_embeddings: calls.append(array.shape)
+            or np.array([[0.0, 1.0, 0.0]], dtype=np.float32),
+        )
+
+    metadata = {
+        "task": 0,
+        "model_family": "torchvision",
+        "model_class": "torchvision:vit_b_32",
+        "num_classes": "3",
+        "in_channels": "3",
+        "input_size": "224",
+    }
+    for chip in ((512, 512, 3), (224, 256, 3)):
+        with pytest.raises(dispatch.MalformedPayloadError) as refused:
+            run(chip, metadata)
+        assert str(refused.value) == (
+            f"torchvision:vit_b_32 takes only 224 x 224 chips; this chip is {chip[0]} x {chip[1]}"
+        )
+        assert refused.value.code == dispatch.ERROR_MALFORMED_PAYLOAD
+    assert calls == []  # refused before the model ran
+    assert _raw(run((224, 224, 3), metadata)).shape == (224, 224)
+    assert _raw(run((512, 512, 3), {**metadata, "input_size": ""})).shape == (512, 512)
+    assert calls == [(224, 224, 3), (512, 512, 3)]
 
 
 def test_the_cache_key_includes_the_catalog_arguments():

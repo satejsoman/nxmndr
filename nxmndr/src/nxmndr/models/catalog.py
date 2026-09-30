@@ -47,6 +47,17 @@ the server sends it (``[H, W, C]`` float32, no scaling or normalization; CONTRAC
 2.4) as one image ``[1, C, H, W]`` and returns one tensor (the ``out`` entry of a
 torchvision segmentation model). ``nxmndr.server.dispatch.catalog_output`` turns that
 tensor into a result family.
+
+Fixed input sizes (:func:`input_size`, :func:`list_input_sizes`; the server's
+Capabilities entry ``pytorch_model_input_sizes``): some served models take one square
+chip size only. The size is read from the model's own metadata on a build with the
+family's default arguments on the ``meta`` device: ``image_size`` (torchvision
+``VisionTransformer``, torchgeo ``EarthLoc``) or timm's strict ``patch_embed.img_size``
+(torchgeo's timm ViTs, DINOv2 ViTs and ScaleMAE). A torchvision builder whose model
+class takes no input-size argument is not built for this. A model that requires a
+size without recording it is in :data:`INPUT_SIZES_NOT_ON_THE_MODEL`. The server
+refuses a chip of another size for such a model before it reaches the model
+(``nxmndr.server.dispatch.check_catalog_chip``).
 """
 
 from __future__ import annotations
@@ -176,6 +187,18 @@ _CHANNEL_MARK = 7907
 # torchvision builder flags set from the weights file: the flag adds entries with
 # these prefixes.
 _TORCHVISION_FLAGS = {"aux_loss": ("aux_classifier.",)}
+
+# Constructor arguments that set a model's input size. A torchvision model class whose
+# constructor takes none of them has no fixed input size (input_size).
+_SIZE_ARGUMENTS = ("image_size", "img_size", "input_size")
+# Square chip sizes that served models require but do not record on the built model.
+INPUT_SIZES_NOT_ON_THE_MODEL = {
+    # torchvision 0.26.0 models/maxvit.py, _maxvit: input_size defaults to (224, 224)
+    # and sizes the partition grid of every block when the model is built; MaxVit keeps
+    # no size attribute. Other chip sizes fail its reshapes (223 x 223, which maps onto
+    # the same grids, also runs).
+    "torchvision:maxvit_t": 224,
+}
 
 
 def unknown_class_message(model_class) -> str:
@@ -326,8 +349,8 @@ def _construct(family: str, name: str, kwargs: Mapping[str, object]) -> torch.nn
     return _family_models(family).get_model(name, **kwargs)
 
 
-def _probe_shapes(family: str, name: str, kwargs: Mapping[str, object]) -> Dict[str, tuple]:
-    """State-dict entry shapes of the model built with ``kwargs``, without its weights.
+def _probe_model(family: str, name: str, kwargs: Mapping[str, object]) -> torch.nn.Module:
+    """The model built with ``kwargs`` without its weights.
 
     Built on the ``meta`` device; a builder that needs real tensors while it builds
     (torchvision RegNet computes its widths with ``tolist``) is built on the CPU.
@@ -335,10 +358,73 @@ def _probe_shapes(family: str, name: str, kwargs: Mapping[str, object]) -> Dict[
 
     try:
         with torch.device("meta"):
-            model = _construct(family, name, kwargs)
+            return _construct(family, name, kwargs)
     except (NotImplementedError, RuntimeError):
-        model = _construct(family, name, kwargs)
+        return _construct(family, name, kwargs)
+
+
+def _probe_shapes(family: str, name: str, kwargs: Mapping[str, object]) -> Dict[str, tuple]:
+    """State-dict entry shapes of the model built with ``kwargs``, without its weights."""
+
+    model = _probe_model(family, name, kwargs)
     return {key: tuple(value.shape) for key, value in model.state_dict().items()}
+
+
+def _declared_input_size(model: torch.nn.Module) -> Optional[int]:
+    """The square chip size a built model records that it requires, or None.
+
+    - ``image_size`` (an int): torchvision ``VisionTransformer``, whose forward refuses
+      any other height or width, and torchgeo ``EarthLoc``, whose MixVPR aggregator is
+      sized from it;
+    - timm's ``patch_embed.img_size`` when the patch embedding refuses other sizes
+      (``strict_img_size``) and the model does not resize (``dynamic_img_size``).
+    """
+
+    size = getattr(model, "image_size", None)
+    if isinstance(size, int) and not isinstance(size, bool):
+        return size
+    embed = getattr(model, "patch_embed", None)
+    if getattr(embed, "strict_img_size", False) and not getattr(model, "dynamic_img_size", False):
+        height, width = tuple(getattr(embed, "img_size", None) or (0, 0))
+        if height and height == width:
+            return int(height)
+    return None
+
+
+def _may_require_input_size(family: str, name: str) -> bool:
+    """False for a torchvision builder whose model class takes no input-size argument."""
+
+    if family != FAMILY_TORCHVISION:
+        return True  # torchgeo's builders do not name their model class: probed
+    returned = inspect.signature(_family_models(family).get_model_builder(name)).return_annotation
+    if not inspect.isclass(returned):
+        return True
+    return any(arg in inspect.signature(returned).parameters for arg in _SIZE_ARGUMENTS)
+
+
+@functools.lru_cache(maxsize=None)
+def input_size(model_class: str) -> Optional[int]:
+    """The square chip size (pixels) that served ``model_class`` requires, or None.
+
+    See the module docstring. The size does not depend on the class count or the band
+    count. ``CatalogError`` for a name that is not served.
+    """
+
+    family, name = resolve(model_class)
+    if model_class in INPUT_SIZES_NOT_ON_THE_MODEL:
+        return INPUT_SIZES_NOT_ON_THE_MODEL[model_class]
+    if not _may_require_input_size(family, name):
+        return None
+    return _declared_input_size(_probe_model(family, name, _builder_kwargs(family, name, {})))
+
+
+@functools.lru_cache(maxsize=None)
+def list_input_sizes() -> Tuple[Tuple[str, int], ...]:
+    """``(name, pixels)`` of each served name with a fixed input size, in the order of
+    :func:`list_model_classes`."""
+
+    sizes = ((name, input_size(name)) for name in list_model_classes())
+    return tuple((name, size) for name, size in sizes if size is not None)
 
 
 def _dimension(shapes: Mapping, keys, axis: int) -> Optional[int]:
@@ -435,6 +521,7 @@ class CatalogModel(torch.nn.Module):
         family: str,
         num_classes: Optional[int],
         in_channels: int,
+        input_size: Optional[int] = None,
     ):
         super().__init__()
         self.model = model
@@ -442,15 +529,19 @@ class CatalogModel(torch.nn.Module):
         self.family = family
         self.num_classes = num_classes  # None: the model has no class head argument
         self.in_channels = int(in_channels)
+        self.input_size = input_size  # None: the model takes any chip size
 
     def catalog_info(self) -> Dict[str, str]:
-        """The load metadata of this model (LoadModelResponse.effective_metadata)."""
+        """The load metadata of this model: model_family, model_class, num_classes and
+        in_channels (LoadModelResponse.effective_metadata), and input_size ("" for any
+        size), which the server checks each chip against."""
 
         return {
             "model_family": self.family,
             "model_class": self.catalog_name,
             "num_classes": "" if self.num_classes is None else str(self.num_classes),
             "in_channels": str(self.in_channels),
+            "input_size": "" if self.input_size is None else str(self.input_size),
         }
 
     def forward(self, chip: torch.Tensor) -> torch.Tensor:
@@ -534,6 +625,7 @@ def build(model_class: str, weights_path, metadata: Optional[Mapping] = None) ->
         family=family,
         num_classes=effective_classes,
         in_channels=effective_channels,
+        input_size=input_size(model_class),
     )
 
 
@@ -545,11 +637,14 @@ __all__ = [
     "CatalogError",
     "CatalogUnavailableError",
     "CatalogModel",
+    "INPUT_SIZES_NOT_ON_THE_MODEL",
     "TORCHGEO_EXCLUDED",
     "TORCHGEO_SERVED",
     "TORCHVISION_EXCLUDED",
     "build",
+    "input_size",
     "is_catalog_name",
+    "list_input_sizes",
     "list_model_classes",
     "parse_arguments",
     "resolve",
