@@ -521,8 +521,8 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
         if get_model_class(name) is not None:
             return None
         try:
-            catalog.resolve(name)
-            return catalog.parse_arguments({e.key: e.value for e in spec_msg.metadata})
+            # Resolves the name, then checks the arguments against it.
+            return catalog.parse_arguments({e.key: e.value for e in spec_msg.metadata}, name)
         except catalog.CatalogUnavailableError as exc:
             raise _LoadRequestError(grpc.StatusCode.FAILED_PRECONDITION, str(exc)) from exc
         except catalog.CatalogError as exc:

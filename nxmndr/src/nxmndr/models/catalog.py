@@ -260,8 +260,15 @@ def resolve(model_class: str) -> Tuple[str, str]:
     return family, name
 
 
-def parse_arguments(metadata: Optional[Mapping]) -> Dict[str, int]:
-    """The constructor arguments in ``ModelSpec.metadata``: integers >= 1."""
+def parse_arguments(
+    metadata: Optional[Mapping], model_class: Optional[str] = None
+) -> Dict[str, int]:
+    """The constructor arguments in ``ModelSpec.metadata``: integers >= 1.
+
+    With ``model_class`` (a served name), an argument the model cannot take is refused:
+    ``num_classes`` for a model without a class head argument, and an ``in_channels``
+    other than the band count of a model without an input-channel argument.
+    """
 
     arguments: Dict[str, int] = {}
     for key in CONSTRUCTOR_KEYS:
@@ -275,6 +282,21 @@ def parse_arguments(metadata: Optional[Mapping]) -> Dict[str, int]:
         if value < 1:
             raise CatalogError(f"ModelSpec metadata {key}={raw!r} must be an integer >= 1")
         arguments[key] = value
+    if model_class is None:
+        return arguments
+    entry = _entry(*resolve(model_class))
+    if entry.class_arg is None and "num_classes" in arguments:
+        raise CatalogError(
+            f"{model_class} has no class head; ModelSpec metadata num_classes="
+            f"{arguments['num_classes']} cannot be applied"
+        )
+    in_channels = arguments.get("in_channels", entry.in_channels)
+    if entry.channel_arg is None and in_channels != entry.in_channels:
+        raise CatalogError(
+            f"{model_class} takes {entry.in_channels}-band chips and its builder has no "
+            f"input-channel argument; ModelSpec metadata in_channels={in_channels} "
+            "cannot be applied"
+        )
     return arguments
 
 
@@ -419,7 +441,7 @@ def build(model_class: str, weights_path, metadata: Optional[Mapping] = None) ->
 
     family, name = resolve(model_class)
     entry = _entry(family, name)
-    given = parse_arguments(metadata)
+    given = parse_arguments(metadata, model_class)
     state = _load_state(model_class, weights_path)
     base = _builder_kwargs(family, name, state)
 
@@ -434,29 +456,12 @@ def build(model_class: str, weights_path, metadata: Optional[Mapping] = None) ->
     file_shapes = {key: tuple(value.shape) for key, value in state.items()}
 
     arguments: Dict[str, int] = {}
-    num_classes = given.get("num_classes")
-    if entry.class_arg is None:
-        if num_classes is not None:
-            raise CatalogError(
-                f"{model_class} has no class head; ModelSpec metadata num_classes="
-                f"{num_classes} cannot be applied"
-            )
-    else:
-        if num_classes is None:
-            num_classes = _dimension(file_shapes, head, 0)
+    if entry.class_arg is not None:
+        num_classes = given.get("num_classes") or _dimension(file_shapes, head, 0)
         if num_classes is not None:
             arguments[entry.class_arg] = num_classes
-    in_channels = given.get("in_channels")
-    if entry.channel_arg is None:
-        if in_channels is not None and in_channels != entry.in_channels:
-            raise CatalogError(
-                f"{model_class} takes {entry.in_channels}-band chips and its builder has no "
-                f"input-channel argument; ModelSpec metadata in_channels={in_channels} "
-                "cannot be applied"
-            )
-    else:
-        if in_channels is None:
-            in_channels = _dimension(file_shapes, stem, 1)
+    if entry.channel_arg is not None:
+        in_channels = given.get("in_channels") or _dimension(file_shapes, stem, 1)
         if in_channels is not None:
             arguments[entry.channel_arg] = in_channels
 
