@@ -73,18 +73,28 @@ def _spec_value(spec, name, default=None):
 
 
 def _load_model(model_spec, device: str = "cpu"):
+    """Build ``model_spec``: a registered class, or a catalog name (``nxmndr.models.catalog``)."""
+
     model_class = _spec_value(model_spec, "model_class")
-    if isinstance(model_class, str) or not callable(model_class):
-        raise TypeError(
-            f"model_class {model_class!r} is not a PyTorch model class; the server resolves "
-            "ModelSpec.model_class by the names registered with register_pytorch_model"
-        )
-    model = model_class()
     target = "cpu"
     if device and device.startswith("cuda") and torch.cuda.is_available():
         target = device
     model_path = _spec_value(model_spec, "model_path")
-    model.load_state_dict(torch.load(model_path, map_location=target, weights_only=True), strict=False)
+    if isinstance(model_class, str):
+        from ..models import catalog
+
+        model = catalog.build(model_class, model_path, _spec_value(model_spec, "catalog_args"))
+    elif callable(model_class):
+        model = model_class()
+        model.load_state_dict(
+            torch.load(model_path, map_location=target, weights_only=True), strict=False
+        )
+    else:
+        raise TypeError(
+            f"model_class {model_class!r} is not a PyTorch model class or a catalog name; the "
+            "server resolves ModelSpec.model_class by the names registered with "
+            "register_pytorch_model, then by nxmndr.models.catalog"
+        )
     if target != "cpu":
         model.to(target)
     model.eval()
@@ -104,6 +114,7 @@ def _fingerprint(model) -> str:
     digest = hashlib.sha256()
     cls = type(model)
     digest.update(f"{cls.__module__}.{cls.__qualname__}".encode("utf-8"))
+    digest.update(str(getattr(model, "catalog_name", "")).encode("utf-8"))
     for name, tensor in model.state_dict().items():
         value = tensor.detach().cpu().contiguous()
         digest.update(f"|{name}|{value.dtype}|{tuple(value.shape)}|".encode("utf-8"))
@@ -116,7 +127,10 @@ def _register(model_id: str, model) -> dict:
     entry = _LoadedModel(model, _model_device(model), _fingerprint(model))
     with _models_lock:
         _worker_state["models"][model_id] = entry
-    return {"model_id": model_id, "device": entry.device, "fingerprint": entry.fingerprint}
+    info = {"model_id": model_id, "device": entry.device, "fingerprint": entry.fingerprint}
+    if hasattr(model, "catalog_info"):  # a catalog model: its family, class and arguments
+        info["catalog"] = model.catalog_info()
+    return info
 
 
 def _rpc_ping():
@@ -127,9 +141,10 @@ def _rpc_ping():
 def _rpc_load(model_id, spec, device="cpu"):
     """Build the model of ``spec`` under ``model_id``; return its device and fingerprint.
 
-    ``spec`` has ``model_class`` (the class itself), ``model_path`` and ``name``, as
-    a mapping or as attributes. A model ID that is loaded or loading is refused, so
-    one ID never names two models.
+    ``spec`` has ``model_class`` (a registered class itself, or a catalog name with its
+    ``catalog_args``), ``model_path`` and ``name``, as a mapping or as attributes. A
+    model ID that is loaded or loading is refused, so one ID never names two models.
+    A catalog model's result also has ``catalog`` (``CatalogModel.catalog_info``).
     """
 
     if not isinstance(model_id, str) or not model_id:

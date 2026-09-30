@@ -98,19 +98,24 @@ class PytorchModelSpec(ModelSpec):
     model_class: nn.Module
     model_path: str
     name: Optional[str] = None
+    # Constructor arguments of a catalog model_class (nxmndr.models.catalog), from
+    # ModelSpec.metadata: num_classes, in_channels.
+    catalog_args: Optional[dict] = None
 
     @classmethod
     def from_json(cls, json_str):
         """Custom from_json to handle model_class resolution."""
         d = json.loads(json_str)
         model_class_field = d["model_class"]
-        # Accept either a registered class name or a fully qualified string
+        # A registered class name resolves to its class; any other string stays as given
+        # (a catalog name, built by nxmndr.models.catalog).
         registry = get_registry()
         resolved = registry.get_model_class(model_class_field)
         return cls(
             model_class=resolved if resolved is not None else model_class_field,
             model_path=d["model_path"],
             name=d.get("name"),
+            catalog_args=d.get("catalog_args"),
         )
 
 

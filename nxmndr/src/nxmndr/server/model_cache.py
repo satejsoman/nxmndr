@@ -49,6 +49,9 @@ logger = get_logger(__name__)
 SESSION_CLOSE_REASONS = ("closed", "cancelled", "expired", "failed", "disconnected", "shutdown")
 
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+# ModelSpec.metadata keys that build a PyTorch catalog model; the same names as
+# nxmndr.models.catalog.CONSTRUCTOR_KEYS (this module imports only the standard library).
+_PYTORCH_CONSTRUCTOR_KEYS = ("num_classes", "in_channels")
 # Per-process key for auth scopes: equal tokens map to equal scopes inside this
 # process, and the scope cannot be reversed or correlated across processes.
 _AUTH_SCOPE_KEY = secrets.token_bytes(32)
@@ -178,11 +181,13 @@ def cache_key_from_spec(spec: Any, *, artifact_sha256: str = "") -> ModelCacheKe
 
     Fields read: ``format``, ``source``, ``artifact``, ``version`` (the revision),
     ``checksum``, ``model_class``, ``task``, ``lazy_load``, ``name`` (TorchHub only,
-    where it selects the hub entry point) and ``token`` (only as an opaque scope).
-    Uploaded artifact bytes are keyed by content: ``source = "sha256:<hex>"``.
-    Not part of the key, because the server does not use them to load:
-    ``model_id``, the friendly ``name`` of other formats, ``preprocessing``,
-    ``postprocessing``, ``metadata`` entries and ``artifact_mime_type``.
+    where it selects the hub entry point), the ``metadata`` entries ``num_classes`` and
+    ``in_channels`` (PyTorch only, where they build a catalog model) and ``token``
+    (only as an opaque scope). Uploaded artifact bytes are keyed by content:
+    ``source = "sha256:<hex>"``. Not part of the key, because the server does not use
+    them to load: ``model_id``, the friendly ``name`` of other formats,
+    ``preprocessing``, ``postprocessing``, other ``metadata`` entries and
+    ``artifact_mime_type``.
     """
 
     fmt = _enum_name(spec, "format")
@@ -201,6 +206,12 @@ def cache_key_from_spec(spec: Any, *, artifact_sha256: str = "") -> ModelCacheKe
         options.append(("lazy_load", "true"))
     if fmt == "torchhub" and spec.name.strip():
         options.append(("name", spec.name.strip()))
+    if fmt == "pytorch":
+        entries = {e.key: e.value.strip() for e in getattr(spec, "metadata", ())}
+        for name in _PYTORCH_CONSTRUCTOR_KEYS:
+            value = entries.get(name, "")
+            if value:
+                options.append((name, str(int(value)) if value.isdigit() else value))
     return ModelCacheKey(
         format=fmt,
         source=source,

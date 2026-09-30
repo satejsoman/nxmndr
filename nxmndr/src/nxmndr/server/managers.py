@@ -440,20 +440,24 @@ class RpcWorkerManager:
         Returns the worker's ``{"model_id", "device", "fingerprint"}``.
         """
 
-        model_class = getattr(model_spec, "model_class", None)
-        if isinstance(model_class, str) or not callable(model_class):
-            raise ValueError(
-                f"PyTorch model_class {model_class!r} is not registered in this server "
-                "(nxmndr.models.register_pytorch_model)"
-            )
-        self.ensure_started()
-        from .rpc_worker import _rpc_load
+        from ..models import catalog
 
+        model_class = getattr(model_spec, "model_class", None)
         payload = {
             "model_class": model_class,
             "model_path": model_spec.model_path,
             "name": getattr(model_spec, "name", None),
         }
+        if isinstance(model_class, str):
+            # A catalog name, built by the worker (nxmndr.models.catalog). An unknown or
+            # unserved name fails here, before the worker starts.
+            catalog.resolve(model_class)
+            payload["catalog_args"] = dict(getattr(model_spec, "catalog_args", None) or {})
+        elif not callable(model_class):
+            raise ValueError(catalog.unknown_class_message(model_class))
+        self.ensure_started()
+        from .rpc_worker import _rpc_load
+
         return torch_rpc.rpc_sync(RPC_WORKER_NAME, _rpc_load, args=(model_id, payload))
 
     def infer(self, model_id: str, tensor, *, device_hint: str = "cpu", timeout: float):

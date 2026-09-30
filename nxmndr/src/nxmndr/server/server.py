@@ -38,7 +38,8 @@ Model input (``Predict`` and every ``StreamPredict`` tile):
   QGIS chips ``[H, W, C]``, bands in the host's order) and ``dtype``, with no batch
   dimension added and no band selection, scaling, normalization or transpose. ONNX
   models receive that array; the PyTorch RPC worker receives it as a float32 tensor
-  of the same shape.
+  of the same shape. A catalog model (``nxmndr.models.catalog``) takes that tensor as
+  one image ``[1, C, H, W]`` inside the model, with no scaling or normalization.
 - Hugging Face models apply their own processor, SAM 3 prompts go through
   ``nxmndr.models.sam``, and ``ultralytics_yolo`` models convert the chip as
   ``nxmndr.models.ultralytics_yolo`` documents.
@@ -76,8 +77,8 @@ from aiohttp import web
 from ..logging import get_logger
 
 from ..inference import LocalInferenceProvider, inference_pb2, inference_pb2_grpc
-from ..models import Model
-from ..models import ultralytics_yolo
+from ..models import Model, get_model_class
+from ..models import catalog, ultralytics_yolo
 from ..models.sam import resolve_sam_capability
 from . import dispatch
 from . import managers
@@ -474,6 +475,10 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
             }
             if fmt_str in ("pytorch", "torchhub") and spec_msg.model_class and not yolo:
                 spec_dict["model_class"] = spec_msg.model_class
+            if fmt_str == "pytorch" and spec_msg.model_class and not yolo:
+                arguments = self._catalog_arguments(spec_msg)
+                if arguments is not None:
+                    spec_dict["catalog_args"] = arguments
 
         model_spec = Model.model_spec_from_json(json.dumps(spec_dict))
         model_type = model_spec.__class__.__name__
@@ -502,6 +507,26 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
             raise _LoadRequestError(grpc.StatusCode.INVALID_ARGUMENT, "Unsupported spec type")
         key = managers.cache_key_from_spec(spec_msg, artifact_sha256=artifact_sha)
         return _PreparedLoad(model_spec, key, model_metadata, device_plan, model_type)
+
+    @staticmethod
+    def _catalog_arguments(spec_msg) -> Optional[Dict[str, int]]:
+        """The constructor arguments of a catalog model_class, or None for a registered class.
+
+        A PYTORCH model_class is a name registered with ``register_pytorch_model`` or a
+        catalog name (``nxmndr.models.catalog``). Anything else, an unserved catalog name
+        and bad ``num_classes``/``in_channels`` metadata give INVALID_ARGUMENT; a family
+        whose package is missing gives FAILED_PRECONDITION.
+        """
+        name = spec_msg.model_class
+        if get_model_class(name) is not None:
+            return None
+        try:
+            catalog.resolve(name)
+            return catalog.parse_arguments({e.key: e.value for e in spec_msg.metadata})
+        except catalog.CatalogUnavailableError as exc:
+            raise _LoadRequestError(grpc.StatusCode.FAILED_PRECONDITION, str(exc)) from exc
+        except catalog.CatalogError as exc:
+            raise _LoadRequestError(grpc.StatusCode.INVALID_ARGUMENT, str(exc)) from exc
 
     @staticmethod
     def _cache_error_status(exc):
