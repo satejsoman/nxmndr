@@ -6,8 +6,9 @@
 One code path turns (leased model record, decoded input, effective options) into a
 response array plus metadata: SAM prompt routing, the unprompted fallback, the result
 family of a catalog model's output (``catalog_output``), task shaping (segmentation
-masks and confidence, detection boxes, embeddings) and NPZ tensor bundles. The gRPC layer only decodes transport, holds leases and adds
-correlation metadata, so unary and streaming results cannot drift apart.
+masks and confidence, detection boxes, embeddings) and NPZ tensor bundles. The gRPC
+layer only decodes transport, holds leases and adds correlation metadata, so unary
+and streaming results cannot drift apart.
 
 Stream context v1 (``StreamPredictRequest.context``) is also decoded here:
 ``session_id`` and ``tile_id`` are reserved, per-tile options use the ``opt.``
