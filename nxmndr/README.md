@@ -128,7 +128,23 @@ print(out.shape)
 
 ## Torch RPC (Experimental)
 
-Used for remote execution of PyTorch models via `torch.distributed.rpc`. A worker process is spawned server-side for PyTorch specs.
+Used for remote execution of PyTorch models via `torch.distributed.rpc`. A worker process is spawned server-side for PyTorch specs, or started by hand, on the server's host or another one (external worker mode, below).
+
+### External Worker Mode (worker on another host)
+
+1. Start the server with `NXMNDR_RPC_EXTERNAL_WORKER=1`. It spawns no worker. `MASTER_ADDR` is the address it listens on (default `0.0.0.0`) and `MASTER_PORT` the rendezvous port (default `29500`).
+2. On the worker host:
+
+```bash
+python -m nxmndr.server.rpc_worker --master <server address> --port <MASTER_PORT> --device cuda:0   # or cpu, mps
+```
+
+The worker waits until the server loads its first PyTorch model, reports on `MASTER_PORT + 1`, joins the two-rank RPC group at `MASTER_ADDR:MASTER_PORT`, and exits when the server stops it. If no worker reports within 60 s, `LoadModel` and `OpenSession` fail with `FAILED_PRECONDITION` naming the address; the next load waits again.
+
+- Weights load on the worker host: the spec's `source` path must exist there (as for a remote nxmndr server). A client that uploads `artifact` bytes gets a path in the server's cache, which the worker host must also see.
+- The worker host needs nxmndr with the same torch version, and the model code: the module of a class registered with `register_pytorch_model` must import there, and a catalog model needs its family package.
+- Network: TCP between the hosts on `MASTER_PORT`, `MASTER_PORT + 1` and the ports gloo and TensorPipe open. Those transports pick an interface from the hostname; where it resolves to a loopback address (`::1` on the macOS test host; Debian-family hosts often map it to `127.0.1.1`), set `GLOO_SOCKET_IFNAME` and `TP_SOCKET_IFNAME` to the LAN interface on both hosts. `torch.distributed.rpc` has no authentication and runs pickled calls: use it only on a trusted network.
+- One worker per server run. A server that dies without stopping its worker leaves it running: stop it and start a new one. A worker that dies disables PyTorch models until the server restarts.
 
 ### Torch RPC Execution Flow
 
@@ -184,7 +200,7 @@ File / Symbol | Role
 
 ### Known Limitations / Future Work
 
-- No GPU selection logic yet (always CPU); future: driver can send device hint.
+- The spawned worker builds models on CPU; an external worker uses its `--device`.
 - No batching / streaming; each call is a single `rpc_sync` invocation.
 - Error metadata is plain exceptions; could wrap into structured envelopes.
 - Readiness file could be replaced with a pipe/queue IPC for cleaner startup semantics.
