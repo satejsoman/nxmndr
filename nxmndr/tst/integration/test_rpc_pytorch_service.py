@@ -15,6 +15,10 @@ failures are bounded and clean up the child), W3 (unary Predict and StreamPredic
 run through the real RPC invocation) and W4 (two models loaded at once route by
 identity under concurrent pinned sessions; eviction and unload free the model in
 the worker; a reload gets a new identity).
+
+The external-worker tests start the server with ``NXMNDR_RPC_EXTERNAL_WORKER=1`` and
+the worker as a separate ``python -m nxmndr.server.rpc_worker`` process, both on this
+host's non-loopback address, as a worker on a second machine would be.
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import socket
 import subprocess
 import sys
 import threading
@@ -49,15 +54,11 @@ CHIP = np.arange(4 * 4 * 3, dtype=np.float32).reshape(4, 4, 3)
 class ServiceProcess:
     """One ``rpc_service_process`` server; ``command`` sends a line and returns its reply."""
 
-    def __init__(self, tmp_path: Path, *args: str):
+    def __init__(self, tmp_path: Path, *args: str, env=None):
         self.log_path = tmp_path / "rpc_service_process.log"
         self._log = open(self.log_path, "w", encoding="utf-8")
-        env = dict(os.environ)
-        env["PYTHONPATH"] = os.pathsep.join(
-            p for p in (str(ROOT / "src"), str(ROOT), env.get("PYTHONPATH", "")) if p
-        )
-        for var in ("MASTER_ADDR", "MASTER_PORT", "NXMNDR_REMOTE_HOST", "NXMNDR_REMOTE_PORT"):
-            env.pop(var, None)
+        extra, env = env or {}, _child_env()
+        env.update(extra)
         self.proc = subprocess.Popen(
             [sys.executable, "-m", "tst.support.rpc_service_process", *args],
             cwd=str(ROOT),
@@ -107,12 +108,28 @@ class ServiceProcess:
         self._log.close()
 
 
+def _child_env() -> dict:
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        p for p in (str(ROOT / "src"), str(ROOT), env.get("PYTHONPATH", "")) if p
+    )
+    for var in (
+        "MASTER_ADDR",
+        "MASTER_PORT",
+        "NXMNDR_REMOTE_HOST",
+        "NXMNDR_REMOTE_PORT",
+        "NXMNDR_RPC_EXTERNAL_WORKER",
+    ):
+        env.pop(var, None)
+    return env
+
+
 @pytest.fixture
 def service_process(tmp_path):
     made = []
 
-    def start(*args):
-        made.append(ServiceProcess(tmp_path, *args))
+    def start(*args, env=None):
+        made.append(ServiceProcess(tmp_path, *args, env=env))
         return made[-1]
 
     yield start
@@ -315,3 +332,130 @@ def test_worker_start_failures_are_bounded_clean_up_and_allow_a_retry(tmp_path, 
 
     stopped = proc.stop()
     assert stopped["children"] == [], stopped
+
+
+def _lan_address() -> str:
+    """This host's non-loopback IPv4 address (the default route's source), or skip."""
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(("192.0.2.1", 9))  # TEST-NET-1; a UDP connect sends nothing
+            addr = probe.getsockname()[0]
+    except OSError:
+        addr = ""
+    if not addr or addr.startswith("127.") or addr == "0.0.0.0":
+        pytest.skip("no non-loopback IPv4 address on this host")
+    return addr
+
+
+def _free_port_pair(addr: str) -> int:
+    """A port P on ``addr`` with P + 1 also free (the rendezvous and the ready line)."""
+
+    for _ in range(20):
+        with socket.socket() as first:
+            first.bind((addr, 0))
+            port = first.getsockname()[1]
+            try:
+                with socket.socket() as second:
+                    second.bind((addr, port + 1))
+            except OSError:
+                continue
+        return port
+    pytest.skip("no free port pair")
+
+
+@pytest.fixture
+def external_worker(tmp_path):
+    """Start ``python -m nxmndr.server.rpc_worker`` as its own process (not a child of the server).
+
+    Its working directory is ``tmp_path``, the server's is ``ROOT``: a relative weights
+    path names a file that only the worker can open.
+    """
+
+    made = []
+
+    def start(addr: str, port: int, device: str = "cpu"):
+        log = open(tmp_path / f"external_worker_{len(made)}.log", "w", encoding="utf-8")
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "nxmndr.server.rpc_worker", "--master", addr,
+             "--port", str(port), "--device", device],
+            cwd=str(tmp_path), stdout=log, stderr=subprocess.STDOUT, env=_child_env(),
+        )
+        made.append((proc, log))
+        return proc
+
+    yield start
+    for proc, log in made:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=30)
+        log.close()
+
+
+def _external_env(addr: str, port: int) -> dict:
+    return {"NXMNDR_RPC_EXTERNAL_WORKER": "1", "MASTER_ADDR": addr, "MASTER_PORT": str(port)}
+
+
+def _direct(weights, chip) -> np.ndarray:
+    model = rpc_models.AddConst()
+    model.load_state_dict(torch.load(weights, weights_only=True))
+    with torch.no_grad():
+        return model(torch.from_numpy(chip)).numpy()
+
+
+def test_external_worker_on_a_lan_address_serves_load_session_and_stream(
+    tmp_path, service_process, external_worker
+):
+    addr = _lan_address()
+    port = _free_port_pair(addr)
+    device = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
+    weights = rpc_models.save_add_const(tmp_path / "a.pt", 1.5)
+    assert not (ROOT / "a.pt").exists()
+    proc = service_process(env=_external_env(addr, port))
+    worker = external_worker(addr, port, device)
+    with proc.client() as client:
+        # "a.pt" resolves in the worker's directory only: the worker opens the weights.
+        model_id = client.load_model_result("", _spec("a.pt")).model_id
+        status = proc.command("status")
+        assert status["children"] == [], status  # the server spawned nothing
+        assert status["worker"]["pid"] == worker.pid, status
+        assert status["worker"]["models"][model_id]["device"].split(":")[0] == device, status
+
+        _open(client, "s-ext", model_id=model_id)
+        chips = [CHIP, CHIP * 2]
+        tiles = _stream(client, "s-ext", chips, "t")
+        for chip, tile in zip(chips, tiles):
+            np.testing.assert_array_equal(tile, _direct(weights, chip))
+        assert client.close_session("s-ext").status == "closed"
+
+    stopped = proc.stop()  # _rpc_stop ends the external worker too
+    assert stopped["state"] == "stopped", stopped
+    assert worker.wait(timeout=60) == 0
+
+
+def test_external_worker_that_never_joins_fails_the_load_then_a_late_worker_serves(
+    tmp_path, service_process, external_worker
+):
+    addr = _lan_address()
+    port = _free_port_pair(addr)
+    weights = rpc_models.save_add_const(tmp_path / "a.pt", 1.0)
+    proc = service_process("--startup-timeout", "3", env=_external_env(addr, port))
+    with proc.client() as client:
+        started = time.monotonic()
+        with pytest.raises(InferenceGrpcError) as missing:
+            client.load_model_result("", _spec(weights))
+        assert 3.0 <= time.monotonic() - started < 3.0 + 10.0
+        assert missing.value.code == grpc.StatusCode.FAILED_PRECONDITION, str(missing.value)
+        assert f"no external PyTorch RPC worker joined at {addr}:{port} within 3 s" in str(
+            missing.value
+        ), str(missing.value)
+        assert proc.command("status")["state"] == "idle"
+
+        # The failed wait never entered the torch rendezvous: a worker started now serves.
+        proc.command("timeout 60")
+        worker = external_worker(addr, port)
+        model_id = client.load_model_result("", _spec(weights)).model_id
+        np.testing.assert_array_equal(_predict(client, model_id), _direct(weights, CHIP))
+
+    proc.stop()
+    assert worker.wait(timeout=60) == 0

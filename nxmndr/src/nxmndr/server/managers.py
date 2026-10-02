@@ -210,10 +210,20 @@ RPC_STARTUP_TIMEOUT_SECONDS = 60.0
 RPC_STOP_TIMEOUT_SECONDS = 2.0
 # Aux resource name of a PyTorch record's model in the RPC worker.
 RPC_MODEL_RESOURCE = "pytorch_rpc_model"
+# External worker mode (NXMNDR_RPC_EXTERNAL_WORKER=1): the server does not spawn the
+# worker; one started with ``python -m nxmndr.server.rpc_worker``, possibly on another
+# host, reports to MASTER_PORT + 1 and joins the group at MASTER_ADDR:MASTER_PORT.
+# Defaults: all interfaces, and 29500, run_worker's and torch's usual MASTER_PORT.
+RPC_EXTERNAL_DEFAULT_ADDR = "0.0.0.0"
+RPC_EXTERNAL_DEFAULT_PORT = 29500
 
 
 class RpcWorkerStartError(RuntimeError):
     """The PyTorch RPC worker could not be started, or can no longer be used."""
+
+
+class RpcWorkerNotJoinedError(RpcWorkerStartError):
+    """External worker mode: no worker reported within the startup timeout."""
 
 
 # torch.distributed and torch.distributed.rpc are process-global, and a process
@@ -233,8 +243,8 @@ def _free_port(addr: str) -> int:
 def _terminate(proc) -> None:
     """End a child process: wait, terminate, then kill, each bounded."""
 
-    if proc is None or proc.pid is None:  # never started
-        return
+    if proc is None or proc.pid is None or isinstance(proc, _ExternalWorker):
+        return  # never started, or not this server's child
     proc.join(timeout=RPC_STOP_TIMEOUT_SECONDS)
     if proc.is_alive():
         proc.terminate()
@@ -265,6 +275,55 @@ def _run_rpc_worker(
         master_port=master_port,
         ready_port=ready_port,
         startup_timeout_s=startup_timeout_s,
+    )
+
+
+class _ExternalWorker:
+    """Stands in for the child process when the worker was started by hand (external mode).
+
+    This server cannot watch or end that process: it counts as alive while the RPC
+    group runs, and it exits on ``_rpc_stop``.
+    """
+
+    exitcode = None
+
+    def __init__(self, pid: int, host: str):
+        self.pid = pid
+        self.host = host
+
+    def is_alive(self) -> bool:
+        return True
+
+
+def _await_external(addr: str, port: int, timeout: float) -> _ExternalWorker:
+    """Wait on ``addr:port + 1`` for an external worker's ``ready <pid>``; answer ``ok``."""
+
+    try:
+        listener = socket.create_server((addr, port + 1))
+    except OSError as exc:
+        raise RpcWorkerStartError(
+            f"cannot listen for the external PyTorch RPC worker on {addr}:{port + 1}: {exc}"
+        ) from exc
+    deadline = time.monotonic() + timeout
+    with listener:
+        listener.settimeout(0.1)
+        while time.monotonic() < deadline:
+            try:
+                conn, peer = listener.accept()
+            except socket.timeout:
+                continue
+            with conn:
+                conn.settimeout(max(0.1, deadline - time.monotonic()))
+                try:
+                    line = conn.recv(64).decode("ascii", "replace").split()
+                    if len(line) == 2 and line[0] == "ready" and line[1].isdigit():
+                        conn.sendall(b"ok\n")
+                        return _ExternalWorker(int(line[1]), peer[0])
+                except OSError:
+                    pass
+    raise RpcWorkerNotJoinedError(
+        f"no external PyTorch RPC worker joined at {addr}:{port} within {timeout:g} s; start "
+        f"one with: python -m nxmndr.server.rpc_worker --master <this host's address> --port {port}"
     )
 
 
@@ -299,6 +358,11 @@ class RpcWorkerManager:
     inside the torch rendezvous also terminates the child, but torch cannot rejoin a
     group in this process, so later loads fail until the server restarts; so does a
     worker that exits after it started.
+
+    External mode (``external_worker``, or ``NXMNDR_RPC_EXTERNAL_WORKER=1``): no child
+    is spawned; the first phase waits for a worker started elsewhere to report to
+    ``MASTER_PORT + 1`` (``_await_external``). A wait that times out raises
+    ``RpcWorkerNotJoinedError`` and a later load waits again.
     """
 
     # The child's process target; tests replace it with a module-level function.
@@ -310,12 +374,18 @@ class RpcWorkerManager:
         master_addr: Optional[str] = None,
         master_port: Optional[int] = None,
         startup_timeout_s: float = RPC_STARTUP_TIMEOUT_SECONDS,
+        external_worker: Optional[bool] = None,
     ):
         self._lock = threading.Lock()
         self._proc = None
         self._state = "idle"  # idle -> running -> stopped; "broken" after a failed rendezvous
         self._error = ""
-        self._addr = master_addr or os.environ.get("MASTER_ADDR", "127.0.0.1")
+        if external_worker is None:
+            flag = os.environ.get("NXMNDR_RPC_EXTERNAL_WORKER", "").strip().lower()
+            external_worker = flag not in {"", "0", "false", "no", "off"}
+        self._external = bool(external_worker)
+        default_addr = RPC_EXTERNAL_DEFAULT_ADDR if self._external else "127.0.0.1"
+        self._addr = master_addr or os.environ.get("MASTER_ADDR", default_addr)
         self._port = int(master_port or os.environ.get("MASTER_PORT", "0") or 0)
         self.startup_timeout_s = float(startup_timeout_s)
 
@@ -359,24 +429,28 @@ class RpcWorkerManager:
                 )
             timeout = self.startup_timeout_s
             addr = self._addr
-            port = self._port or _free_port(addr)
-            listener = socket.create_server((addr, 0))
-            listener.settimeout(0.1)
-            # spawn: the child must not inherit this process's gRPC and torch threads.
-            proc = multiprocessing.get_context("spawn").Process(
-                target=type(self).worker_target,
-                args=(addr, port, listener.getsockname()[1], timeout),
-                daemon=True,
-                name="nxmndr-pytorch-rpc-worker",
-            )
-            try:
-                proc.start()
-                self._await_ready(proc, listener, timeout)
-            except BaseException:
-                _terminate(proc)
-                raise
-            finally:
-                listener.close()
+            if self._external:
+                port = self._port or RPC_EXTERNAL_DEFAULT_PORT
+                proc = _await_external(addr, port, timeout)
+            else:
+                port = self._port or _free_port(addr)
+                listener = socket.create_server((addr, 0))
+                listener.settimeout(0.1)
+                # spawn: the child must not inherit this process's gRPC and torch threads.
+                proc = multiprocessing.get_context("spawn").Process(
+                    target=type(self).worker_target,
+                    args=(addr, port, listener.getsockname()[1], timeout),
+                    daemon=True,
+                    name="nxmndr-pytorch-rpc-worker",
+                )
+                try:
+                    proc.start()
+                    self._await_ready(proc, listener, timeout)
+                except BaseException:
+                    _terminate(proc)
+                    raise
+                finally:
+                    listener.close()
             _process_owner = self  # from here on this process has used its one attempt
             init_method = f"tcp://{addr}:{port}"
             try:
@@ -586,6 +660,7 @@ __all__ = [
     "build_model_record",
     "RpcWorkerManager",
     "RpcWorkerStartError",
+    "RpcWorkerNotJoinedError",
     "RPC_MODEL_RESOURCE",
     "shutdown_process_rpc_worker",
 ]

@@ -553,6 +553,8 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
             return grpc.StatusCode.FAILED_PRECONDITION
         if refusal is not None:  # a request the catalog cannot serve: retrying cannot help
             return grpc.StatusCode.INVALID_ARGUMENT
+        if isinstance(exc.__cause__, managers.RpcWorkerNotJoinedError):
+            return grpc.StatusCode.FAILED_PRECONDITION  # external mode: start the worker
         if isinstance(exc, managers.CacheExhaustedError):
             return grpc.StatusCode.RESOURCE_EXHAUSTED
         if isinstance(exc, managers.ModelInUseError):
