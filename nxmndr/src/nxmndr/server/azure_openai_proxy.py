@@ -384,7 +384,7 @@ class AzureOpenAIProxy:
             if request_data is None:
                 request_data = {}
             for key, value in upstream.fields.items():
-                request_data.setdefault(key, value)
+                request_data[key] = value  # the routed endpoint decides, not the client
 
         try:
             logger.info(f"Forwarding {method} request to: {url}")

@@ -138,7 +138,8 @@ The `--azure-proxy` server can also front models on the OpenAI platform
 model. Any endpoint whose URL host is `api.openai.com` is authenticated with
 `OPENAI_API_KEY` instead of Azure credentials, forwarded to `/v1/images/edits` or
 `/v1/chat/completions` (no `api-version`), and the deployment name is sent as the
-`model` field. The plugin-facing routes are unchanged, so the QGIS plugin only needs
+`model` field, replacing any `model` the client sends. The plugin-facing routes are
+unchanged, so the QGIS plugin only needs
 to be in proxy mode pointing at this server. `<PREFIX>_PROVIDER=openai` (or
 `azure_openai`) sets the identity explicitly for any host, for example a loopback test
 stub; without it the host decides as above. Routes and request shapes are defined in

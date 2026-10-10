@@ -117,3 +117,53 @@ def test_the_proxy_forwards_each_identity_in_its_own_shape(monkeypatch):
     assert {e["deployment_name"]: e["provider"] for e in listing["data"]} == {
         "gpt-image-1": "openai", "edits-az": "azure_openai", "edits-default": "",
     }
+
+
+async def _client_model_scenario(monkeypatch):
+    seen = []
+
+    async def record_form(request):
+        form = {}
+        async for part in await request.multipart():
+            if part.name != "image":
+                form[part.name] = await part.text()
+        seen.append(form)
+        return web.json_response({"data": [{"b64_json": "AAAA"}]})
+
+    async def record_json(request):
+        seen.append(await request.json())
+        return web.json_response({"choices": []})
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/images/edits", record_form)
+    upstream.router.add_post("/v1/chat/completions", record_json)
+    async with TestServer(upstream, host="127.0.0.1") as up:
+        for prefix, deployment, kind in (("IMG", "gpt-image-1", "vision"), ("CHAT", "gpt-4o", "chat")):
+            monkeypatch.setenv(f"{prefix}_DEPLOYMENT_NAME", deployment)
+            monkeypatch.setenv(f"{prefix}_ENDPOINT_URL", str(up.make_url("/")))
+            monkeypatch.setenv(f"{prefix}_TYPE", kind)
+            monkeypatch.setenv(f"{prefix}_PROVIDER", "openai")
+        app = web.Application()
+        setup_azure_proxy_routes(app, AzureOpenAIProxy())
+        async with TestServer(app, host="127.0.0.1") as ps, aiohttp.ClientSession() as client:
+            base = str(ps.make_url("/"))
+            # an unconfigured deployment falls back to the default vision endpoint
+            form = aiohttp.FormData()
+            form.add_field("prompt", "outline every field")
+            form.add_field("model", "my-vision")
+            form.add_field("image", PNG, filename="input.png", content_type="image/png")
+            url = routes.proxy_url(base, routes.ROUTE_IMAGE_EDITS, deployment="my-vision")
+            async with client.post(url, data=form) as resp:
+                assert resp.status == 200
+            # a configured deployment, with a client asking for another model
+            url = routes.proxy_url(base, routes.ROUTE_CHAT_COMPLETIONS, deployment="gpt-4o")
+            async with client.post(url, json={"model": "o1-pro", "messages": []}) as resp:
+                assert resp.status == 200
+    return seen
+
+
+def test_the_proxy_sends_the_configured_model_not_the_clients(monkeypatch):
+    # The endpoint the proxy routed to, and whose credentials it spends, names the model.
+    edit_form, chat_body = asyncio.run(_client_model_scenario(monkeypatch))
+    assert edit_form == {"prompt": "outline every field", "model": "gpt-image-1"}
+    assert chat_body == {"model": "gpt-4o", "messages": []}
