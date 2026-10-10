@@ -105,6 +105,10 @@ GRPC_MAX_MESSAGE_LENGTH = 128 * 1024 * 1024  # 128MB ceiling for large tensor pa
 RPC_INFER_TIMEOUT_SECONDS = 5.0  # Timeout for individual RPC inference calls
 DEFAULT_MODEL_CACHE_CAPACITY = 10  # plan: LRU model cache capacity (NXMNDR_MODEL_CACHE_CAPACITY)
 SERVER_STOP_GRACE_SECONDS = 5.0  # grace for in-flight RPCs, then cache shutdown drains leases
+# Bind address of the gRPC server and the HTTP proxy unless --host names another:
+# this machine only. Every gRPC client is trusted (it can make the server run code
+# it supplies, README "Security"), so exposing the server is an explicit choice.
+DEFAULT_BIND_HOST = "127.0.0.1"
 GRPC_OPTIONS = [
     ("grpc.max_send_message_length", GRPC_MAX_MESSAGE_LENGTH),
     ("grpc.max_receive_message_length", GRPC_MAX_MESSAGE_LENGTH),
@@ -1404,7 +1408,7 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
 
 
 def create_server(
-    host: str = "127.0.0.1",
+    host: str = DEFAULT_BIND_HOST,
     port: int = 0,
     *,
     model_cache_dir: str | Path | None = None,
@@ -1413,8 +1417,7 @@ def create_server(
     """Build, bind and start the gRPC inference server without blocking.
 
     Args:
-            host: address to bind; loopback by default. ``serve()`` passes ``"[::]"``.
-                An IPv6 address needs brackets.
+            host: address to bind; loopback by default. An IPv6 address needs brackets.
             port: TCP port; 0 picks a free ephemeral port.
             model_cache_dir, max_cores: as for ``InferenceService``.
 
@@ -1459,6 +1462,7 @@ def stop_server(server, service, *, grace: float | None = SERVER_STOP_GRACE_SECO
 def serve(
     port: int = 50051,
     *,
+    host: str = DEFAULT_BIND_HOST,
     model_cache_dir: str | Path | None = None,
     startup_event=None,
     stop_event=None,
@@ -1469,6 +1473,7 @@ def serve(
 
     Args:
             port: TCP port to bind (50051 default). Use 0 for ephemeral.
+            host: address to bind, as for ``create_server``; loopback by default.
             startup_event: threading.Event that will be set once the server is started.
             stop_event: threading.Event; if provided, the server thread will block until it is set then shut down.
             stop_grace: seconds running RPCs get at shutdown; the model cache then drains
@@ -1478,9 +1483,9 @@ def serve(
             The actual bound port (useful if port=0 was passed).
     """
     server, bound_port, service = create_server(
-        "[::]", port, model_cache_dir=model_cache_dir, max_cores=max_cores
+        host, port, model_cache_dir=model_cache_dir, max_cores=max_cores
     )
-    logger.info(f"gRPC inference server started on port {bound_port}")
+    logger.info(f"gRPC inference server started on {host}:{bound_port}")
     if startup_event is not None:
         startup_event.set()
     # Backward compatibility: discover stop_event from caller frame if not explicitly passed
@@ -1581,7 +1586,7 @@ async def create_unified_web_app(
 
 
 async def run_unified_server(
-    host="0.0.0.0",
+    host=DEFAULT_BIND_HOST,
     port=8080,
     *,
     include_azure_proxy=False,
@@ -1676,8 +1681,10 @@ def main():
     )
     parser.add_argument(
         "--host",
-        default="0.0.0.0",
-        help="Host to bind the Azure proxy HTTP server to (default: 0.0.0.0)",
+        default=DEFAULT_BIND_HOST,
+        help="Address the gRPC server, and with --azure-proxy the HTTP proxy, bind to "
+        f"(default: {DEFAULT_BIND_HOST}, this machine only). 0.0.0.0 accepts other machines: "
+        "every client can then make the server run code it supplies (README, Security).",
     )
     parser.add_argument(
         "--azure-proxy",
@@ -1737,6 +1744,7 @@ def main():
         try:
             serve(
                 port=args.grpc_port,
+                host=args.host,
                 model_cache_dir=args.model_cache_dir or None,
                 max_cores=args.max_cores,
             )
@@ -1749,6 +1757,7 @@ def main():
         logger.info(f"Starting gRPC inference server on port {args.grpc_port}")
         serve(
             port=args.grpc_port,
+            host=args.host,
             model_cache_dir=args.model_cache_dir or None,
             max_cores=args.max_cores,
         )

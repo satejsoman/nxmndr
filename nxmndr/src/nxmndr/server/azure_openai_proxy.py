@@ -774,7 +774,7 @@ def create_app() -> web.Application:
     return app
 
 
-async def run_server(host: str = "0.0.0.0", port: int = 8080):
+async def run_server(host: str = "127.0.0.1", port: int = 8080):
     """
     Run the Azure OpenAI proxy server.
 
@@ -811,7 +811,12 @@ def main():
     parser = argparse.ArgumentParser(
         description="Azure OpenAI API Proxy Server - Automatically discovers endpoints from environment variables"
     )
-    parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Host to bind to (default: 127.0.0.1). The proxy has no authentication and "
+        "spends its own credentials: expose it only on a trusted network.",
+    )
     parser.add_argument("--port", type=int, default=8080, help="Port to bind to")
 
     args = parser.parse_args()
