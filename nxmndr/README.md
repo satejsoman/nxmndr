@@ -60,7 +60,7 @@ The package installs convenient entry points:
 
 | Command | Purpose |
 |---------|---------|
-| `nxmndr-server` | Unified HTTP server (inference + optional Azure proxy) |
+| `nxmndr-server` | gRPC inference server (+ HTTP Azure proxy with `--azure-proxy`) |
 | `python -m nxmndr` | Multi-command launcher (see `--help`) |
 
 ### Examples Directory
@@ -98,17 +98,14 @@ print(out.shape)
 
 ## Remote Inference (gRPC)
 
-1. Start the server (HTTP unified):
+1. Start the server:
 
 ```bash
-nxmndr-server --port 8080 --azure-proxy   # optional Azure proxy endpoints
+nxmndr-server                                  # gRPC on 127.0.0.1:50051
+nxmndr-server --azure-proxy --http-port 8080   # also the HTTP proxy, on 127.0.0.1:8080
 ```
 
-Or start legacy gRPC server only:
-
-```bash
-python -m server.server --grpc-only
-```
+To accept connections from other machines, read [Security](#security) first.
 
 2. Load an ONNX model and predict:
 
@@ -125,6 +122,27 @@ session = InferenceSession(spec, provider)
 out = session.run(np.zeros((1,3,32,32), dtype=np.float32))
 print(out.shape)
 ```
+
+## Security
+
+The gRPC server and the OpenAI / Azure OpenAI proxy have no authentication. You must trust every client that can connect to them:
+
+- A client that loads a model can make the server run code that the client supplies. `LoadModel` takes uploaded weight bytes (`artifact`) or a path on the server (`source`). With `model_class = "ultralytics_yolo"`, `ultralytics.YOLO` opens a `.pt` checkpoint: it unpickles the file with `torch.load(weights_only=False)` and, by default, pip-installs a missing package that the checkpoint names (ultralytics 8.4.142, the tested version). Hugging Face models load with `trust_remote_code=True`, and TorchHub models run code from their repository (`torch.hub.load`).
+- The proxy uses the operator's credentials (`OPENAI_API_KEY` or the Azure identity) for every caller.
+
+For this reason, the servers listen on `127.0.0.1` (this machine only) by default. Earlier versions listened on every interface ([CHANGELOG.md](CHANGELOG.md)). To use a server from another machine, keep the default and open an SSH tunnel:
+
+```bash
+ssh -N -L 50051:127.0.0.1:50051 user@server-host   # then connect to 127.0.0.1:50051
+```
+
+To listen on the network, give the address explicitly. Do this only on a network where you trust every host that can reach the port:
+
+```bash
+nxmndr-server --host 0.0.0.0   # gRPC, and with --azure-proxy the HTTP proxy, on every interface
+```
+
+`python -m nxmndr server`, `python -m nxmndr grpc` and `python -m nxmndr.server.azure_openai_proxy` take the same `--host` option. The gRPC server uses plaintext; for TLS, put a TLS endpoint in front of it. The PyTorch RPC worker has the same trust requirement (External Worker Mode, below).
 
 ## Torch RPC (Experimental)
 

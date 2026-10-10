@@ -153,6 +153,9 @@ export VISION_TYPE="vision"
 nxmndr-server --azure-proxy --http-port 8080
 ```
 
+The proxy listens on 127.0.0.1 unless started with `--host`; it has no authentication
+and spends these credentials for every caller.
+
 No `az login` is needed for a proxy that only fronts OpenAI-platform endpoints; the
 Azure credential is created lazily on the first Azure-bound request. GPT Image
 models on the OpenAI platform may require completing API Organization Verification

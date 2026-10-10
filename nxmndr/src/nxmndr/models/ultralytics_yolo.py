@@ -227,6 +227,8 @@ def load_ultralytics_yolo(spec: UltralyticsModelSpec, provider, session):
             "model_class ultralytics_yolo needs the ultralytics package in the server's "
             f"Python environment ({exc})"
         ) from exc
+    # YOLO() unpickles a .pt checkpoint (weights_only=False), so it runs code from the file:
+    # only trusted clients may load models (README, Security).
     yolo = YOLO(spec.model_path)
     task = getattr(yolo, "task", None)
     if task is not None and task != SEGMENT_TASK:
