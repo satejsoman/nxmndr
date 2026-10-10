@@ -23,8 +23,8 @@ Ported from the plugin's former in-QGIS path (nxmndr-qgis ``inference/backends.p
 - ``YOLO.predict(chip, verbose=False, retina_masks=True, conf=..., iou=..., max_det=...)``.
   A YOLO build that rejects ``retina_masks`` (``TypeError``) is called again without it.
   ``conf``, ``iou`` and ``max_det`` are per-request options (the pre-rebuild plugin read
-  them from ``model_info``). Their defaults are the paper's DelineateAnything run: a
-  detection confidence threshold of 0.1 (``anaximander/arxiv/nxmndr.tex:263``), and
+  them from ``model_info``). Their defaults are those of the DelineateAnything run in
+  the Anaximander paper's case study: a detection confidence threshold of 0.1, and
   Ultralytics' own predict defaults for the other two, which that run left unchanged
   (``ultralytics`` 8.4.142 ``cfg/default.yaml``: ``iou: 0.7``, ``max_det: 300``;
   Ultralytics' own ``conf`` default is 0.25).
