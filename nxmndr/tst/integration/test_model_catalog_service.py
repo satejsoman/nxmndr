@@ -18,7 +18,7 @@ mocked. Weights are random, made and saved by each test; nothing is downloaded.
   alone (``malformed_payload``, naming 224) and unary Predict with INVALID_ARGUMENT.
 - A weights file that does not match fails the load with INVALID_ARGUMENT and one
   line naming the class, its arguments and the first differing entry; the wire
-  client's retries (it retries INTERNAL) do not build the model again. Unknown and
+  client's retries (it retries UNAVAILABLE) do not build the model again. Unknown and
   unserved names fail with INVALID_ARGUMENT; an output that fits no family is
   INVALID_ARGUMENT (unary) or a tile error ``inference_failed``.
 - A served name (``catalog.list_model_classes()``) loads without metadata from
@@ -386,7 +386,7 @@ def _load_calls(server):
 
 
 def test_a_refused_load_is_built_once_and_answered_in_one_line(server, resnet18):
-    """The wire client retries INTERNAL but not INVALID_ARGUMENT (``nxmndr.client``), so
+    """The wire client retries UNAVAILABLE but not INVALID_ARGUMENT (``nxmndr.client``), so
     a load the worker refuses is built once per request, and the message the plugin
     shows is the catalog's one line, without the worker's traceback."""
 
