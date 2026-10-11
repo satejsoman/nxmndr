@@ -21,7 +21,9 @@ import pytest
 
 from nxmndr.client import InferenceGrpcError
 from nxmndr.inference import inference_pb2
+from nxmndr.server import server
 from nxmndr.tensor_bundle import unpack_tensor_bundle
+from tst.support import grpc_harness
 from tst.support.grpc_harness import running_server, wait_until
 from tst.support.stream_doubles import (
     CountingLoader,
@@ -575,6 +577,30 @@ def test_capabilities_advertise_stream_context_and_limits(tmp_path, loader):
         with pytest.raises(InferenceGrpcError) as err:
             _open(c, "sess-too-wide", mid, chunk_bytes=ceiling + 1)
         assert err.value.code == grpc.StatusCode.INVALID_ARGUMENT
+
+
+def test_a_chunk_of_the_advertised_maximum_reaches_the_server(tmp_path, loader, monkeypatch):
+    # A message carries its context (with the tile's options), shape and dtype besides
+    # the chunk, and gRPC ends the whole stream for a message over its limit.
+    limit = 2 * 1024 * 1024  # a small gRPC message limit, so the test sends megabytes, not 128 MiB
+    monkeypatch.setattr(server, "GRPC_MAX_MESSAGE_LENGTH", limit)
+    monkeypatch.setattr(
+        grpc_harness,
+        "GRPC_OPTIONS",
+        [("grpc.max_send_message_length", limit), ("grpc.max_receive_message_length", limit)],
+    )
+    with running_server(tmp_path, loader=loader) as h, h.client() as c:
+        ceiling = int(c.capabilities()["stream_max_chunk_bytes"])
+        mid = _load(c, "double://echo", task="")
+        _open(c, "sess-ceiling", mid, chunk_bytes=ceiling)
+        tile = np.zeros(ceiling, dtype=np.uint8)  # the whole tile in one message of the maximum chunk
+        [resp] = list(
+            c.stream_predict(
+                session_id="sess-ceiling", samples=[tile], tile_ids=["t0"], chunk_bytes=ceiling,
+                options={"note": "x" * 1024},
+            )
+        )
+        assert resp.metadata.get("error") is None, resp.metadata
 
 
 def test_capabilities_survive_a_catalog_failure(tmp_path, loader, monkeypatch):

@@ -28,7 +28,11 @@ Streaming (``StreamPredict``) contract v1:
   ``error_code`` and ``error_scope`` on failure: ``tile`` scope fails one tile and the
   stream continues; ``stream`` scope ends the stream.
 - Limits: a message chunk over ``max_chunk_bytes`` and a tile over ``max_tile_bytes``
-  are tile-scope failures. The number of chunks per tile is not limited. The server
+  are tile-scope failures. The number of chunks per tile is not limited. Capabilities
+  ``stream_max_chunk_bytes`` is the gRPC message limit minus
+  ``STREAM_MESSAGE_HEADROOM_BYTES`` for the message's other fields (its context with
+  the tile's options, shape and dtype); a message over the gRPC limit ends the whole
+  stream with RESOURCE_EXHAUSTED. The server
   processes tiles in arrival order and answers each before reading on, so a client
   window of ``max_inflight`` outstanding tiles cannot deadlock.
 
@@ -113,6 +117,14 @@ GRPC_OPTIONS = [
     ("grpc.max_send_message_length", GRPC_MAX_MESSAGE_LENGTH),
     ("grpc.max_receive_message_length", GRPC_MAX_MESSAGE_LENGTH),
 ]
+# Bytes of one StreamPredictRequest kept for its fields other than the chunk data: the
+# chunk field's own tag and length, model_id, shape, dtype, end_of_sequence and the
+# context (tile_id, session_id and, on a tile's first message, the tile's opt.*
+# options). Without options these take under 200 bytes; the rest is for options, whose
+# size nothing else limits. gRPC refuses a message over GRPC_MAX_MESSAGE_LENGTH by
+# ending the whole stream (RESOURCE_EXHAUSTED), so the largest chunk a session may
+# negotiate is that limit minus this headroom (stream_max_chunk_bytes).
+STREAM_MESSAGE_HEADROOM_BYTES = 1024 * 1024
 # gRPC handler threads. Each StreamPredict holds one for its whole life, so the pool is
 # sized for concurrent calls, not by max_cores (which sizes the device plan and the
 # number of inference calls that run at once).
@@ -120,6 +132,13 @@ GRPC_HANDLER_THREADS = 32
 # Seconds between the sweeps that expire sessions idle longer than the session TTL
 # (NXMNDR_SESSION_TTL_SECONDS); a session expires at most this much late.
 SESSION_EXPIRY_INTERVAL_SECONDS = 60.0
+
+
+def stream_max_chunk_bytes() -> int:
+    """The largest chunk one StreamPredictRequest may carry (Capabilities
+    ``stream_max_chunk_bytes``)."""
+
+    return GRPC_MAX_MESSAGE_LENGTH - STREAM_MESSAGE_HEADROOM_BYTES
 
 
 def _shutdown_rpc_driver_if_needed():
@@ -331,6 +350,16 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
         self._default_chunk_bytes = int(
             os.environ.get("NXMNDR_STREAM_MAX_CHUNK_BYTES", str(8 * 1024 * 1024))
         )
+        if self._default_chunk_bytes > stream_max_chunk_bytes():
+            # Clients send chunks of this size (Capabilities stream_default_chunk_bytes),
+            # and a larger one would end their streams.
+            self.logger.warning(
+                "NXMNDR_STREAM_MAX_CHUNK_BYTES %d is above the largest chunk a message can "
+                "carry; using %d",
+                self._default_chunk_bytes,
+                stream_max_chunk_bytes(),
+            )
+            self._default_chunk_bytes = stream_max_chunk_bytes()
         self._default_tile_bytes = int(
             os.environ.get("NXMNDR_STREAM_MAX_TILE_BYTES", str(GRPC_MAX_MESSAGE_LENGTH))
         )
@@ -1217,10 +1246,11 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
         # A requested chunk size is honored as sent, so the negotiated value is exactly
         # what the client asked for; without one the server default applies.
         max_chunk_bytes = transport.chunk_bytes or self._default_chunk_bytes
-        if transport.chunk_bytes < 0 or transport.chunk_bytes > GRPC_MAX_MESSAGE_LENGTH:
+        max_chunk = stream_max_chunk_bytes()
+        if transport.chunk_bytes < 0 or transport.chunk_bytes > max_chunk:
             return _fail(
                 grpc.StatusCode.INVALID_ARGUMENT,
-                f"transport.chunk_bytes {transport.chunk_bytes} is outside 0..{GRPC_MAX_MESSAGE_LENGTH} "
+                f"transport.chunk_bytes {transport.chunk_bytes} is outside 0..{max_chunk} "
                 "(Capabilities stream_max_chunk_bytes)",
             )
         max_tile_bytes = min(self._default_tile_bytes, GRPC_MAX_MESSAGE_LENGTH)
@@ -1397,7 +1427,7 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
                 key="stream_default_chunk_bytes", value=str(self._default_chunk_bytes)
             ),
             inference_pb2.CapabilityInfo(
-                key="stream_max_chunk_bytes", value=str(GRPC_MAX_MESSAGE_LENGTH)
+                key="stream_max_chunk_bytes", value=str(stream_max_chunk_bytes())
             ),
             inference_pb2.CapabilityInfo(
                 key="stream_max_tile_bytes",

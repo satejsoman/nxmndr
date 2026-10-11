@@ -87,6 +87,18 @@ def test_model_manager_capacity_and_ttl_come_from_the_environment(tmp_path, monk
     assert svc.model_manager._ttl == 3600.0
 
 
+def test_the_default_chunk_is_clamped_to_the_advertised_maximum(tmp_path, monkeypatch):
+    monkeypatch.setenv("NXMNDR_STREAM_MAX_CHUNK_BYTES", str(server.GRPC_MAX_MESSAGE_LENGTH))
+    svc = server.InferenceService(
+        model_cache_dir=tmp_path / "cache",
+        model_manager=managers.ModelManager(None, capacity=1, loader=_record),
+    )
+    caps = svc.Capabilities(inference_pb2.CapabilitiesRequest(), None).capabilities
+    caps = {c.key: c.value for c in caps}
+    assert int(caps["stream_default_chunk_bytes"]) == int(caps["stream_max_chunk_bytes"])
+    assert int(caps["stream_max_chunk_bytes"]) < server.GRPC_MAX_MESSAGE_LENGTH
+
+
 def test_sam_variant_factory_gets_the_record_auth_token(monkeypatch):
     """The SAM path reads ModelRecord.auth_token, not a token on the spec or in metadata."""
 
