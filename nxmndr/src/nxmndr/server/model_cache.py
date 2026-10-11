@@ -340,7 +340,7 @@ class _ResourceAttempt:
 
 @dataclass(eq=False)
 class ModelRecord:
-    """A loaded model with its device replicas, aux resources and owned artifacts."""
+    """A loaded model with its device replicas and aux resources."""
 
     model: Optional[object]
     backend: str
@@ -356,7 +356,6 @@ class ModelRecord:
     auth_token: str = field(default="", repr=False)
     _resources: Dict[str, object] = field(default_factory=dict, init=False, repr=False)
     _attempts: Dict[str, _ResourceAttempt] = field(default_factory=dict, init=False, repr=False)
-    _finalizers: List[Callable[[], None]] = field(default_factory=list, init=False, repr=False)
     _disposed: bool = field(default=False, init=False, repr=False)
     _cond: threading.Condition = field(default_factory=threading.Condition, init=False, repr=False)
 
@@ -415,7 +414,7 @@ class ModelRecord:
         return value
 
     def dispose(self) -> None:
-        """Release replicas, aux resources and owned temporary artifacts. Idempotent.
+        """Release replicas and aux resources. Idempotent.
 
         Each aux resource gets one ``dispose()`` call, or ``close()`` if it has no
         ``dispose``, in the calling thread; failures are logged, not raised.
@@ -427,8 +426,6 @@ class ModelRecord:
             self._disposed = True
             resources = list(self._resources.items())
             self._resources.clear()
-            finalizers = list(self._finalizers)
-            self._finalizers.clear()
             self._cond.notify_all()
         self.device_models.clear()
         self.model = None
@@ -436,13 +433,6 @@ class ModelRecord:
         for name, resource in resources:
             _dispose_resource(self.model_id, name, resource)
         del resources
-        for finalizer in finalizers:
-            try:
-                finalizer()
-            except Exception as exc:  # disposal continues past a failing finalizer
-                logger.warning(
-                    "model %s: disposal step failed: %s", self.model_id, type(exc).__name__
-                )
 
 
 @dataclass(frozen=True)
@@ -606,7 +596,6 @@ class ModelCache:
         self._sessions: Dict[str, _Session] = {}
         self._tombstones: Dict[str, Tuple[str, float]] = {}  # session_id -> (reason, closed_at)
         self._live_executions = 0
-        self._artifacts: Dict[str, set[str]] = {}  # path -> owning model IDs ("" = the cache)
         self._state = "running"  # running -> draining -> stopped
 
     # ---- loading --------------------------------------------------------
@@ -737,7 +726,6 @@ class ModelCache:
                 pending.error = exc
                 pending.done = True
                 self._cond.notify_all()
-            self._release_artifacts(model_id)
             if not isinstance(exc, Exception):
                 raise
             logger.warning("loading model %s failed: %s", model_id, type(exc).__name__)
@@ -752,7 +740,6 @@ class ModelCache:
         record.metadata["model_id"] = model_id
         if not record.auth_token:
             record.auth_token = token or spec_token
-        record._finalizers.append(lambda mid=model_id: self._release_artifacts(mid))
 
         reused: Optional[SessionLease] = None
         with self._cond:
@@ -975,45 +962,6 @@ class ModelCache:
                 pinned=sum(1 for entry in self._records.values() if entry.pins() > 0),
             )
 
-    # ---- temporary artifacts -------------------------------------------
-
-    def register_temp_artifact(self, path: str, *, model_id: str = "") -> None:
-        """Delete ``path`` when its last owner is disposed.
-
-        With ``model_id`` (resident or being loaded) the record owns the file;
-        without it the cache owns it until shutdown. A path registered by several
-        owners is deleted only after all of them are gone.
-        """
-
-        path = os.fspath(path)
-        with self._cond:
-            if self._state == "stopped":
-                raise CacheShutdownError("model cache is shut down")
-            if model_id and model_id not in self._records:
-                if not any(p.model_id == model_id for p in self._loading.values()):
-                    raise UnknownModelError(f"model {model_id} is not resident or loading")
-            self._artifacts.setdefault(path, set()).add(model_id)
-
-    def _release_artifacts(self, owner: str) -> None:
-        with self._cond:
-            doomed = []
-            for path, owners in list(self._artifacts.items()):
-                if owner in owners:
-                    owners.discard(owner)
-                    if not owners:
-                        del self._artifacts[path]
-                        doomed.append(path)
-        for path in doomed:
-            try:
-                os.unlink(path)
-                logger.debug("deleted temporary artifact %s", path)
-            except FileNotFoundError:
-                pass
-            except OSError as exc:
-                logger.warning(
-                    "could not delete temporary artifact %s: %s", path, type(exc).__name__
-                )
-
     # ---- shutdown -------------------------------------------------------
 
     def shutdown(self, *, drain_timeout_s: Optional[float] = None) -> None:
@@ -1061,7 +1009,6 @@ class ModelCache:
                     len(entry.executions),
                 )
             self._dispose_record(entry.record)
-        self._release_artifacts("")
         with self._cond:
             self._state = "stopped"
             self._cond.notify_all()

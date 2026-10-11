@@ -88,7 +88,7 @@ class CountingRecord(ModelRecord):
         self.dispose_entered.set()
         if self.manager is not None and not lock_is_free(self.manager):
             self.violations.append("dispose ran under the global lock")
-            return  # finishing would deadlock in the artifact finalizer; report instead
+            return  # report instead of disposing under the lock
         if self.users:
             self.violations.append(f"disposed with {self.users} test-held user(s)")
         if self.dispose_gate is not None:
@@ -107,7 +107,6 @@ class FakeLoader:
         self.gate: Optional[threading.Event] = None
         self.entered = threading.Event()
         self.fail_with: Optional[BaseException] = None
-        self.on_call: Optional[Callable[[dict], None]] = None
         self.violations: List[str] = []
         self._lock = threading.Lock()
 
@@ -120,8 +119,6 @@ class FakeLoader:
         self.entered.set()
         if self.gate is not None:
             self.gate.wait(WAIT_S)
-        if self.on_call is not None:
-            self.on_call(metadata)
         if self.fail_with is not None:
             raise self.fail_with
         replicas = {d["id"]: f"{cache_key.source}@{d['id']}" for d in (device_plan or [])}
