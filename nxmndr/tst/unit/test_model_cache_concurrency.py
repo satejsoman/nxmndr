@@ -86,6 +86,24 @@ def test_concurrent_loads_of_one_key_coalesce_into_one_loader_call():
     assert _violations(loader) == []
 
 
+def test_coalesced_loads_each_hold_a_load_reference():
+    manager, loader, _ = make_manager()
+    loader.gate = threading.Event()
+    runner = _Runner()
+    runner.start("first", lambda: manager.load(spec(), key=key("A")))
+    assert loader.entered.wait(WAIT_S)
+    for i in range(2):
+        runner.start(f"waiter{i}", lambda: manager.load(spec(), key=key("A")))
+    wait_until(lambda: pending_waiters(manager, key("A")) == 2, "2 coalesced waiters")
+    loader.gate.set()
+    runner.join()
+    [model_id] = {result.model_id for _, result in runner.results.values()}
+    assert manager.unload(model_id) is True and manager.unload(model_id) is True
+    assert manager.get(model_id) is not None and loader.records[0].dispose_calls == 0
+    assert manager.unload(model_id) is True  # the third and last reference
+    assert manager.get(model_id) is None and loader.records[0].dispose_calls == 1
+
+
 def test_concurrent_open_sessions_coalesce_and_each_pins():
     manager, loader, _ = make_manager()
     loader.gate = threading.Event()

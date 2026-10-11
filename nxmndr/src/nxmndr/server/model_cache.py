@@ -15,6 +15,12 @@ Rules the implementation keeps:
 * A record is pinned while an open session is bound to it or an execution lease
   on it is unreleased. Pinned records are never evicted, unloaded or overwritten.
   Holding a Python reference to a record is not a pin.
+* Equal keys share one record, so several ``load`` callers can hold one model ID.
+  Each ``load`` adds a load reference to the record it returns and each ``unload``
+  releases one; the record is disposed only with its last reference. A record with
+  a load reference is never overwritten. Load references are not pins: LRU eviction
+  ignores them, because a caller that never unloads would otherwise hold its cache
+  slot until the server stops.
 * A distinct load at full capacity evicts the least recently used unpinned
   record. If every slot is pinned or reserved it raises ``CacheExhaustedError``
   before it loads or evicts anything.
@@ -92,7 +98,7 @@ class CacheExhaustedError(ModelCacheError):
 
 
 class ModelInUseError(ModelCacheError):
-    """Unload or overwrite of a record that is pinned."""
+    """Unload of a pinned record's last load reference, or overwrite of a record in use."""
 
 
 class UnknownModelError(ModelCacheError, KeyError):
@@ -487,7 +493,7 @@ class ExecutionLease:
 
 
 class _Entry:
-    __slots__ = ("record", "key", "sessions", "executions", "handoffs")
+    __slots__ = ("record", "key", "sessions", "executions", "handoffs", "loads")
 
     def __init__(self, record: ModelRecord, key: ModelCacheKey) -> None:
         self.record = record
@@ -497,6 +503,9 @@ class _Entry:
         # Coalesced waiters that have not yet picked up this freshly loaded
         # record. They keep it from eviction until they resume.
         self.handoffs = 0
+        # load() calls that returned this record minus unload() calls that released
+        # one. Not a pin: eviction ignores it.
+        self.loads = 0
 
     def pins(self) -> int:
         return len(self.sessions) + len(self.executions)
@@ -568,12 +577,14 @@ class ModelCache:
         device_plan: Optional[List[dict]] = None,
         overwrite: bool = False,
     ) -> LoadResult:
-        """Make the model resident without pinning it (LoadModel).
+        """Make the model resident and add a load reference to it, not a pin (LoadModel).
 
-        With ``overwrite=True`` a resident unpinned record for ``key`` is disposed
-        and loaded again under a new model ID; a pinned one raises
-        ``ModelInUseError``. If ``key`` is being loaded by another call, this call
-        waits for that load and returns its model ID, also with ``overwrite``.
+        With ``overwrite=True`` a resident record for ``key`` that nothing holds is
+        disposed and loaded again under a new model ID. A record that is pinned or
+        has a load reference raises ``ModelInUseError``: the cache cannot tell the
+        caller's own reference from another caller's, and disposing it would end the
+        model ID for every holder. If ``key`` is being loaded by another call, this
+        call waits for that load and returns its model ID, also with ``overwrite``.
         """
 
         _check_key(key)
@@ -613,10 +624,13 @@ class ModelCache:
                         self._records.move_to_end(model_id)
                         if session_id is not None:
                             self._bind_session(session_id, entry)
+                        else:
+                            entry.loads += 1
                         return model_id, True, False
-                    if not entry.evictable():
+                    if entry.loads or not entry.evictable():
                         raise ModelInUseError(
-                            f"model {model_id} is in use ({entry.pins()} pins); cannot overwrite"
+                            f"model {model_id} is in use ({entry.pins()} pins, "
+                            f"{entry.loads} load references); cannot overwrite"
                         )
                     self._remove_entry(model_id)
                     victims.append(entry.record)
@@ -641,6 +655,8 @@ class ModelCache:
                         if existing is not None:
                             return existing.model_id, True, True
                         self._bind_session(session_id, entry)
+                    else:
+                        entry.loads += 1
                     return pending.model_id, False, False
                 if len(self._records) + len(self._loading) >= self._capacity:
                     victim = self._lru_evictable()
@@ -710,6 +726,8 @@ class ModelCache:
                         reused = self._session_precheck(session_id, key=key)
                         if reused is None:
                             self._bind_session(session_id, entry)
+                    else:
+                        entry.loads = 1
             finally:
                 pending.done = True
                 self._cond.notify_all()
@@ -859,15 +877,28 @@ class ModelCache:
     # ---- unload and introspection ---------------------------------------
 
     def unload(self, model_id: str) -> bool:
-        """Dispose an unpinned record. False if unknown; ``ModelInUseError`` if pinned."""
+        """Release one load reference; dispose the record with the last one (UnloadModel).
+
+        False if ``model_id`` is not resident. The last reference of a pinned record
+        raises ``ModelInUseError`` and releases nothing. A record that only sessions
+        loaded has no load reference, so unloading it is unloading its last one.
+        """
 
         with self._cond:
             entry = self._records.get(model_id)
             if entry is None:
                 return False
-            if not entry.evictable():
+            remaining = 0
+            if entry.loads > 1:
+                entry.loads -= 1
+                remaining = entry.loads
+            elif not entry.evictable():
                 raise ModelInUseError(f"model {model_id} is in use ({entry.pins()} pins)")
-            self._remove_entry(model_id)
+            else:
+                self._remove_entry(model_id)
+        if remaining:
+            logger.info("released a load reference of model %s (%d remain)", model_id, remaining)
+            return True
         self._dispose_record(entry.record)
         logger.info("unloaded model %s", model_id)
         return True

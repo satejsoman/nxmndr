@@ -246,16 +246,60 @@ def test_unload_refuses_pinned_records_and_disposes_once():
     assert _no_violations(loader) == []
 
 
-def test_overwrite_reloads_unpinned_and_refuses_pinned():
+def test_unload_releases_one_load_reference_of_a_shared_model():
     manager, loader, _ = make_manager()
-    old = manager.load(spec(), key=key("A")).model_id
+    a = manager.load(spec(), key=key("A")).model_id  # client A
+    assert manager.load(spec(), key=key("A")).model_id == a  # client B: cache hit
+    assert manager.unload(a) is True  # A is done
+    assert manager.get(a) is not None and loader.records[0].dispose_calls == 0
+    manager.acquire_execution(model_id=a).release()  # B still predicts
+    assert manager.unload(a) is True  # B is done: the last reference
+    assert manager.get(a) is None and loader.records[0].dispose_calls == 1
+    assert manager.unload(a) is False
+    assert _no_violations(loader) == []
+
+
+def test_last_load_reference_of_a_pinned_record_is_refused():
+    manager, loader, _ = make_manager()
+    a = manager.load(spec(), key=key("A")).model_id
+    manager.load(spec(), key=key("A"))
+    manager.open_session("s1", model_id=a)
+    assert manager.unload(a) is True  # another load reference remains
+    with pytest.raises(ModelInUseError):
+        manager.unload(a)  # the last one, while the session pins the record
+    manager.close_session("s1", reason="closed")
+    assert manager.unload(a) is True  # the refused reference was kept
+    assert manager.get(a) is None and loader.records[0].dispose_calls == 1
+
+
+def test_overwrite_refuses_a_record_that_a_load_reference_holds():
+    manager, loader, _ = make_manager()
+    held = manager.load(spec(), key=key("A")).model_id  # client B holds it
+    with pytest.raises(ModelInUseError):
+        manager.load(spec(), key=key("A"), overwrite=True)  # client A
+    assert manager.get(held) is not None and loader.records[0].dispose_calls == 0
+    manager.acquire_execution(model_id=held).release()  # B still predicts
+    assert manager.unload(held) is True and loader.records[0].dispose_calls == 1
+    fresh = manager.load(spec(), key=key("A"), overwrite=True)  # not resident: plain load
+    assert fresh.model_id != held and fresh.cache_hit is False and len(loader.calls) == 2
+    assert _no_violations(loader) == []
+
+
+def test_overwrite_refuses_a_pinned_record():
+    manager, loader, _ = make_manager()
+    a = manager.open_session("s1", model_spec=spec(), key=key("A")).model_id
+    with pytest.raises(ModelInUseError):
+        manager.load(spec(), key=key("A"), overwrite=True)
+    assert len(loader.calls) == 1 and manager.get(a) is not None
+
+
+def test_overwrite_reloads_a_record_that_nothing_holds():
+    manager, loader, _ = make_manager()
+    old = manager.open_session("s1", model_spec=spec(), key=key("A")).model_id
+    manager.close_session("s1", reason="closed")  # no load reference, no pin
     new = manager.load(spec(), key=key("A"), overwrite=True)
     assert new.model_id != old and new.cache_hit is False
     assert manager.get(old) is None and loader.records[0].dispose_calls == 1
-    manager.open_session("s1", model_id=new.model_id)
-    with pytest.raises(ModelInUseError):
-        manager.load(spec(), key=key("A"), overwrite=True)
-    assert len(loader.calls) == 2 and manager.get(new.model_id) is not None
     fresh = manager.load(spec(), key=key("B"), overwrite=True)  # not resident: plain load
     assert fresh.cache_hit is False and len(loader.calls) == 3
     assert _no_violations(loader) == []

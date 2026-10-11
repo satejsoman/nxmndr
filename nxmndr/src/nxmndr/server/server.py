@@ -658,6 +658,11 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
             context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
             context.set_details(str(e))
             return inference_pb2.UnloadModelResponse(success=False, message=f"model in use: {e}")
+        if unloaded and self.model_manager.get(mid) is not None:
+            # Another LoadModel caller still holds it; it is freed when the last one unloads.
+            return inference_pb2.UnloadModelResponse(
+                success=True, message=f"released {mid}; still loaded for other callers"
+            )
         if unloaded:
             return inference_pb2.UnloadModelResponse(success=True, message=f"unloaded {mid}")
         return inference_pb2.UnloadModelResponse(success=False, message="unknown model_id")

@@ -8,6 +8,9 @@ a model pinned by an open session stays resident and usable while other models
 load and evict each other, and becomes evictable after its last lease ends; and a
 prediction still running when its session closes keeps its record alive until the
 call returns, after which the record is disposed exactly once.
+
+Also over gRPC: two clients that load an equal spec share one model ID, and one
+client's UnloadModel or overwrite does not take the model from the other.
 """
 
 from __future__ import annotations
@@ -147,3 +150,33 @@ def test_running_prediction_keeps_its_record_until_the_call_returns(tmp_path, en
         assert h.manager.get(mid) is None
         assert record.dispose_calls == 1
     assert record.dispose_calls == 1  # server shutdown does not dispose it again
+
+
+def test_unload_by_one_client_keeps_the_model_for_another(tmp_path):
+    loader = _Loader({"double://shared": SegLogitsModel})
+    with running_server(tmp_path, loader=loader) as h, h.client() as a, h.client() as b:
+        mid = _load(a, "double://shared")
+        assert _load(b, "double://shared") == mid  # a cache hit shares the model ID
+        [record] = loader.records["double://shared"]
+        released = a._get_stub().UnloadModel(inference_pb2.UnloadModelRequest(model_id=mid))
+        assert released.success and "still loaded" in released.message
+        result = b.predict(mid, CHIP, options={"task_type": "segmentation"})
+        assert result.metadata.get("error") is None and record.dispose_calls == 0
+        unloaded = b._get_stub().UnloadModel(inference_pb2.UnloadModelRequest(model_id=mid))
+        assert unloaded.success and h.manager.get(mid) is None
+        assert record.dispose_calls == 1
+
+
+def test_overwrite_of_a_model_another_client_holds_is_refused(tmp_path):
+    loader = _Loader({"double://shared": SegLogitsModel})
+    spec = inference_pb2.ModelSpec(
+        format=inference_pb2.ONNX, source="double://shared", task=inference_pb2.SEGMENTATION
+    )
+    with running_server(tmp_path, loader=loader) as h, h.client() as a, h.client() as b:
+        mid = _load(b, "double://shared")
+        with pytest.raises(grpc.RpcError) as err:
+            a._get_stub().LoadModel(inference_pb2.LoadModelRequest(spec=spec, overwrite=True))
+        assert err.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+        result = b.predict(mid, CHIP, options={"task_type": "segmentation"})
+        assert result.metadata.get("error") is None and h.manager.get(mid) is not None
+        assert [r.dispose_calls for r in loader.records["double://shared"]] == [0]
