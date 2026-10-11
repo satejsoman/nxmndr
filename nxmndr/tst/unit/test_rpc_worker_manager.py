@@ -394,3 +394,33 @@ def test_a_load_abandoned_before_it_arrives_is_not_built(tmp_path):
         assert "unit-early" not in rpc_worker._rpc_status()["models"]
     finally:
         rpc_worker._rpc_unload("unit-early")
+
+
+def test_the_fingerprint_is_taken_on_the_cpu_before_the_model_moves(monkeypatch, tmp_path):
+    from tst.support import rpc_models
+
+    events, taken = [], []
+
+    class MovingAddConst(AddConst):
+        def to(self, *args, **kwargs):
+            events.append("to")
+            return self
+
+    real_fingerprint = rpc_worker._fingerprint
+
+    def fingerprint(model):
+        events.append("fp")
+        taken.append(real_fingerprint(model))
+        return taken[-1]
+
+    monkeypatch.setattr(rpc_worker, "_fingerprint", fingerprint)
+    monkeypatch.setattr(rpc_worker.torch.cuda, "is_available", lambda: True)
+    path = rpc_models.save_add_const(tmp_path / "w.pt", 1.0)
+    payload = {"model_class": MovingAddConst, "model_path": path, "name": "w"}
+    try:
+        info = rpc_worker._rpc_load("unit-fp", payload, "cuda:0")
+        assert events == ["fp", "to"]
+        assert info["fingerprint"] == taken[0]
+        assert rpc_worker._rpc_status()["models"]["unit-fp"]["fingerprint"] == taken[0]
+    finally:
+        rpc_worker._rpc_unload("unit-fp")

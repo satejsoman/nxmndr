@@ -91,7 +91,11 @@ def _spec_value(spec, name, default=None):
 
 
 def _load_model(model_spec, device: str = "cpu"):
-    """Build ``model_spec``: a registered class, or a catalog name (``nxmndr.models.catalog``)."""
+    """Build ``model_spec``: a registered class, or a catalog name (``nxmndr.models.catalog``).
+
+    Returns the model on ``device`` and its ``_fingerprint``, taken on the CPU before
+    the move: on a GPU the hash would first copy every weight back to the host.
+    """
 
     model_class = _spec_value(model_spec, "model_class")
     target = "cpu"
@@ -117,10 +121,11 @@ def _load_model(model_spec, device: str = "cpu"):
             "server resolves ModelSpec.model_class by the names registered with "
             "register_pytorch_model, then by nxmndr.models.catalog"
         )
+    fingerprint = _fingerprint(model)
     if target != "cpu":
         model.to(target)
     model.eval()
-    return model
+    return model, fingerprint
 
 
 def configure_cudnn() -> None:
@@ -176,10 +181,10 @@ def _fingerprint(model) -> str:
     return "sha256:" + digest.hexdigest()
 
 
-def _register(model_id: str, model) -> Optional[dict]:
+def _register(model_id: str, model, fingerprint: str) -> Optional[dict]:
     """Keep ``model`` under ``model_id``; None if the server abandoned that load."""
 
-    entry = _LoadedModel(model, _model_device(model), _fingerprint(model))
+    entry = _LoadedModel(model, _model_device(model), fingerprint)
     with _models_lock:
         if model_id in _worker_state["abandoned"]:  # the server gave up on this load
             _worker_state["abandoned"].discard(model_id)
@@ -239,13 +244,13 @@ def _rpc_load(model_id, spec, device=None):
     device = device or _worker_state.get("device") or "cpu"
     try:
         try:
-            model = _load_model(spec, device)
+            model, fingerprint = _load_model(spec, device)
         except Exception as exc:
             refusal = _catalog_refusal(exc)
             if refusal is None:
                 raise
             return {"model_id": model_id, "refused": refusal}
-        info = _register(model_id, model)
+        info = _register(model_id, model, fingerprint)
     finally:
         with _models_lock:
             _worker_state["loading"].discard(model_id)
@@ -326,7 +331,7 @@ def _rpc_load_model(spec_dict):
         model.eval()
 
         # Store in the provider's slot
-        _register(DEFAULT_MODEL_ID, model)
+        _register(DEFAULT_MODEL_ID, model, _fingerprint(model))
         state["spec"] = spec_dict
         state["initialized"] = True
 
@@ -439,7 +444,7 @@ def run_worker(
     parent_pid = os.getppid()
     if model_spec is not None:
         logger.info("Loading model for worker %s", worker_name)
-        _register(DEFAULT_MODEL_ID, _load_model(model_spec))
+        _register(DEFAULT_MODEL_ID, *_load_model(model_spec))
     logger.info(
         "Ensuring process group then initializing RPC (name=%s rank=%d world_size=%d)",
         worker_name,
