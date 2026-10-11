@@ -1414,20 +1414,8 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
                 if ultralytics_yolo.ultralytics_available()
                 else "",
             ),
-            # PYTORCH model_class catalog names this server builds and runs
-            # (nxmndr.models.catalog), comma-separated, ordered by family, then name;
-            # a family whose package is missing gives none.
-            inference_pb2.CapabilityInfo(
-                key="pytorch_model_classes", value=",".join(catalog.list_model_classes())
-            ),
-            # The names of pytorch_model_classes whose model takes one square chip size
-            # only (nxmndr.models.catalog.input_size), as '<name>=<pixels>',
-            # comma-separated, in the same order; a chip of another size fails its tile.
-            inference_pb2.CapabilityInfo(
-                key="pytorch_model_input_sizes",
-                value=",".join(f"{name}={size}" for name, size in catalog.list_input_sizes()),
-            ),
         ]
+        caps.extend(self._catalog_capabilities())
         if self._device_plan:
             caps.append(
                 inference_pb2.CapabilityInfo(
@@ -1436,6 +1424,34 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
                 )
             )
         return inference_pb2.CapabilitiesResponse(capabilities=caps)
+
+    def _catalog_capabilities(self):
+        """The catalog entries of Capabilities, or none (logged) if the catalog cannot
+        be listed. A catalog failure must not fail Capabilities, whose other entries
+        (stream_context_version, the stream limits) every client reads. The entries are
+        left out, not sent empty: a client then treats the server like one from before
+        these entries (the QGIS plugin uses the sizes of its own catalog file)."""
+
+        try:
+            classes = catalog.list_model_classes()
+            sizes = catalog.list_input_sizes()
+        except Exception:
+            self.logger.exception("Capabilities: the PyTorch model catalog cannot be listed")
+            return []
+        return [
+            # PYTORCH model_class catalog names this server builds and runs
+            # (nxmndr.models.catalog), comma-separated, ordered by family, then name;
+            # a family whose package is missing gives none.
+            inference_pb2.CapabilityInfo(key="pytorch_model_classes", value=",".join(classes)),
+            # The names of pytorch_model_classes whose model takes one square chip size
+            # only (nxmndr.models.catalog.input_size), as '<name>=<pixels>',
+            # comma-separated, in the same order; a chip of another size fails its tile.
+            # A name whose size cannot be read is left out.
+            inference_pb2.CapabilityInfo(
+                key="pytorch_model_input_sizes",
+                value=",".join(f"{name}={size}" for name, size in sizes),
+            ),
+        ]
 
     def Health(self, request, context):
         return inference_pb2.HealthResponse(ready=True, message="ok")

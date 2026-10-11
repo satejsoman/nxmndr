@@ -418,12 +418,27 @@ def input_size(model_class: str) -> Optional[int]:
     return _declared_input_size(_probe_model(family, name, _builder_kwargs(family, name, {})))
 
 
+def _listed_input_size(model_class: str) -> Optional[int]:
+    """:func:`input_size`, or None (logged) when its probe fails, so that one model
+    cannot hide the sizes of the others."""
+
+    try:
+        return input_size(model_class)
+    except Exception as exc:
+        logger.warning(
+            "model catalog: the input size of %s cannot be read, so it is not listed (%s: %s)",
+            model_class, type(exc).__name__, _first_line(exc),
+        )
+        return None
+
+
 @functools.lru_cache(maxsize=None)
 def list_input_sizes() -> Tuple[Tuple[str, int], ...]:
     """``(name, pixels)`` of each served name with a fixed input size, in the order of
-    :func:`list_model_classes`."""
+    :func:`list_model_classes`. A name whose size cannot be read is left out (logged);
+    the result is cached, so a failing probe runs once per process."""
 
-    sizes = ((name, input_size(name)) for name in list_model_classes())
+    sizes = ((name, _listed_input_size(name)) for name in list_model_classes())
     return tuple((name, size) for name, size in sizes if size is not None)
 
 

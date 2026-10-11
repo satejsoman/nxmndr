@@ -308,6 +308,28 @@ def test_the_fixed_input_sizes_are_listed_in_catalog_order(fresh_catalog):
         catalog.input_size("torchvision:raft_large")
 
 
+def test_one_failing_input_size_probe_leaves_only_that_name_out(fresh_catalog, monkeypatch):
+    real = catalog._probe_model
+    failed = []
+
+    def probe(family, name, kwargs):
+        if (family, name) == ("torchvision", "vit_b_16"):
+            failed.append(name)
+            raise RuntimeError("probe failed")
+        return real(family, name, kwargs)
+
+    monkeypatch.setattr(catalog, "_probe_model", probe)
+    names = catalog.list_model_classes()
+    expected = [
+        (name, FIXED_INPUT_SIZES[name])
+        for name in names
+        if name in FIXED_INPUT_SIZES and name != "torchvision:vit_b_16"
+    ]
+    assert list(catalog.list_input_sizes()) == expected
+    assert list(catalog.list_input_sizes()) == expected
+    assert failed == ["vit_b_16"]  # the result is cached: the failing probe runs once
+
+
 def _runs(model, bands, size, device):
     try:
         with torch.no_grad():

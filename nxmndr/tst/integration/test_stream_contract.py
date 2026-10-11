@@ -577,6 +577,19 @@ def test_capabilities_advertise_stream_context_and_limits(tmp_path, loader):
         assert err.value.code == grpc.StatusCode.INVALID_ARGUMENT
 
 
+def test_capabilities_survive_a_catalog_failure(tmp_path, loader, monkeypatch):
+    from nxmndr.models import catalog
+
+    def broken():
+        raise RuntimeError("catalog probe failed")
+
+    monkeypatch.setattr(catalog, "list_input_sizes", broken)
+    with running_server(tmp_path, loader=loader) as h, h.client() as c:
+        caps = c.capabilities()
+    assert caps["stream_context_version"] == "1"
+    assert "pytorch_model_classes" not in caps and "pytorch_model_input_sizes" not in caps
+
+
 class _PeakModel:
     """Counts the predictions running at once; each blocks until ``release`` is set."""
 
