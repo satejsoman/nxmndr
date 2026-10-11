@@ -424,3 +424,29 @@ def test_the_fingerprint_is_taken_on_the_cpu_before_the_model_moves(monkeypatch,
         assert rpc_worker._rpc_status()["models"]["unit-fp"]["fingerprint"] == taken[0]
     finally:
         rpc_worker._rpc_unload("unit-fp")
+
+
+@pytest.mark.parametrize(
+    "state, first",
+    [
+        ({}, "missing bias"),
+        ({"bias": 1.0, "scale": 2.0}, "unexpected scale"),
+    ],
+)
+def test_a_registered_class_loads_strictly_and_a_mismatch_is_refused(tmp_path, state, first):
+    import torch
+
+    path = tmp_path / "w.pt"
+    torch.save({key: torch.tensor(value) for key, value in state.items()}, str(path))
+    payload = {"model_class": AddConst, "model_path": str(path), "name": "w"}
+    try:
+        reply = rpc_worker._rpc_load("unit-strict", payload)
+        assert set(reply) == {"model_id", "refused"}, reply
+        refused = reply["refused"]
+        assert refused["message"].startswith(
+            f"weights file {path} does not match AddConst (strict load): {first}"
+        ), refused["message"]
+        assert "\n" not in refused["message"] and refused["unavailable"] is False
+        assert "unit-strict" not in rpc_worker._rpc_status()["models"]
+    finally:
+        rpc_worker._rpc_unload("unit-strict")

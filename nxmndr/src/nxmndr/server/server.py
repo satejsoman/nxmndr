@@ -624,8 +624,9 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
         """The catalog error behind a failed load, or None.
 
         The PyTorch worker refuses a catalog model it cannot build as requested
-        (weights that do not match the class or its arguments; ``RpcWorkerManager.load``
-        raises that ``CatalogError``), and the model cache raises it as the cause of
+        (weights that do not match the class or its arguments), and a registered class
+        whose weights do not load strictly; ``RpcWorkerManager.load`` raises that
+        ``CatalogError``, and the model cache raises it as the cause of
         ``ModelLoadError``, also for a waiter on the same load.
         """
         cause = exc.__cause__ if isinstance(exc, managers.ModelLoadError) else None

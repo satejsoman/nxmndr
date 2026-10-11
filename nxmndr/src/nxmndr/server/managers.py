@@ -534,10 +534,11 @@ class RpcWorkerManager:
     def load(self, model_id: str, model_spec) -> Dict[str, object]:
         """Build ``model_spec`` in the worker under ``model_id`` (starting the worker first).
 
-        Returns the worker's ``{"model_id", "device", "fingerprint"}``. A catalog model
-        the worker refused raises ``catalog.CatalogError`` (``CatalogUnavailableError``
-        when its family package is missing) with the worker's one-line message; the
-        worker's traceback is logged here at DEBUG. A load that fails here, or takes
+        Returns the worker's ``{"model_id", "device", "fingerprint"}``. A model the
+        worker refused (a catalog model it cannot build, or a registered class whose
+        weights do not load strictly) raises ``catalog.CatalogError``
+        (``CatalogUnavailableError`` when a catalog family package is missing) with the
+        worker's one-line message; the worker's traceback is logged here at DEBUG. A load that fails here, or takes
         longer than ``RPC_LOAD_TIMEOUT_SECONDS``, is abandoned in the worker.
         """
 

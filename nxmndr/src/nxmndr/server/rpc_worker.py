@@ -16,10 +16,11 @@ server stopped waiting for is abandoned (``_rpc_unload(model_id, True)``): torch
 not cancel the call, so the worker drops that model when its build ends.
 
 A catalog model that cannot be built as requested (``nxmndr.models.catalog.CatalogError``:
-weights that do not match the class or its arguments, a missing family package) is
-returned as a refusal, not raised: torch RPC would re-raise the error in the server
-with this process's traceback in its message. ``RpcWorkerManager.load`` raises it
-there again with the one-line message and logs the traceback at DEBUG.
+weights that do not match the class or its arguments, a missing family package), or a
+registered class whose weights file does not load strictly, is returned as a refusal,
+not raised: torch RPC would re-raise the error in the server with this process's
+traceback in its message. ``RpcWorkerManager.load`` raises it there again with the
+one-line message and logs the traceback at DEBUG.
 
 External mode: ``python -m nxmndr.server.rpc_worker --master <server address>`` runs
 this worker by hand, on the server's host or another one, for a server started with
@@ -33,6 +34,7 @@ import socket
 import threading
 import time
 import traceback
+from collections.abc import Mapping
 from datetime import timedelta
 from pathlib import Path
 from typing import Optional
@@ -112,9 +114,8 @@ def _load_model(model_spec, device: str = "cpu"):
         model = model_class()
         # Loaded on the CPU, then moved once below with the model (as catalog models are),
         # rather than read onto the GPU, copied into CPU parameters and moved back.
-        model.load_state_dict(
-            torch.load(model_path, map_location="cpu", weights_only=True), strict=False
-        )
+        state = torch.load(model_path, map_location="cpu", weights_only=True)
+        _load_state_strict(model, state, model_class, model_path)
     else:
         raise TypeError(
             f"model_class {model_class!r} is not a PyTorch model class or a catalog name; the "
@@ -126,6 +127,27 @@ def _load_model(model_spec, device: str = "cpu"):
         model.to(target)
     model.eval()
     return model, fingerprint
+
+
+def _load_state_strict(model, state, model_class, model_path) -> None:
+    """Load ``state`` into ``model`` with strict=True, as catalog models load.
+
+    A file that lacks entries would leave those layers randomly initialized and the
+    model would serve their output. A mismatch is a refusal: ``catalog.CatalogError``
+    with one line (the class, the first differing entry and the counts), which the
+    server answers with INVALID_ARGUMENT.
+    """
+
+    from ..models import catalog
+
+    name = getattr(model_class, "__qualname__", str(model_class))
+    if isinstance(state, Mapping) and all(torch.is_tensor(v) for v in state.values()):
+        mismatch = catalog._mismatch(model.state_dict(), state)
+        if mismatch:
+            raise catalog.CatalogError(
+                f"weights file {model_path} does not match {name} (strict load): {mismatch}"
+            )
+    model.load_state_dict(state, strict=True)
 
 
 def configure_cudnn() -> None:
@@ -224,7 +246,8 @@ def _rpc_load(model_id, spec, device=None):
     ``catalog_args``), ``model_path`` and ``name``, as a mapping or as attributes. A
     model ID that is loaded or loading is refused, so one ID never names two models.
     A catalog model's result also has ``catalog`` (``CatalogModel.catalog_info``).
-    A catalog model that cannot be built is not loaded; the result is then
+    A catalog model that cannot be built, or a registered class whose weights do not
+    load strictly, is not loaded; the result is then
     ``{"model_id", "refused": {"message", "unavailable", "traceback"}}``, with the
     ``CatalogError`` message and whether its family package is missing.
     A load the server abandoned (``_rpc_unload(model_id, True)``) before it arrived or
