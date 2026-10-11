@@ -11,14 +11,16 @@ Rules the implementation keeps:
 * ``resident + reserved <= capacity`` at all times. Device replicas and aux
   resources are part of their record and do not use capacity.
 * A record is pinned while an open session is bound to it or an execution lease
-  on it is unreleased. Pinned records are never evicted, unloaded or overwritten.
+  on it is unreleased. Pinned records are never evicted or overwritten, and only
+  shutdown disposes them.
   Holding a Python reference to a record is not a pin.
 * Equal keys share one record, so several ``load`` callers can hold one model ID.
   Each ``load`` adds a load reference to the record it returns and each ``unload``
-  releases one; the record is disposed only with its last reference. A record with
-  a load reference is never overwritten. Load references are not pins: LRU eviction
-  ignores them, because a caller that never unloads would otherwise hold its cache
-  slot until the server stops.
+  releases one. An ``unload`` that leaves no load reference disposes the record at
+  once if it is not pinned, else when its last pin is released, unless a ``load``
+  adds a reference first. A record with a load reference is never overwritten. Load
+  references are not pins: LRU eviction ignores them, because a caller that never
+  unloads would otherwise hold its cache slot until the server stops.
 * A distinct load at full capacity evicts the least recently used unpinned
   record. If every slot is pinned or reserved it raises ``CacheExhaustedError``
   before it loads or evicts anything.
@@ -97,7 +99,7 @@ class CacheExhaustedError(ModelCacheError):
 
 
 class ModelInUseError(ModelCacheError):
-    """Unload of a pinned record's last load reference, or overwrite of a record in use."""
+    """Overwrite of a record that is pinned or has a load reference."""
 
 
 class UnknownModelError(ModelCacheError, KeyError):
@@ -524,7 +526,7 @@ class ExecutionLease:
 
 
 class _Entry:
-    __slots__ = ("record", "key", "sessions", "executions", "handoffs", "loads")
+    __slots__ = ("record", "key", "sessions", "executions", "handoffs", "loads", "unloaded")
 
     def __init__(self, record: ModelRecord, key: ModelCacheKey) -> None:
         self.record = record
@@ -537,6 +539,9 @@ class _Entry:
         # load() calls that returned this record minus unload() calls that released
         # one. Not a pin: eviction ignores it.
         self.loads = 0
+        # unload() left no load reference while the record was pinned: it is disposed
+        # when its last pin is released. A new load reference clears it.
+        self.unloaded = False
 
     def pins(self) -> int:
         return len(self.sessions) + len(self.executions)
@@ -656,6 +661,7 @@ class ModelCache:
                             self._bind_session(session_id, entry)
                         else:
                             entry.loads += 1
+                            entry.unloaded = False
                         return model_id, True, False
                     if entry.loads or not entry.evictable():
                         raise ModelInUseError(
@@ -687,6 +693,7 @@ class ModelCache:
                         self._bind_session(session_id, entry)
                     else:
                         entry.loads += 1
+                        entry.unloaded = False
                     return pending.model_id, False, False
                 if len(self._records) + len(self._loading) >= self._capacity:
                     victim = self._lru_evictable()
@@ -815,10 +822,12 @@ class ModelCache:
 
         if reason not in SESSION_CLOSE_REASONS:
             raise ValueError(f"unknown close reason {reason!r}")
+        freed: List[ModelRecord] = []
         with self._cond:
-            closed = self._close_locked(session_id, reason, self._clock())
+            closed = self._close_locked(session_id, reason, self._clock(), freed)
         if closed:
             logger.info("session %s %s", session_id, reason)
+        self._dispose_unloaded(freed)
         return closed
 
     def touch_session(self, session_id: str) -> None:
@@ -844,6 +853,7 @@ class ModelCache:
         tombstones older than the TTL. Returns the expired session IDs.
         """
 
+        freed: List[ModelRecord] = []
         with self._cond:
             now = self._clock()
             expired = [
@@ -852,12 +862,13 @@ class ModelCache:
                 if session.active == 0 and now - session.last_activity > self._ttl
             ]
             for sid in expired:
-                self._close_locked(sid, "expired", now)
+                self._close_locked(sid, "expired", now, freed)
             for sid, (_, closed_at) in list(self._tombstones.items()):
                 if now - closed_at > self._ttl:
                     del self._tombstones[sid]
         for sid in expired:
             logger.info("session %s expired", sid)
+        self._dispose_unloaded(freed)
         return expired
 
     # ---- execution ------------------------------------------------------
@@ -888,6 +899,7 @@ class ModelCache:
         return lease
 
     def _release_execution(self, lease: ExecutionLease) -> None:
+        freed: List[ModelRecord] = []
         with self._cond:
             if lease._released:
                 return
@@ -895,41 +907,52 @@ class ModelCache:
             entry = self._records.get(lease.model_id)
             if entry is not None:
                 entry.executions.discard(lease.lease_id)
+                self._take_unloaded(entry, freed)
             self._live_executions -= 1
             if lease._session is not None:
                 lease._session.active -= 1
                 lease._session.last_activity = self._clock()
             self._cond.notify_all()
         logger.debug("released execution lease %s", lease.lease_id)
+        self._dispose_unloaded(freed)
 
     # ---- unload and introspection ---------------------------------------
 
-    def unload(self, model_id: str) -> bool:
-        """Release one load reference; dispose the record with the last one (UnloadModel).
+    def unload(self, model_id: str) -> str:
+        """Release one load reference of a resident record (UnloadModel).
 
-        False if ``model_id`` is not resident. The last reference of a pinned record
-        raises ``ModelInUseError`` and releases nothing. A record that only sessions
-        loaded has no load reference, so unloading it is unloading its last one.
+        Returns ``"unknown"`` if ``model_id`` is not resident, ``"released"`` while
+        other load references remain, ``"unloaded"`` if the record was disposed now,
+        and ``"pending"`` if no load reference remains but the record is in use (pinned,
+        or not yet picked up by a load that waited for it): it is disposed when its
+        last pin is released, unless a ``load`` adds a reference first. A record that
+        only sessions loaded has no load reference, so unloading it releases none and
+        leaves none.
         """
 
         with self._cond:
             entry = self._records.get(model_id)
             if entry is None:
-                return False
-            remaining = 0
-            if entry.loads > 1:
+                return "unknown"
+            if entry.loads:
                 entry.loads -= 1
-                remaining = entry.loads
-            elif not entry.evictable():
-                raise ModelInUseError(f"model {model_id} is in use ({entry.pins()} pins)")
-            else:
+            if entry.loads:
+                outcome = "released"
+            elif entry.evictable():
                 self._remove_entry(model_id)
-        if remaining:
+                outcome = "unloaded"
+            else:
+                entry.unloaded = True
+                outcome = "pending"
+            remaining = entry.loads
+        if outcome == "released":
             logger.info("released a load reference of model %s (%d remain)", model_id, remaining)
-            return True
-        self._dispose_record(entry.record)
-        logger.info("unloaded model %s", model_id)
-        return True
+        elif outcome == "pending":
+            logger.info("model %s is unloaded when its last pin is released", model_id)
+        else:
+            self._dispose_record(entry.record)
+            logger.info("unloaded model %s", model_id)
+        return outcome
 
     def get(self, model_id: str) -> Optional[ModelRecord]:
         """Peek at a resident record. Does not pin it or change recency."""
@@ -978,7 +1001,7 @@ class ModelCache:
             self._state = "draining"
             now = self._clock()
             for sid in list(self._sessions):
-                self._close_locked(sid, "shutdown", now)
+                self._close_locked(sid, "shutdown", now, [])  # every record is disposed below
             self._cond.notify_all()
             deadline = (
                 None if drain_timeout_s is None else time.monotonic() + max(0.0, drain_timeout_s)
@@ -1076,16 +1099,35 @@ class ModelCache:
         self._records.move_to_end(model_id)
         logger.info("session %s opened on model %s", session_id, model_id)
 
-    def _close_locked(self, session_id: str, reason: str, now: float) -> bool:
+    def _close_locked(
+        self, session_id: str, reason: str, now: float, freed: List[ModelRecord]
+    ) -> bool:
         session = self._sessions.pop(session_id, None)
         if session is None:
             return False
         entry = self._records.get(session.model_id)
         if entry is not None:
             entry.sessions.discard(session_id)
+            self._take_unloaded(entry, freed)
         self._tombstones[session_id] = (reason, now)
         self._cond.notify_all()
         return True
+
+    def _take_unloaded(self, entry: _Entry, freed: List[ModelRecord]) -> None:
+        """Remove an unloaded entry whose last pin was just released; append its record
+        to ``freed``, which the caller disposes outside the lock. Shutdown disposes every
+        record itself, so nothing is taken once it has started."""
+
+        if entry.unloaded and entry.evictable() and self._state == "running":
+            self._remove_entry(entry.record.model_id)
+            freed.append(entry.record)
+
+    def _dispose_unloaded(self, records: List[ModelRecord]) -> None:
+        """Dispose records taken by ``_take_unloaded`` (outside the global lock)."""
+
+        for record in records:
+            self._dispose_record(record)
+            logger.info("unloaded model %s", record.model_id)
 
     def _dispose_record(self, record: ModelRecord) -> None:
         """Dispose outside the global lock."""

@@ -18,7 +18,6 @@ from nxmndr.server.managers import (
     SESSION_CLOSE_REASONS,
     CacheExhaustedError,
     CacheShutdownError,
-    ModelInUseError,
     ModelLoadError,
     SessionClosedError,
 )
@@ -98,9 +97,9 @@ def test_coalesced_loads_each_hold_a_load_reference():
     loader.gate.set()
     runner.join()
     [model_id] = {result.model_id for _, result in runner.results.values()}
-    assert manager.unload(model_id) is True and manager.unload(model_id) is True
+    assert manager.unload(model_id) == manager.unload(model_id) == "released"
     assert manager.get(model_id) is not None and loader.records[0].dispose_calls == 0
-    assert manager.unload(model_id) is True  # the third and last reference
+    assert manager.unload(model_id) == "unloaded"  # the third and last reference
     assert manager.get(model_id) is None and loader.records[0].dispose_calls == 1
 
 
@@ -331,7 +330,7 @@ def test_close_racing_a_running_call_releases_each_pin_once():
         manager.acquire_execution(session_id="s1")
     lease.release()
     assert manager.pin_count(a) == 0
-    assert manager.unload(a) is True and loader.records[0].dispose_calls == 1
+    assert manager.unload(a) == "unloaded" and loader.records[0].dispose_calls == 1
 
 
 def test_randomised_workload_keeps_every_invariant():
@@ -380,7 +379,7 @@ def test_randomised_workload_keeps_every_invariant():
                 else:
                     clock.advance(20)
                     manager.expire_sessions()
-            except (CacheExhaustedError, ModelInUseError, SessionClosedError):
+            except (CacheExhaustedError, SessionClosedError):
                 pass  # SessionClosedError: expired between open and acquire
             except KeyError:
                 pass  # UnknownModelError: evicted between load and acquire

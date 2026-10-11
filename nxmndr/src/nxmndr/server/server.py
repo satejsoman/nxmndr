@@ -765,18 +765,17 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
 
     def UnloadModel(self, request, context):
         mid = request.model_id
-        try:
-            unloaded = self.model_manager.unload(mid)
-        except managers.ModelInUseError as e:
-            context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
-            context.set_details(str(e))
-            return inference_pb2.UnloadModelResponse(success=False, message=f"model in use: {e}")
-        if unloaded and self.model_manager.get(mid) is not None:
+        outcome = self.model_manager.unload(mid)
+        if outcome == "released":
             # Another LoadModel caller still holds it; it is freed when the last one unloads.
             return inference_pb2.UnloadModelResponse(
                 success=True, message=f"released {mid}; still loaded for other callers"
             )
-        if unloaded:
+        if outcome == "pending":
+            return inference_pb2.UnloadModelResponse(
+                success=True, message=f"released {mid}; freed when its sessions and calls end"
+            )
+        if outcome == "unloaded":
             return inference_pb2.UnloadModelResponse(success=True, message=f"unloaded {mid}")
         return inference_pb2.UnloadModelResponse(success=False, message="unknown model_id")
 

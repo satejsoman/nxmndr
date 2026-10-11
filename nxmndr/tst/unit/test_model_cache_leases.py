@@ -260,21 +260,19 @@ def test_all_pinned_capacity_raises_retryable_error_without_side_effects():
 # ---------------------------------------------------------------------------
 
 
-def test_unload_refuses_pinned_records_and_disposes_once():
+def test_unload_of_a_pinned_record_disposes_it_when_the_last_pin_is_released():
     manager, loader, _ = make_manager()
-    assert manager.unload("no-such-model") is False
+    assert manager.unload("no-such-model") == "unknown"
     a = manager.open_session("s1", model_spec=spec(), key=key("A")).model_id
-    with pytest.raises(ModelInUseError):
-        manager.unload(a)
-    manager.close_session("s1", reason="closed")
     lease = manager.acquire_execution(model_id=a)
-    with pytest.raises(ModelInUseError):
-        manager.unload(a)
-    assert manager.get(a) is not None and loader.records[0].dispose_calls == 0
+    assert manager.unload(a) == "pending"  # a session-only record: no reference to release
+    manager.close_session("s1", reason="closed")
+    assert manager.get(a) is not None and loader.records[0].dispose_calls == 0  # the call
     lease.release()
-    assert manager.unload(a) is True
     assert manager.get(a) is None and loader.records[0].dispose_calls == 1
-    assert manager.unload(a) is False and loader.records[0].dispose_calls == 1
+    assert manager.unload(a) == "unknown" and loader.records[0].dispose_calls == 1
+    b = manager.load(spec(), key=key("B")).model_id
+    assert manager.unload(b) == "unloaded" and loader.records[1].dispose_calls == 1
     assert _no_violations(loader) == []
 
 
@@ -282,25 +280,59 @@ def test_unload_releases_one_load_reference_of_a_shared_model():
     manager, loader, _ = make_manager()
     a = manager.load(spec(), key=key("A")).model_id  # client A
     assert manager.load(spec(), key=key("A")).model_id == a  # client B: cache hit
-    assert manager.unload(a) is True  # A is done
+    assert manager.unload(a) == "released"  # A is done
     assert manager.get(a) is not None and loader.records[0].dispose_calls == 0
     manager.acquire_execution(model_id=a).release()  # B still predicts
-    assert manager.unload(a) is True  # B is done: the last reference
+    assert manager.unload(a) == "unloaded"  # B is done: the last reference
     assert manager.get(a) is None and loader.records[0].dispose_calls == 1
-    assert manager.unload(a) is False
+    assert manager.unload(a) == "unknown"
     assert _no_violations(loader) == []
 
 
-def test_last_load_reference_of_a_pinned_record_is_refused():
+def test_last_load_reference_of_a_pinned_record_is_released_and_the_record_freed_later():
     manager, loader, _ = make_manager()
     a = manager.load(spec(), key=key("A")).model_id
     manager.load(spec(), key=key("A"))
     manager.open_session("s1", model_id=a)
-    assert manager.unload(a) is True  # another load reference remains
+    assert manager.unload(a) == "released"  # another load reference remains
+    assert manager.unload(a) == "pending"  # the last one, while the session pins the record
     with pytest.raises(ModelInUseError):
-        manager.unload(a)  # the last one, while the session pins the record
+        manager.load(spec(), key=key("A"), overwrite=True)  # the session still pins it
+    assert manager.get(a) is not None and loader.records[0].dispose_calls == 0
     manager.close_session("s1", reason="closed")
-    assert manager.unload(a) is True  # the refused reference was kept
+    assert manager.get(a) is None and loader.records[0].dispose_calls == 1
+
+
+def test_overwrite_works_once_the_session_of_an_unloaded_record_closes():
+    manager, loader, _ = make_manager()
+    a = manager.load(spec(), key=key("A")).model_id  # client A: LoadModel
+    manager.open_session("s-b", model_spec=spec(), key=key("A"))  # client B: by spec
+    assert manager.unload(a) == "pending"  # A is done while B's session runs
+    manager.close_session("s-b", reason="closed")  # B is done
+    assert manager.get(a) is None and loader.records[0].dispose_calls == 1
+    fresh = manager.load(spec(), key=key("A"), overwrite=True)
+    assert fresh.model_id != a and fresh.cache_hit is False and len(loader.calls) == 2
+    assert _no_violations(loader) == []
+
+
+def test_a_load_reference_added_after_the_last_unload_keeps_the_record():
+    manager, loader, _ = make_manager()
+    a = manager.load(spec(), key=key("A")).model_id
+    lease = manager.acquire_execution(model_id=a)
+    assert manager.unload(a) == "pending"
+    assert manager.load(spec(), key=key("A")).model_id == a  # a new caller: cache hit
+    lease.release()
+    assert manager.get(a) is not None and loader.records[0].dispose_calls == 0
+    assert manager.unload(a) == "unloaded" and loader.records[0].dispose_calls == 1
+
+
+def test_session_expiry_frees_an_unloaded_record():
+    manager, loader, clock = make_manager(ttl=10)
+    a = manager.load(spec(), key=key("A")).model_id
+    manager.open_session("s1", model_id=a)
+    assert manager.unload(a) == "pending"
+    clock.advance(11)
+    assert manager.expire_sessions() == ["s1"]
     assert manager.get(a) is None and loader.records[0].dispose_calls == 1
 
 
@@ -311,7 +343,7 @@ def test_overwrite_refuses_a_record_that_a_load_reference_holds():
         manager.load(spec(), key=key("A"), overwrite=True)  # client A
     assert manager.get(held) is not None and loader.records[0].dispose_calls == 0
     manager.acquire_execution(model_id=held).release()  # B still predicts
-    assert manager.unload(held) is True and loader.records[0].dispose_calls == 1
+    assert manager.unload(held) == "unloaded" and loader.records[0].dispose_calls == 1
     fresh = manager.load(spec(), key=key("A"), overwrite=True)  # not resident: plain load
     assert fresh.model_id != held and fresh.cache_hit is False and len(loader.calls) == 2
     assert _no_violations(loader) == []
@@ -576,7 +608,7 @@ def test_aux_resource_is_created_once_per_record_and_disposed_with_it():
     assert manager.stats().resident == 1  # aux resources use no cache slot
     ref = weakref.ref(tracker)
     del tracker
-    assert manager.unload(a) is True
+    assert manager.unload(a) == "unloaded"
     gc.collect()
     assert ref() is None
 
@@ -631,7 +663,7 @@ def test_aux_resources_are_disposed_once_in_the_disposing_thread(caplog):
     assert calls == []  # nothing is disposed while the record lives
 
     caplog.set_level(logging.WARNING)
-    assert manager.unload(a) is True  # the failing resource does not raise here
+    assert manager.unload(a) == "unloaded"  # the failing resource does not raise here
     me = threading.get_ident()
     assert sorted(calls) == sorted(
         [("both", "dispose", me), ("close-only", "close", me), ("failing", "dispose", me)]
@@ -709,7 +741,7 @@ def test_shutdown_closes_sessions_and_disposes_every_record_once():
     with pytest.raises(CacheShutdownError):
         manager.acquire_execution(model_id=a)
     assert manager.close_session("s1", reason="closed") is False
-    assert manager.unload(a) is False
+    assert manager.unload(a) == "unknown"
     manager.shutdown()  # repeated cleanup is safe
     assert [r.dispose_calls for r in loader.records] == [1, 1, 1]
     assert _no_violations(loader) == []

@@ -551,18 +551,13 @@ def test_prediction_running_when_its_session_closes(tmp_path, loader, gated):
         closed = control.close_session("sess-run")
         assert closed.status == "closed"
         assert h.manager.pin_count(mid) == 1  # execution lease outlives the session
-        with pytest.raises(InferenceGrpcError) as err:
-            control._with_retry(
-                lambda: control._get_stub().UnloadModel(inference_pb2.UnloadModelRequest(model_id=mid))
-            )
-        assert err.value.code == grpc.StatusCode.FAILED_PRECONDITION
+        resp = control._get_stub().UnloadModel(inference_pb2.UnloadModelRequest(model_id=mid))
+        assert resp.success and h.manager.get(mid) is not None  # freed when the call ends
 
         gated.release.set()
         consumer.join(timeout=10)
         assert errors == [] and [r.metadata.get("error") for r in got] == [None]
-        assert wait_until(lambda: h.manager.pin_count(mid) == 0)
-        resp = control._get_stub().UnloadModel(inference_pb2.UnloadModelRequest(model_id=mid))
-        assert resp.success and h.manager.get(mid) is None
+        assert wait_until(lambda: h.manager.get(mid) is None)
 
 
 def test_capabilities_advertise_stream_context_and_limits(tmp_path, loader):

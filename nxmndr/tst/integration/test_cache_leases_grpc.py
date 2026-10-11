@@ -10,8 +10,9 @@ running when its session closes keeps its record alive until the call returns,
 after which the record is disposed exactly once.
 
 Also over gRPC: two clients that load an equal spec share one model ID, and one
-client's UnloadModel or overwrite does not take the model from the other; and a
-local model file rewritten in place is loaded again.
+client's UnloadModel or overwrite does not take the model from the other; an
+UnloadModel while a session uses the model succeeds and the model is freed when the
+session closes; and a local model file rewritten in place is loaded again.
 """
 
 from __future__ import annotations
@@ -166,6 +167,25 @@ def test_unload_by_one_client_keeps_the_model_for_another(tmp_path):
         unloaded = b._get_stub().UnloadModel(inference_pb2.UnloadModelRequest(model_id=mid))
         assert unloaded.success and h.manager.get(mid) is None
         assert record.dispose_calls == 1
+
+
+def test_unload_while_a_session_uses_the_model_frees_it_when_the_session_closes(tmp_path):
+    loader = _Loader({"double://shared": SegLogitsModel})
+    spec = inference_pb2.ModelSpec(
+        format=inference_pb2.ONNX, source="double://shared", task=inference_pb2.SEGMENTATION
+    )
+    with running_server(tmp_path, loader=loader) as h, h.client() as a, h.client() as b:
+        mid = _load(a, "double://shared")
+        _open(b, "s-b", mid)
+        [record] = loader.records["double://shared"]
+        reply = a._get_stub().UnloadModel(inference_pb2.UnloadModelRequest(model_id=mid))
+        assert reply.success and "freed when its sessions and calls end" in reply.message
+        _predict(b, "s-b")  # the session still runs on the model
+        assert record.dispose_calls == 0
+        assert b.close_session("s-b").status == "closed"
+        assert h.manager.get(mid) is None and record.dispose_calls == 1
+        fresh = a._get_stub().LoadModel(inference_pb2.LoadModelRequest(spec=spec, overwrite=True))
+        assert fresh.success and fresh.model_id != mid
 
 
 def test_overwrite_of_a_model_another_client_holds_is_refused(tmp_path):
