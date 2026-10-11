@@ -29,6 +29,7 @@ this worker by hand, on the server's host or another one, for a server started w
 
 import argparse
 import hashlib
+import itertools
 import os
 import socket
 import threading
@@ -182,10 +183,30 @@ def configure_cudnn() -> None:
 
 
 def _model_device(model) -> str:
+    """The device of the model's first parameter, else of its first buffer, else cpu."""
+
     try:
-        return str(next(model.parameters()).device)
-    except Exception:
+        return str(next(itertools.chain(model.parameters(), model.buffers())).device)
+    except Exception:  # neither, or not a torch module
         return "cpu"
+
+
+def _to_cpu(value):
+    """``value`` with every tensor in it on the CPU, also inside dicts, lists and tuples.
+
+    TensorPipe sends CPU tensors only (the RPC group sets no device map), so a model
+    output left on the GPU would fail the call.
+    """
+
+    if torch.is_tensor(value):
+        return value.detach().cpu() if value.device.type != "cpu" else value
+    if isinstance(value, dict):
+        return {key: _to_cpu(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_to_cpu(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_to_cpu(item) for item in value)
+    return value
 
 
 def _fingerprint(model) -> str:
@@ -373,17 +394,12 @@ def _rpc_infer(model_id, tensor, device_hint="cpu"):
     if entry is None:
         raise UnknownModelError(f"model {model_id} is not loaded in the PyTorch RPC worker")
     model = entry.model
-    try:
-        model_device = next(model.parameters()).device
-    except Exception:
-        model_device = torch.device("cpu")
+    model_device = torch.device(_model_device(model))
     if model_device != tensor.device:  # the model's device in this worker decides
         tensor = tensor.to(model_device)
     with torch.no_grad():
         out = model(tensor)
-    if torch.is_tensor(out) and out.device.type != "cpu":
-        out = out.detach().cpu()
-    return out
+    return _to_cpu(out)
 
 
 def _rpc_stop(graceful=True):

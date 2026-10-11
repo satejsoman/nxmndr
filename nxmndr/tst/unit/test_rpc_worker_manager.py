@@ -16,6 +16,8 @@
 - The spawned worker gets the first GPU of the server's device plan and the cuDNN policy.
 - A load that fails or times out in the server is abandoned in the worker, which drops
   the model when its build ends; the fingerprint is taken before the model moves.
+- A model's device is that of its parameters, else of its buffers; the input moves there
+  and every output tensor, also inside a dict, list or tuple, comes back on the CPU.
 - After a stopped server, a later one in the process is refused with the reason.
 - The RPC group listens on loopback unless MASTER_ADDR names another address.
 - An external worker's report connection stays open: when it closes, the worker counts
@@ -476,6 +478,64 @@ def test_the_fingerprint_is_taken_on_the_cpu_before_the_model_moves(monkeypatch,
         assert rpc_worker._rpc_status()["models"]["unit-fp"]["fingerprint"] == taken[0]
     finally:
         rpc_worker._rpc_unload("unit-fp")
+
+
+def test_a_model_device_comes_from_its_parameters_then_its_buffers():
+    import torch
+
+    class BufferOnly(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("bias", torch.zeros((), device="meta"))  # stands for a GPU
+
+    assert rpc_worker._model_device(BufferOnly()) == "meta"
+    assert rpc_worker._model_device(AddConst().to("meta")) == "meta"
+    assert rpc_worker._model_device(torch.nn.Identity()) == "cpu"  # neither: cpu
+
+
+def _accelerator():
+    import torch
+
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cuda:0" if torch.cuda.is_available() else None
+
+
+@pytest.mark.skipif(_accelerator() is None, reason="needs an MPS or CUDA device")
+def test_on_a_gpu_the_worker_moves_the_input_and_every_output_tensor(tmp_path):
+    import torch
+
+    from tst.support import rpc_models
+
+    class BufferAddConst(torch.nn.Module):  # no parameters: the device is its buffer's
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("bias", torch.zeros(()))
+
+        def forward(self, x):
+            return x + self.bias
+
+    class NestedAddConst(AddConst):  # a dict output, with a list and a tuple inside
+        def forward(self, x):
+            y = x + self.bias
+            return {"output": y, "extra": [y * 2, (y * 3,)]}
+
+    device = _accelerator()
+    path = rpc_models.save_add_const(tmp_path / "w.pt", 1.0)
+    try:
+        for model_id, model_class in (("unit-gpu-buf", BufferAddConst), ("unit-gpu-nest", NestedAddConst)):
+            payload = {"model_class": model_class, "model_path": path, "name": "w"}
+            info = rpc_worker._rpc_load(model_id, payload, device)
+            assert info["device"].split(":")[0] == device.split(":")[0], info
+        out = rpc_worker._rpc_infer("unit-gpu-buf", torch.zeros(2), "cpu")
+        assert out.device.type == "cpu" and out.tolist() == [1.0, 1.0]
+        out = rpc_worker._rpc_infer("unit-gpu-nest", torch.zeros(2), "cpu")
+        tensors = [out["output"], out["extra"][0], out["extra"][1][0]]
+        assert [t.device.type for t in tensors] == ["cpu"] * 3  # TensorPipe sends CPU tensors only
+        assert [t.tolist() for t in tensors] == [[1.0, 1.0], [2.0, 2.0], [3.0, 3.0]]
+    finally:
+        rpc_worker._rpc_unload("unit-gpu-buf")
+        rpc_worker._rpc_unload("unit-gpu-nest")
 
 
 @pytest.mark.parametrize(
