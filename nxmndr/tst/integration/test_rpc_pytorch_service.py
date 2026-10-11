@@ -14,7 +14,7 @@ Covers worker startup (the first OpenSession starts the worker; startup failures
 are bounded and clean up the child), unary Predict and StreamPredict through the real
 RPC invocation, and two models loaded at once (they route by identity under
 concurrent pinned sessions; eviction and unload free the model in the worker; a
-reload gets a new identity).
+reload gets a new identity). A stop does not wait for a load still building in the worker.
 
 The external-worker tests start the server with ``NXMNDR_RPC_EXTERNAL_WORKER=1`` and
 the worker as a separate ``python -m nxmndr.server.rpc_worker`` process. Two put both
@@ -382,6 +382,37 @@ def test_a_load_that_times_out_leaves_no_model_in_the_worker(tmp_path, service_p
 
     stopped = proc.stop()
     assert stopped["children"] == [], stopped
+
+
+def test_stop_does_not_wait_for_a_load_still_building_in_the_worker(tmp_path, service_process):
+    weights = rpc_models.save_add_const(tmp_path / "hung.pt", 1.0)
+    proc = service_process()
+    failed = []
+
+    def load():
+        with proc.client() as client:
+            try:
+                client.load_model_result("", _spec(weights, rpc_models.HUNG_ADD_CONST_CLASS))
+            except InferenceGrpcError as exc:
+                failed.append(exc)
+
+    thread = threading.Thread(target=load, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 120
+    while True:
+        status = proc.command("status")
+        if status.get("worker", {}).get("loading") or time.monotonic() > deadline:
+            break
+        time.sleep(0.2)
+    assert status["worker"]["loading"], status  # HungAddConst sleeps 60 s in __init__
+
+    stopped = proc.stop()
+    # The stop's own bounds: grace 5 s for the gRPC calls and 5 s for the cache, then
+    # the worker's _rpc_stop and its bounded terminate. Far below the 60 s load.
+    assert stopped["seconds"] < 30.0, stopped
+    assert stopped["state"] == "stopped" and stopped["children"] == [], stopped
+    thread.join(timeout=30)
+    assert len(failed) == 1, failed  # the server ended the load's call
 
 
 def test_the_rendezvous_store_listens_on_the_rpc_address_only(tmp_path, service_process):

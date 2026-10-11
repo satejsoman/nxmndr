@@ -154,9 +154,10 @@ def stream_max_chunk_bytes() -> int:
 def _shutdown_rpc_driver_if_needed():
     """At exit: stop this process's PyTorch RPC worker, then drop any leftover RPC state.
 
-    The worker is stopped first (``_rpc_stop``, then a bounded graceful shutdown on
-    both ranks). A leftover agent is shut down locally, never gracefully, because a
-    graceful shutdown waits without limit for a peer that may be gone.
+    The worker is stopped first (``_rpc_stop``, then a graceful shutdown on both ranks,
+    or a local one on each while a call is in flight). A leftover agent is shut down
+    locally, never gracefully, because a graceful shutdown waits without limit for a
+    peer that may be gone.
     """
 
     try:

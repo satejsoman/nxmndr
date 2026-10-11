@@ -18,7 +18,8 @@ Then one reply per stdin command:
 - ``load_timeout <seconds>``: the bound on each later model load in the worker
   (``managers.RPC_LOAD_TIMEOUT_SECONDS``).
 - ``stop`` (or end of input): ``stop_server``, which also stops the RPC worker;
-  replies with the manager's state and the live worker children afterwards and exits.
+  replies with the manager's state, the live worker children afterwards and the
+  seconds ``stop_server`` took, and exits.
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ import json
 import multiprocessing
 import os
 import sys
+import time
 
 
 def _say(payload) -> None:
@@ -86,8 +88,10 @@ def main() -> int:
             _say({"load_timeout": managers.RPC_LOAD_TIMEOUT_SECONDS})
         elif words[0] == "stop":
             break
+    started = time.monotonic()
     stop_server(server, service, grace=5.0)
-    _say({"stopped": True, "state": rpc._state, "children": _children()})
+    seconds = round(time.monotonic() - started, 2)
+    _say({"stopped": True, "state": rpc._state, "children": _children(), "seconds": seconds})
     return 0
 
 

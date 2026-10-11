@@ -9,7 +9,8 @@ classes and process targets by reference.
 ``AddConst`` returns its input plus a scalar ``bias`` read from the weights file, so
 two weights files give two models with distinguishable outputs from one class.
 ``SleepyAddConst`` first sleeps for the ``delay`` seconds in its weights file.
-``SlowAddConst`` takes 3 s to construct (a slow load); ``GatedAddConst`` sets
+``SlowAddConst`` takes 3 s to construct (a slow load); ``HungAddConst`` takes 60 s
+(a load still building when the server stops); ``GatedAddConst`` sets
 ``GATED_STARTED`` when its construction starts and waits for ``GATED_RELEASE``, so a
 test can act while a load is in progress.
 The ``*_worker`` functions replace ``RpcWorkerManager.worker_target`` to make the
@@ -27,6 +28,7 @@ import torch
 ADD_CONST_CLASS = "nxmndr_test_add_const"
 SLEEPY_ADD_CONST_CLASS = "nxmndr_test_sleepy_add_const"
 SLOW_ADD_CONST_CLASS = "nxmndr_test_slow_add_const"
+HUNG_ADD_CONST_CLASS = "nxmndr_test_hung_add_const"
 GATED_STARTED = threading.Event()
 GATED_RELEASE = threading.Event()
 
@@ -56,6 +58,12 @@ class SlowAddConst(AddConst):
         super().__init__()
 
 
+class HungAddConst(AddConst):
+    def __init__(self):
+        time.sleep(60.0)
+        super().__init__()
+
+
 class GatedAddConst(AddConst):
     def __init__(self):
         GATED_STARTED.set()
@@ -79,6 +87,7 @@ def register() -> None:
     register_pytorch_model(ADD_CONST_CLASS, AddConst)
     register_pytorch_model(SLEEPY_ADD_CONST_CLASS, SleepyAddConst)
     register_pytorch_model(SLOW_ADD_CONST_CLASS, SlowAddConst)
+    register_pytorch_model(HUNG_ADD_CONST_CLASS, HungAddConst)
 
 
 def crashing_worker(master_addr, master_port, ready_port, startup_timeout_s, device="cpu"):

@@ -386,8 +386,12 @@ def _rpc_infer(model_id, tensor, device_hint="cpu"):
     return out
 
 
-def _rpc_stop():
+def _rpc_stop(graceful=True):
+    """End the worker. ``graceful``: leave the RPC group together with the server; False:
+    leave at once, as the server does when a call is still in flight."""
+
     state = _get_worker_state()
+    state["stop_graceful"] = bool(graceful)
     state["stop_requested"] = True
     return {"status": "stopping"}
 
@@ -506,8 +510,9 @@ def run_worker(
     finally:
         logger.info("Shutting down RPC worker %s", worker_name)
         try:
-            # A graceful shutdown waits for the driver's own; an orphan has no driver.
-            rpc.shutdown(graceful=not orphaned)
+            # A graceful shutdown waits for the driver's own; an orphan has no driver,
+            # and a driver that stops with a call in flight leaves at once.
+            rpc.shutdown(graceful=not orphaned and state.get("stop_graceful", True))
         finally:
             if dist.is_available() and dist.is_initialized():  # best-effort cleanup
                 try:

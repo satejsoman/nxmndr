@@ -217,8 +217,12 @@ RPC_STARTUP_TIMEOUT_SECONDS = 60.0
 # and OpenSession, so a slow load that is still progressing lands in the model cache for
 # the client's next attempt instead of being abandoned.
 RPC_LOAD_TIMEOUT_SECONDS = 300.0
-# Stopping the worker: the _rpc_stop call, the graceful RPC shutdown and each join
-# of the child get this long (the values the earlier stop() used).
+# Stopping the worker: the _rpc_stop call and each join of the child get this long, and
+# so does the wait for the worker in a graceful RPC shutdown (the values the earlier
+# stop() used). A graceful shutdown also waits until no call of this process is in
+# flight, whatever its timeout (torch 2.11's TensorPipe agent): up to
+# RPC_LOAD_TIMEOUT_SECONDS for a load. So stop() leaves gracefully only when no call is
+# in flight, and otherwise at once on both ranks.
 RPC_STOP_TIMEOUT_SECONDS = 2.0
 # Aux resource name of a PyTorch record's model in the RPC worker.
 RPC_MODEL_RESOURCE = "pytorch_rpc_model"
@@ -424,7 +428,8 @@ class RpcWorkerManager:
 
     ``stop`` (from ``stop_server``) ends the worker for good: torch keeps per-process
     RPC state that a second group cannot reuse, so no later manager in this process
-    can start one, and it is refused with that reason.
+    can start one, and it is refused with that reason. It does not wait for a call in
+    flight (a load still building, an inference call): that call fails.
     """
 
     # The child's process target; tests replace it with a module-level function.
@@ -440,6 +445,8 @@ class RpcWorkerManager:
         device: str = "cpu",
     ):
         self._lock = threading.Lock()
+        self._calls_lock = threading.Lock()
+        self._calls = 0  # rpc_sync calls in flight (_call); stop reads it
         self._proc = None
         self._state = "idle"  # idle -> running -> stopped; "broken" after a failed rendezvous
         self._error = ""
@@ -643,12 +650,7 @@ class RpcWorkerManager:
         from .rpc_worker import _rpc_load
 
         try:
-            info = torch_rpc.rpc_sync(
-                RPC_WORKER_NAME,
-                _rpc_load,
-                args=(model_id, payload),
-                timeout=RPC_LOAD_TIMEOUT_SECONDS,
-            )
+            info = self._call(_rpc_load, (model_id, payload), timeout=RPC_LOAD_TIMEOUT_SECONDS)
         except Exception:
             # torch does not cancel a call that timed out: the build may still finish in
             # the worker. Have the worker drop model_id, now or when its build ends; a
@@ -670,13 +672,9 @@ class RpcWorkerManager:
     def infer(self, model_id: str, tensor, *, device_hint: str = "cpu", timeout: float):
         """Run the worker's model ``model_id`` (``rpc_worker.UnknownModelError`` if absent)."""
 
-        if not self.is_alive():
-            raise RpcWorkerStartError("the PyTorch RPC worker is not running")
         from .rpc_worker import _rpc_infer
 
-        return torch_rpc.rpc_sync(
-            RPC_WORKER_NAME, _rpc_infer, args=(model_id, tensor, device_hint), timeout=timeout
-        )
+        return self._call(_rpc_infer, (model_id, tensor, device_hint), timeout=timeout)
 
     def unload(self, model_id: str, *, abandon: bool = False) -> bool:
         """Free the worker's model ``model_id``. False if the worker or the model is gone.
@@ -692,7 +690,7 @@ class RpcWorkerManager:
 
         args = (model_id, True) if abandon else (model_id,)
         try:
-            return bool(torch_rpc.rpc_sync(RPC_WORKER_NAME, _rpc_unload, args=args))
+            return bool(self._call(_rpc_unload, args))
         except Exception:
             logger.warning("freeing model %s in the PyTorch RPC worker failed", model_id, exc_info=True)
             return False
@@ -700,11 +698,25 @@ class RpcWorkerManager:
     def status(self) -> Dict[str, object]:
         """The worker's ``_rpc_status()``: state, loaded model IDs with device and fingerprint."""
 
-        if not self.is_alive():
-            raise RpcWorkerStartError("the PyTorch RPC worker is not running")
         from .rpc_worker import _rpc_status
 
-        return torch_rpc.rpc_sync(RPC_WORKER_NAME, _rpc_status, args=())
+        return self._call(_rpc_status, ())
+
+    def _call(self, func, args, **kwargs):
+        """``rpc_sync`` of the worker function ``func``, counted while it runs (``stop``).
+
+        ``RpcWorkerStartError`` if the worker is not running; ``kwargs``: ``timeout``.
+        """
+
+        with self._calls_lock:
+            if not self.is_alive():
+                raise RpcWorkerStartError("the PyTorch RPC worker is not running")
+            self._calls += 1
+        try:
+            return torch_rpc.rpc_sync(RPC_WORKER_NAME, func, args=args, **kwargs)
+        finally:
+            with self._calls_lock:
+                self._calls -= 1
 
     # ---- stop ---------------------------------------------------------------
 
@@ -727,19 +739,28 @@ class RpcWorkerManager:
             if self._state == "running":
                 self._state = "stopped"
                 alive = proc is not None and proc.is_alive()
+                with self._calls_lock:  # no _call starts from here on: the state is stopped
+                    in_flight = self._calls
+                # A graceful shutdown would wait for the calls in flight (see
+                # RPC_STOP_TIMEOUT_SECONDS). The worker ends either way, so with a call in
+                # flight both ranks leave at once and that call fails.
+                graceful = alive and in_flight == 0
                 if alive:
                     from .rpc_worker import _rpc_stop
 
                     try:
                         torch_rpc.rpc_sync(
-                            RPC_WORKER_NAME, _rpc_stop, args=(), timeout=RPC_STOP_TIMEOUT_SECONDS
+                            RPC_WORKER_NAME,
+                            _rpc_stop,
+                            args=(graceful,),
+                            timeout=RPC_STOP_TIMEOUT_SECONDS,
                         )
                     except Exception:
-                        alive = False
+                        graceful = False
                         logger.warning(
                             "_rpc_stop failed; terminating the PyTorch RPC worker", exc_info=True
                         )
-                self._leave_group(graceful=alive)
+                self._leave_group(graceful=graceful)
             self._store = None
         _terminate(proc)
 

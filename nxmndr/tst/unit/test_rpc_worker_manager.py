@@ -6,6 +6,7 @@
 - Every ``rpc_sync`` call passes the worker function object, never its name
   (PyTorch rejects a string with "function should be callable").
 - A failed ``_rpc_stop`` is logged, then the child is terminated.
+- A stop does not wait for a call in flight: both ranks leave the RPC group at once.
 - A generic PyTorch record owns its worker-side model as an aux resource: disposing
   the record frees that model exactly once.
 - A catalog model the worker cannot build is returned as a refusal, raised in the
@@ -97,7 +98,8 @@ def test_rpc_calls_pass_the_worker_functions_not_their_names(monkeypatch, tmp_pa
     assert all(to == managers.RPC_WORKER_NAME for to, _, _ in calls)
     assert calls[0][2] == ("m1", {"model_class": AddConst, "model_path": str(tmp_path / "w.pt"), "name": "w"})
     assert calls[1][2] == ("m1", "tensor", "cpu")
-    assert left == [True]  # a live worker gets a graceful RPC shutdown
+    assert calls[4][2] == (True,)
+    assert left == [True]  # a live worker with no call in flight gets a graceful RPC shutdown
 
 
 def test_a_failed_rpc_stop_is_logged_then_the_worker_is_terminated(monkeypatch, caplog):
@@ -117,6 +119,47 @@ def test_a_failed_rpc_stop_is_logged_then_the_worker_is_terminated(monkeypatch, 
     assert "terminate" in proc.calls
     assert left == [False]  # no graceful shutdown with an unreachable peer
     assert manager._state == "stopped" and not manager.is_alive()
+
+
+def test_a_stop_with_a_call_in_flight_leaves_the_rpc_group_without_waiting(monkeypatch):
+    import threading
+
+    calls = []
+    started, release = threading.Event(), threading.Event()
+
+    def fake_rpc_sync(to, func, args=(), kwargs=None, timeout=None):
+        calls.append((func, args))
+        if func is rpc_worker._rpc_load:  # a load still building in the worker
+            started.set()
+            release.wait(timeout=30)
+            raise RuntimeError("pipe closed")  # what the in-flight call gets on the leave
+        return {"status": "stopping"} if func is rpc_worker._rpc_stop else False
+
+    monkeypatch.setattr(managers.torch_rpc, "rpc_sync", fake_rpc_sync)
+    manager, left = _running_manager(monkeypatch)
+    spec = PytorchModelSpec(model_class=AddConst, model_path="w.pt", name="w")
+    failed = []
+
+    def load():
+        try:
+            manager.load("m1", spec)
+        except RuntimeError as exc:
+            failed.append(str(exc))
+
+    loader = threading.Thread(target=load)
+    loader.start()
+    try:
+        assert started.wait(timeout=30)
+        manager.stop()
+    finally:
+        release.set()
+        loader.join(timeout=30)
+    # The worker is told to leave at once too, and the graceful barrier is skipped.
+    assert (rpc_worker._rpc_stop, (False,)) in calls
+    assert left == [False]
+    assert failed == ["pipe closed"]
+    with pytest.raises(managers.RpcWorkerStartError, match="not running"):
+        manager.status()  # no call starts after the stop
 
 
 def test_an_unregistered_model_class_is_refused_before_any_worker_starts(monkeypatch, tmp_path):
