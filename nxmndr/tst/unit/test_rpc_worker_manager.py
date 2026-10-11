@@ -11,6 +11,11 @@
 - A catalog model the worker cannot build is returned as a refusal, raised in the
   server as the ``CatalogError`` with its one-line message, and answered with
   INVALID_ARGUMENT (FAILED_PRECONDITION for a missing family package), never INTERNAL.
+  A registered class whose weights file does not load strictly is refused the same way.
+- The spawned worker gets the first GPU of the server's device plan and the cuDNN policy.
+- A load that fails or times out in the server is abandoned in the worker, which drops
+  the model when its build ends; the fingerprint is taken before the model moves.
+- After a stopped server, a later one in the process is refused with the reason.
 The real worker, rendezvous and routing run in tst/integration/test_rpc_pytorch_service.py.
 """
 
