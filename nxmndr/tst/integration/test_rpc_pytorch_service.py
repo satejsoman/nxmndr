@@ -17,9 +17,10 @@ identity under concurrent pinned sessions; eviction and unload free the model in
 the worker; a reload gets a new identity).
 
 The external-worker tests start the server with ``NXMNDR_RPC_EXTERNAL_WORKER=1`` and
-the worker as a separate ``python -m nxmndr.server.rpc_worker`` process, both on this
-host's non-loopback address, as a worker on a second machine would be. The rendezvous
-store of the default server listens on loopback only, not on that address.
+the worker as a separate ``python -m nxmndr.server.rpc_worker`` process. Two put both
+on this host's non-loopback address, as a worker on a second machine would be; one
+keeps the loopback default and kills the worker, whose models then become unavailable.
+The rendezvous store of the default server listens on loopback only, not on that address.
 """
 
 from __future__ import annotations
@@ -524,3 +525,32 @@ def test_external_worker_that_never_joins_fails_the_load_then_a_late_worker_serv
 
     proc.stop()
     assert worker.wait(timeout=60) == 0
+
+
+def test_an_external_worker_that_exits_makes_its_models_unavailable(
+    tmp_path, service_process, external_worker
+):
+    port = _free_port_pair("127.0.0.1")
+    weights = rpc_models.save_add_const(tmp_path / "a.pt", 1.0)
+    other = rpc_models.save_add_const(tmp_path / "b.pt", 2.0)
+    # No MASTER_ADDR: the loopback default, with the worker on this host.
+    proc = service_process(env={"NXMNDR_RPC_EXTERNAL_WORKER": "1", "MASTER_PORT": str(port)})
+    worker = external_worker("127.0.0.1", port)
+    with proc.client() as client:
+        model_id = client.load_model_result("", _spec(weights)).model_id
+        np.testing.assert_array_equal(_predict(client, model_id), CHIP + 1)
+        worker.kill()
+        worker.wait(timeout=30)
+        deadline = time.monotonic() + 10
+        while proc.command("status")["alive"] and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert proc.command("status")["alive"] is False
+        with pytest.raises(InferenceGrpcError) as gone:
+            client.predict(model_id, CHIP)
+        assert gone.value.code == grpc.StatusCode.UNAVAILABLE, str(gone.value)
+        with pytest.raises(InferenceGrpcError) as reload:
+            client.load_model_result("", _spec(other))
+        assert f"(pid {worker.pid} on 127.0.0.1) disconnected" in str(reload.value), str(
+            reload.value
+        )
+    proc.stop()

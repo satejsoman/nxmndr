@@ -17,6 +17,8 @@
   the model when its build ends; the fingerprint is taken before the model moves.
 - After a stopped server, a later one in the process is refused with the reason.
 - The RPC group listens on loopback unless MASTER_ADDR names another address.
+- An external worker's report connection stays open: when it closes, the worker counts
+  as gone and the next load names it.
 The real worker, rendezvous and routing run in tst/integration/test_rpc_pytorch_service.py.
 """
 
@@ -490,3 +492,53 @@ def test_the_rpc_group_listens_on_loopback_unless_an_address_is_given(monkeypatc
     assert managers.RpcWorkerManager(external_worker=False)._addr == "127.0.0.1"
     monkeypatch.setenv("MASTER_ADDR", "192.0.2.10")
     assert managers.RpcWorkerManager(external_worker=True)._addr == "192.0.2.10"
+
+
+def test_the_external_handshake_connection_tracks_the_worker_process():
+    import os
+    import socket
+    import threading
+    import time
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        ready_port = probe.getsockname()[1]
+    joined = {}
+
+    def wait_for_worker():
+        joined["worker"] = managers._await_external("127.0.0.1", ready_port - 1, 10.0)
+
+    waiter = threading.Thread(target=wait_for_worker)
+    waiter.start()
+    conn = rpc_worker._join_server("127.0.0.1", ready_port, 1.0)  # retries until the server listens
+    waiter.join(timeout=10)
+    worker = joined["worker"]
+    try:
+        assert worker.pid == os.getpid() and worker.host == "127.0.0.1"
+        assert worker.is_alive()
+        conn.close()  # what the OS does when the worker process exits
+        deadline = time.monotonic() + 5
+        while worker.is_alive() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not worker.is_alive()
+    finally:
+        worker.close()
+
+
+def test_a_disconnected_external_worker_fails_the_next_load_with_its_reason():
+    import socket
+
+    ours, theirs = socket.socketpair()
+    manager = managers.RpcWorkerManager(external_worker=True)
+    manager._state = "running"
+    manager._proc = managers._ExternalWorker(77, "192.0.2.9", ours)
+    try:
+        assert manager.is_alive()
+        theirs.close()
+        assert not manager.is_alive()
+        with pytest.raises(
+            managers.RpcWorkerStartError, match=r"\(pid 77 on 192\.0\.2\.9\) disconnected"
+        ):
+            manager.ensure_started()
+    finally:
+        ours.close()

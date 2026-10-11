@@ -517,21 +517,26 @@ def run_worker(
                     logger.exception("Failed destroying process group")
 
 
-def _join_server(master_addr: str, ready_port: int, timeout: float) -> None:
+def _join_server(master_addr: str, ready_port: int, timeout: float) -> socket.socket:
     """Report ``ready <pid>`` to a server waiting for an external worker; retry until ``ok``.
 
     The server listens only while a PyTorch load waits for this worker, so a worker
-    started first keeps trying, every 0.5 s.
+    started first keeps trying, every 0.5 s. Returns the open connection: the caller
+    keeps it open, unwritten, until this process exits, and the server reads its
+    closing as this worker's exit.
     """
 
     while True:
+        conn = None
         try:
-            with socket.create_connection((master_addr, ready_port), timeout=timeout) as conn:
-                conn.sendall(f"ready {os.getpid()}\n".encode("ascii"))
-                if conn.recv(16).split() == [b"ok"]:
-                    return
+            conn = socket.create_connection((master_addr, ready_port), timeout=timeout)
+            conn.sendall(f"ready {os.getpid()}\n".encode("ascii"))
+            if conn.recv(16).split() == [b"ok"]:
+                return conn
         except OSError:
             pass
+        if conn is not None:
+            conn.close()
         time.sleep(0.5)
 
 
@@ -559,16 +564,16 @@ def main(argv=None) -> int:
         parser.error("--device mps: MPS is not available on this host")
     configure_cudnn()
     logger.info("waiting for the nxmndr server at %s:%d", args.master, args.port + 1)
-    _join_server(args.master, args.port + 1, args.timeout)
-    run_worker(
-        RPC_WORKER_NAME,
-        None,
-        master_addr=args.master,
-        master_port=args.port,
-        startup_timeout_s=args.timeout,
-        device=args.device,
-        watch_parent=False,
-    )
+    with _join_server(args.master, args.port + 1, args.timeout):  # open until this worker exits
+        run_worker(
+            RPC_WORKER_NAME,
+            None,
+            master_addr=args.master,
+            master_port=args.port,
+            startup_timeout_s=args.timeout,
+            device=args.device,
+            watch_parent=False,
+        )
     return 0
 
 

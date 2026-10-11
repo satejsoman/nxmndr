@@ -257,8 +257,11 @@ def _free_port(addr: str) -> int:
 def _terminate(proc) -> None:
     """End a child process: wait, terminate, then kill, each bounded."""
 
-    if proc is None or proc.pid is None or isinstance(proc, _ExternalWorker):
-        return  # never started, or not this server's child
+    if isinstance(proc, _ExternalWorker):
+        proc.close()  # not this server's child: drop its connection; it exits on _rpc_stop
+        return
+    if proc is None or proc.pid is None:
+        return  # never started
     proc.join(timeout=RPC_STOP_TIMEOUT_SECONDS)
     if proc.is_alive():
         proc.terminate()
@@ -301,22 +304,39 @@ def _run_rpc_worker(
 class _ExternalWorker:
     """Stands in for the child process when the worker was started by hand (external mode).
 
-    This server cannot watch or end that process: it counts as alive while the RPC
-    group runs, and it exits on ``_rpc_stop``.
+    The worker keeps its handshake connection open for its whole life and never writes
+    to it after ``ready``, so the connection closing means the worker process exited.
+    A worker host that drops off the network closes nothing: RPC calls time out instead.
+    This server cannot end that process; it exits on ``_rpc_stop``.
     """
 
     exitcode = None
 
-    def __init__(self, pid: int, host: str):
+    def __init__(self, pid: int, host: str, conn: socket.socket):
         self.pid = pid
         self.host = host
+        self._conn = conn
+        conn.setblocking(False)
 
     def is_alive(self) -> bool:
-        return True
+        try:
+            # b"": the worker closed it. Stray bytes are dropped, so a later close is seen.
+            return self._conn.recv(64) != b""
+        except BlockingIOError:
+            return True  # open, nothing to read
+        except OSError:
+            return False  # reset, or closed here
+
+    def close(self) -> None:
+        self._conn.close()
 
 
 def _await_external(addr: str, port: int, timeout: float) -> _ExternalWorker:
-    """Wait on ``addr:port + 1`` for an external worker's ``ready <pid>``; answer ``ok``."""
+    """Wait on ``addr:port + 1`` for an external worker's ``ready <pid>``; answer ``ok``.
+
+    The accepted connection stays open in the returned ``_ExternalWorker``: it tracks
+    the worker process.
+    """
 
     try:
         listener = socket.create_server((addr, port + 1))
@@ -332,15 +352,15 @@ def _await_external(addr: str, port: int, timeout: float) -> _ExternalWorker:
                 conn, peer = listener.accept()
             except socket.timeout:
                 continue
-            with conn:
-                conn.settimeout(max(0.1, deadline - time.monotonic()))
-                try:
-                    line = conn.recv(64).decode("ascii", "replace").split()
-                    if len(line) == 2 and line[0] == "ready" and line[1].isdigit():
-                        conn.sendall(b"ok\n")
-                        return _ExternalWorker(int(line[1]), peer[0])
-                except OSError:
-                    pass
+            conn.settimeout(max(0.1, deadline - time.monotonic()))
+            try:
+                line = conn.recv(64).decode("ascii", "replace").split()
+                if len(line) == 2 and line[0] == "ready" and line[1].isdigit():
+                    conn.sendall(b"ok\n")
+                    return _ExternalWorker(int(line[1]), peer[0], conn)
+            except OSError:
+                pass
+            conn.close()
     raise RpcWorkerNotJoinedError(
         f"no external PyTorch RPC worker joined at {addr}:{port} within {timeout:g} s; start "
         f"one with: python -m nxmndr.server.rpc_worker --master <this host's address> --port {port}"
@@ -382,7 +402,8 @@ class RpcWorkerManager:
     External mode (``external_worker``, or ``NXMNDR_RPC_EXTERNAL_WORKER=1``): no child
     is spawned; the first phase waits for a worker started elsewhere to report to
     ``MASTER_PORT + 1`` (``_await_external``). A wait that times out raises
-    ``RpcWorkerNotJoinedError`` and a later load waits again.
+    ``RpcWorkerNotJoinedError`` and a later load waits again. The worker keeps that
+    report connection open, so its closing tells this server that the worker exited.
 
     The spawned worker builds every model on ``device``. An external worker uses its
     own ``--device``: the server's devices describe the server's host, not the worker's.
@@ -426,12 +447,22 @@ class RpcWorkerManager:
 
         with self._lock:
             if self._state == "running":
-                if self._proc is not None and self._proc.is_alive():
+                proc = self._proc
+                if proc is not None and proc.is_alive():
                     return
+                if isinstance(proc, _ExternalWorker):
+                    gone = (
+                        f"the external PyTorch RPC worker (pid {proc.pid} on {proc.host}) "
+                        "disconnected"
+                    )
+                else:
+                    gone = (
+                        "the PyTorch RPC worker exited (exit code "
+                        f"{getattr(proc, 'exitcode', None)})"
+                    )
                 raise RpcWorkerStartError(
-                    "the PyTorch RPC worker exited (exit code "
-                    f"{getattr(self._proc, 'exitcode', None)}); torch cannot rejoin an RPC "
-                    "group in this process, so restart the server to use PyTorch models"
+                    f"{gone}; torch cannot rejoin an RPC group in this process, so restart "
+                    "the server to use PyTorch models"
                 )
             if self._state == "stopped":
                 raise RpcWorkerStartError(
