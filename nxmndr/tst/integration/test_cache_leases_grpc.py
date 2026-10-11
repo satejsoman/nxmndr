@@ -12,7 +12,8 @@ after which the record is disposed exactly once.
 Also over gRPC: two clients that load an equal spec share one model ID, and one
 client's UnloadModel or overwrite does not take the model from the other; an
 UnloadModel while a session uses the model succeeds and the model is freed when the
-session closes; and a local model file rewritten in place is loaded again.
+session closes; a LoadModel whose client is gone when the load finishes keeps no
+reference; and a local model file rewritten in place is loaded again.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ import pytest
 
 from nxmndr.client import InferenceGrpcError
 from nxmndr.inference import inference_pb2
+from nxmndr.server import server
 from tst.support.grpc_harness import running_server, wait_until
 from tst.support.stream_doubles import GatedModel, SegLogitsModel
 from tst.unit.model_cache_test_utils import CountingRecord
@@ -186,6 +188,36 @@ def test_unload_while_a_session_uses_the_model_frees_it_when_the_session_closes(
         assert h.manager.get(mid) is None and record.dispose_calls == 1
         fresh = a._get_stub().LoadModel(inference_pb2.LoadModelRequest(spec=spec, overwrite=True))
         assert fresh.success and fresh.model_id != mid
+
+
+def test_a_load_whose_client_is_gone_keeps_no_reference(tmp_path, monkeypatch):
+    gate = threading.Event()
+    loader = _Loader({"double://slow": SegLogitsModel})
+
+    def gated_loader(*args):
+        gate.wait(30)
+        return loader(*args)
+
+    contexts = []
+    real = server.InferenceService.LoadModel
+
+    def recording(self, request, context):
+        contexts.append(context)
+        return real(self, request, context)
+
+    monkeypatch.setattr(server.InferenceService, "LoadModel", recording)
+    with running_server(tmp_path, loader=gated_loader) as h, h.client() as c:
+        with h.client(timeout=0.5) as short, pytest.raises(InferenceGrpcError) as err:
+            _load(short, "double://slow")
+        assert err.value.code == grpc.StatusCode.DEADLINE_EXCEEDED
+        assert wait_until(lambda: contexts and not contexts[0].is_active())
+        gate.set()  # the server finishes the load its client gave up on
+        records = loader.records["double://slow"]
+        assert wait_until(lambda: records and records[0].dispose_calls == 1)
+        assert h.manager.list_models() == {}
+        mid = _load(c, "double://slow")  # the client's retry holds the only reference
+        reply = c._get_stub().UnloadModel(inference_pb2.UnloadModelRequest(model_id=mid))
+        assert reply.success and reply.message == f"unloaded {mid}"
 
 
 def test_overwrite_of_a_model_another_client_holds_is_refused(tmp_path):

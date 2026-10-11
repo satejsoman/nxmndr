@@ -734,6 +734,19 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
                 f"cache_hit={result.cache_hit}",
                 extra={"corr_id": corr_id},
             )
+            is_active = getattr(context, "is_active", None)
+            if callable(is_active) and not is_active():
+                # The client is gone (its deadline passed or it cancelled) and never gets
+                # this model_id, so no UnloadModel would release the reference the load
+                # added. A retry gets a reference of its own.
+                outcome = self.model_manager.unload(model_id)
+                self.logger.info(
+                    "LoadModel client is gone; released model_id=%s (%s)", model_id, outcome,
+                    extra={"corr_id": corr_id},
+                )
+                return inference_pb2.LoadModelResponse(
+                    success=False, model_id="", message="the client is gone"
+                )
             self._record_registry_entry(model_id, prepared.metadata)
             return inference_pb2.LoadModelResponse(
                 success=True,
