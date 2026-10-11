@@ -12,9 +12,8 @@ given. The server never assigns instance IDs: the host gives each instance a
 job-unique ID. Within one chip the order is the model's order after group-mask
 removal.
 
-Ported from the YOLO path that the QGIS plugin ran inside QGIS before inference moved
-to a separate worker process (nxmndr-qgis ``src/inference/backends.py``,
-``_predict_tile_yolo``):
+Ported from the YOLO path that a development version of the QGIS plugin ran inside
+QGIS, before inference moved to a separate worker process:
 
 - Chip conversion (``preprocess``): a 2-D chip is one band; one band is repeated to
   three; bands after the third are dropped; two bands are refused. Data that is not
