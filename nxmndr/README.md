@@ -282,6 +282,8 @@ Key tests:
 - `tst/integration/test_rpc_pytorch.py` Torch RPC smoke test
 - `tst/integration/test_stream_predict.py` streaming prediction
 
+`tst/integration/test_model_catalog_service.py` loads and runs one catalog model per output family by default. `NXMNDR_TEST_CATALOG_SWEEP=1` runs every served catalog model; that run is slow and needs several GB of memory for the largest models (`torchvision:vit_h_14` has about 2.5 GB of weights).
+
 ## Roadmap (Excerpt)
 - Structured error envelopes (use `ErrorStatus`).
 - Model warm-up and metrics.

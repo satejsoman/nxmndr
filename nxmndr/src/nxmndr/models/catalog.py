@@ -12,8 +12,9 @@ catalog and keep their own path.
 
 Served names (:func:`list_model_classes`, the server's Capabilities entry
 ``pytorch_model_classes``) are the names this module builds and runs on one image
-chip. ``tst/integration/test_model_catalog_service.py`` loads and runs every one of
-them through the gRPC service and the RPC worker.
+chip. ``tst/integration/test_model_catalog_service.py`` loads and runs one of them
+per output family through the gRPC service and the RPC worker, and every one of them
+with ``NXMNDR_TEST_CATALOG_SWEEP=1``.
 
 - torchvision: the image classification models
   (``list_models(module=torchvision.models)``) and the semantic segmentation models

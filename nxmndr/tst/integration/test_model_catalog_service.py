@@ -21,10 +21,12 @@ mocked. Weights are random, made and saved by each test; nothing is downloaded.
   client's retries (it retries INTERNAL) do not build the model again. Unknown and
   unserved names fail with INVALID_ARGUMENT; an output that fits no family is
   INVALID_ARGUMENT (unary) or a tile error ``inference_failed``.
-- Every served name (``catalog.list_model_classes()``) loads without metadata from
+- A served name (``catalog.list_model_classes()``) loads without metadata from
   weights built with 5 classes (and 5 bands where the model takes a band count),
   runs one chip (of its ``catalog.input_size``, else 224), and returns the result
-  family and values of the direct computation.
+  family and values of the direct computation. By default this runs for one name per
+  output family (``FAMILY_REPRESENTATIVES``); ``NXMNDR_TEST_CATALOG_SWEEP=1`` runs it
+  for every served name.
 """
 
 from __future__ import annotations
@@ -32,6 +34,7 @@ from __future__ import annotations
 import gc
 import importlib.util
 import inspect
+import os
 
 import grpc
 import numpy as np
@@ -472,7 +475,37 @@ def _close(got, want):
     np.testing.assert_allclose(got, want, rtol=1e-4, atol=1e-4 * scale)
 
 
-@pytest.mark.parametrize("model_class", catalog.list_model_classes())
+# By default one model per output family runs, the one with the fewest parameters; no
+# torchvision model lacks a class head, so the embeddings family needs torchgeo. The
+# full sweep (every served name, including vit_h_14 at 631M parameters, about 2.5 GB
+# of float32 weights) runs only with NXMNDR_TEST_CATALOG_SWEEP=1.
+FULL_SWEEP = os.environ.get("NXMNDR_TEST_CATALOG_SWEEP", "").strip() == "1"
+FAMILY_REPRESENTATIVES = {
+    "torchvision:shufflenet_v2_x0_5": dispatch.OUTPUT_CLASS_VECTOR,
+    "torchvision:lraspp_mobilenet_v3_large": dispatch.OUTPUT_LABEL_MAP,
+    "torchgeo:tilenet": dispatch.OUTPUT_EMBEDDINGS,
+}
+_NOT_IN_DEFAULT_RUN = pytest.mark.skipif(
+    not FULL_SWEEP, reason="full catalog sweep: set NXMNDR_TEST_CATALOG_SWEEP=1"
+)
+
+
+def _sweep_params():
+    served = catalog.list_model_classes()
+    params = [
+        pytest.param(name, marks=() if name in FAMILY_REPRESENTATIVES else _NOT_IN_DEFAULT_RUN)
+        for name in served
+    ]
+    # A torchgeo representative without torchgeo installed shows as skipped.
+    params += [
+        pytest.param(name, marks=needs_torchgeo)
+        for name in FAMILY_REPRESENTATIVES
+        if name not in served
+    ]
+    return params
+
+
+@pytest.mark.parametrize("model_class", _sweep_params())
 def test_every_served_model_class_loads_and_runs(server, tmp_path, model_class):
     torch.manual_seed(0)
     model, size, bands = _reference(model_class)
@@ -488,6 +521,7 @@ def test_every_served_model_class_loads_and_runs(server, tmp_path, model_class):
         family = dispatch.OUTPUT_EMBEDDINGS
     else:
         family = dispatch.OUTPUT_CLASS_VECTOR if want.ndim == 2 else dispatch.OUTPUT_LABEL_MAP
+    assert FAMILY_REPRESENTATIVES.get(model_class, family) == family
 
     with server.client() as client:
         loaded = client.load_model_result("", _spec(path, model_class))  # no metadata: inferred
