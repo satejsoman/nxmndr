@@ -450,3 +450,26 @@ def test_a_registered_class_loads_strictly_and_a_mismatch_is_refused(tmp_path, s
         assert "unit-strict" not in rpc_worker._rpc_status()["models"]
     finally:
         rpc_worker._rpc_unload("unit-strict")
+
+
+@pytest.mark.parametrize("state", ["stopped", "broken"])
+def test_a_server_after_a_stopped_one_in_the_process_is_refused_with_the_reason(monkeypatch, state):
+    earlier = managers.RpcWorkerManager()
+    earlier._state = state
+    monkeypatch.setattr(managers, "_process_owner", earlier)
+    monkeypatch.setattr(managers.dist, "is_initialized", lambda: pytest.fail("torch reached"))
+    with pytest.raises(managers.RpcWorkerStartError, match="new process"):
+        managers.RpcWorkerManager().ensure_started()
+
+
+def test_the_service_shutdown_stops_the_rpc_worker_after_the_cache(tmp_path, monkeypatch):
+    from nxmndr.server import server
+
+    service = server.InferenceService(model_cache_dir=tmp_path / "cache", max_cores=1)
+    calls = []
+    monkeypatch.setattr(
+        service.model_manager, "shutdown", lambda drain_timeout_s=None: calls.append("cache")
+    )
+    monkeypatch.setattr(service.rpc_manager, "shutdown", lambda: calls.append("rpc"))
+    service.shutdown(grace=0)
+    assert calls == ["cache", "rpc"]

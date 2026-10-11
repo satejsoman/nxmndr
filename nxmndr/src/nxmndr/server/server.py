@@ -1522,11 +1522,15 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
 
     def shutdown(self, grace: float | None = SERVER_STOP_GRACE_SECONDS) -> None:
         """Stop the session expiry sweep, then close all sessions and dispose every
-        model after running predictions drain."""
+        model after running predictions drain, then stop the PyTorch RPC worker (the
+        disposal has freed its models)."""
         self._expiry_stop.set()
         if self._expiry_thread is not None:
             self._expiry_thread.join(timeout=SERVER_STOP_GRACE_SECONDS)
-        self.model_manager.shutdown(drain_timeout_s=grace)
+        try:
+            self.model_manager.shutdown(drain_timeout_s=grace)
+        finally:
+            self.rpc_manager.shutdown()
 
 
 def create_server(
@@ -1574,14 +1578,17 @@ def create_server(
 
 
 def stop_server(server, service, *, grace: float | None = SERVER_STOP_GRACE_SECONDS) -> None:
-    """Stop a server from ``create_server``: gRPC first, then the model cache.
+    """Stop a server from ``create_server``: gRPC first, then the model cache, then
+    the PyTorch RPC worker.
 
     New RPCs are refused and running ones get ``grace`` seconds (``server.stop``).
     Then ``service.shutdown`` stops the session expiry sweep, and
     ``service.model_manager.shutdown(drain_timeout_s=grace)`` closes every
     session, waits at most ``grace`` seconds for execution leases to drain and
     disposes every model. ``grace=None`` aborts running RPCs at once and waits for
-    the leases without limit.
+    the leases without limit. Last, the PyTorch RPC worker is stopped. torch allows
+    one RPC group per process, so a later server in this process cannot load generic
+    PyTorch models.
     """
     server.stop(grace).wait()
     service.shutdown(grace=grace)

@@ -39,7 +39,7 @@ class _SpyServer:
         return self._inner.stop(grace)
 
 
-def test_create_server_binds_loopback_and_stop_server_stops_grpc_then_the_cache(
+def test_create_server_binds_loopback_and_stop_server_stops_grpc_the_cache_then_the_rpc_worker(
     tmp_path, monkeypatch, caplog
 ):
     srv, port, service = server.create_server(model_cache_dir=tmp_path / "cache", max_cores=1)
@@ -78,10 +78,17 @@ def test_create_server_binds_loopback_and_stop_server_stops_grpc_then_the_cache(
             real_shutdown(drain_timeout_s=drain_timeout_s)
 
         monkeypatch.setattr(service.model_manager, "shutdown", shutdown)
+        real_rpc_shutdown = service.rpc_manager.shutdown
+
+        def rpc_shutdown():
+            calls.append(("rpc.shutdown",))
+            real_rpc_shutdown()
+
+        monkeypatch.setattr(service.rpc_manager, "shutdown", rpc_shutdown)
     finally:
         server.stop_server(_SpyServer(srv, calls), service, grace=1.5)
 
-    assert calls == [("grpc.stop", 1.5), ("cache.shutdown", 1.5)]
+    assert calls == [("grpc.stop", 1.5), ("cache.shutdown", 1.5), ("rpc.shutdown",)]
     with pytest.raises(managers.CacheShutdownError):
         service.model_manager.acquire_execution(model_id="any")
     assert not _accepts("127.0.0.1", port)

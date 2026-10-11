@@ -382,6 +382,10 @@ class RpcWorkerManager:
 
     The spawned worker builds every model on ``device``. An external worker uses its
     own ``--device``: the server's devices describe the server's host, not the worker's.
+
+    ``stop`` (from ``stop_server``) ends the worker for good: torch keeps per-process
+    RPC state that a second group cannot reuse, so no later manager in this process
+    can start one, and it is refused with that reason.
     """
 
     # The child's process target; tests replace it with a module-level function.
@@ -439,6 +443,12 @@ class RpcWorkerManager:
         global _process_owner
         with _PROCESS_LOCK:
             if _process_owner is not None and _process_owner is not self:
+                if _process_owner._state in ("stopped", "broken"):
+                    raise RpcWorkerStartError(
+                        "this process already ran its PyTorch RPC group; "
+                        "torch.distributed.rpc keeps per-process state that a second group "
+                        "cannot reuse, so generic PyTorch models need a server in a new process"
+                    )
                 raise RpcWorkerStartError(
                     "another server in this process already runs the PyTorch RPC worker; "
                     "torch allows one RPC group per process"
@@ -661,7 +671,10 @@ class RpcWorkerManager:
         _terminate(proc)
 
     def shutdown(self):
-        """Public shutdown hook used by atexit to ensure worker exits."""
+        """Stop the worker (``InferenceService.shutdown`` and the server's atexit hook).
+
+        A second call does nothing.
+        """
 
         self.stop()
 

@@ -17,8 +17,8 @@ Then one reply per stdin command:
 - ``timeout <seconds>``: the startup timeout of the next worker start.
 - ``load_timeout <seconds>``: the bound on each later model load in the worker
   (``managers.RPC_LOAD_TIMEOUT_SECONDS``).
-- ``stop`` (or end of input): ``stop_server``, then the RPC worker manager's
-  ``shutdown``; replies with the live worker children afterwards and exits.
+- ``stop`` (or end of input): ``stop_server``, which also stops the RPC worker;
+  replies with the manager's state and the live worker children afterwards and exits.
 """
 
 from __future__ import annotations
@@ -87,7 +87,6 @@ def main() -> int:
         elif words[0] == "stop":
             break
     stop_server(server, service, grace=5.0)
-    rpc.shutdown()
     _say({"stopped": True, "state": rpc._state, "children": _children()})
     return 0
 

@@ -221,6 +221,7 @@ File / Symbol | Role
 ### Known Limitations / Future Work
 
 - The spawned worker builds every model on the server's first GPU (CPU without CUDA); PyTorch models are not spread over several GPUs. An external worker uses its `--device`.
+- One PyTorch RPC group per process: `stop_server` stops the worker, and a later server in the same process cannot load generic PyTorch models; start it in a new process. torch keeps per-process RPC state that a second group cannot reuse.
 - No batching / streaming; each call is a single `rpc_sync` invocation.
 - Error metadata is plain exceptions; could wrap into structured envelopes.
 - Readiness file could be replaced with a pipe/queue IPC for cleaner startup semantics.
