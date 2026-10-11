@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import random
 import socket
 import subprocess
 import sys
@@ -415,17 +416,23 @@ def _lan_address() -> str:
 
 
 def _free_port_pair(addr: str) -> int:
-    """A port P on ``addr`` with P + 1 also free (the rendezvous and the ready line)."""
+    """A port P on ``addr`` with P + 1 also free (the rendezvous and the ready line).
 
-    for _ in range(20):
-        with socket.socket() as first:
-            first.bind((addr, 0))
-            port = first.getsockname()[1]
-            try:
-                with socket.socket() as second:
-                    second.bind((addr, port + 1))
-            except OSError:
-                continue
+    The candidates lie below the ephemeral port ranges (49152 and up on macOS, 32768 and up
+    on Linux). A port taken from ``bind((addr, 0))`` is an ephemeral one, and the OS can hand
+    it to one of the server process's own sockets before the server binds it as the
+    rendezvous port, which failed these tests now and then with "Address already in use".
+    """
+
+    rng = random.Random()
+    for _ in range(50):
+        port = rng.randrange(20000, 32000)
+        try:
+            with socket.socket() as first, socket.socket() as second:
+                first.bind((addr, port))
+                second.bind((addr, port + 1))
+        except OSError:
+            continue
         return port
     pytest.skip("no free port pair")
 
