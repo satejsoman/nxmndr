@@ -4,20 +4,25 @@
 """InferenceGrpcClient failure handling over a real loopback gRPC transport.
 
 A failed call is retried only when the server could not be reached, and a failure
-never ends the other calls of the same client.
+never ends the other calls of the same client. A stream that ends releases its
+request thread even when the caller keeps the response iterator.
 """
 
 from __future__ import annotations
 
+import sys
 import threading
+import time
 
 import grpc
 import numpy as np
 import pytest
 
+from nxmndr import client as nx_client
 from nxmndr.client import InferenceGrpcError
-from tst.support.grpc_harness import running_server
-from tst.support.stream_doubles import CountingLoader, GatedModel
+from nxmndr.inference import inference_pb2
+from tst.support.grpc_harness import running_server, wait_until
+from tst.support.stream_doubles import CountingLoader, EchoModel, GatedModel
 
 pytestmark = pytest.mark.integration
 
@@ -59,6 +64,7 @@ def loader(failing, gated, broken_loads):
             "double://fail": lambda: (failing, "onnx"),
             "double://gated": lambda: (gated, "onnx"),
             "double://broken": broken,
+            "double://echo": lambda: (EchoModel(), "onnx"),
         }
     )
 
@@ -126,3 +132,53 @@ def test_a_failed_stream_does_not_end_a_predict_on_the_same_client(tmp_path, loa
         gated.release.set()
         caller.join(10)
         assert errors == [] and tuple(result[0].shape) == (4, 4, 3)
+
+
+def _threads_waiting_for_a_window_slot():
+    acquire = nx_client._TileWindow.acquire.__code__
+    waiting = []
+    for thread_id, frame in sys._current_frames().items():
+        while frame is not None:
+            if frame.f_code is acquire:
+                waiting.append(thread_id)
+                break
+            frame = frame.f_back
+    return waiting
+
+
+def test_stream_end_releases_the_request_thread_while_the_caller_holds_the_iterator(
+    tmp_path, loader
+):
+    with running_server(tmp_path, loader=loader) as h, h.client() as c, h.client() as control:
+        mid = _load(c, "double://echo")
+        polls = []
+        c.open_session(session_id="sess-held", spec=inference_pb2.ModelSpec(model_id=mid))
+        call = c.stream_predict(
+            session_id="sess-held",
+            samples=[np.zeros(4, np.uint8) for _ in range(20)],
+            tile_ids=[f"t{i}" for i in range(20)],
+            max_inflight=1,
+            cancel_fn=lambda: polls.append(1) and False,
+        )
+        responses = iter(call)
+        assert next(responses).metadata.get("error") is None
+        control.cancel_session("sess-held", reason="test")
+        last = None
+        for resp in responses:  # leaving the loop keeps `responses` alive
+            last = resp
+            if resp.metadata.get("error_scope") == "stream":
+                break
+        assert last is not None and last.metadata["error_code"] == "cancelled"
+        # Wait for the RPC status first: the window check alone can pass before it arrives.
+        assert wait_until(call._call.done, timeout=5), "the server never ended the RPC"
+        assert wait_until(lambda: not _threads_waiting_for_a_window_slot(), timeout=5), (
+            "the request thread still waits for a window slot after the RPC ended"
+        )
+
+        def polling_stopped():
+            seen = len(polls)
+            time.sleep(4 * nx_client.CANCEL_POLL_SECONDS)
+            return len(polls) == seen
+
+        assert wait_until(polling_stopped, timeout=5), "cancel_fn is still polled after the RPC ended"
+        del responses

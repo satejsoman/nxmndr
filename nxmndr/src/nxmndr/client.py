@@ -705,6 +705,10 @@ class StreamPredictCall:
 
     Cancellation cancels the underlying gRPC call immediately, so a caller blocked
     waiting for the first response is released even if the server never answers.
+    A caller that stops reading before the stream ends calls ``cancel()`` (or closes
+    the iterator); until then the RPC stays open. When the RPC ends by itself, the
+    request thread and the ``cancel_fn`` watcher stop even if the caller keeps the
+    iterator.
     """
 
     def __init__(
@@ -834,6 +838,14 @@ class StreamPredictCall:
             if call is not None and callable(getattr(call, "cancel", None)):
                 call.cancel()
 
+    def _on_call_done(self, _call) -> None:
+        # The RPC is over (server status, deadline, cancel or transport failure), so
+        # nothing more can be sent: release a request thread waiting for a window slot
+        # and stop the cancel_fn watcher, even if the caller keeps the response
+        # iterator without finishing or closing it.
+        self._done.set()
+        self._window.close()
+
     def _watch_cancel_fn(self) -> None:
         while not self._done.wait(CANCEL_POLL_SECONDS):
             if self._cancel_requested():
@@ -858,6 +870,8 @@ class StreamPredictCall:
                 cancelled = self._cancelled
             if cancelled and callable(getattr(call, "cancel", None)):
                 call.cancel()
+            if callable(getattr(call, "add_done_callback", None)):
+                call.add_done_callback(self._on_call_done)
             if self._cancel_fn is not None:
                 threading.Thread(
                     target=self._watch_cancel_fn, name="nxmndr-stream-cancel", daemon=True
