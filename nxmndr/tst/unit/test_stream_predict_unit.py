@@ -8,6 +8,8 @@ session must come from OpenSession (no fabricated sessions), chunk counts are no
 limited, and limit failures are tile-scope.
 """
 
+import logging
+
 import grpc
 import numpy as np
 
@@ -210,3 +212,25 @@ def test_session_lifecycle_open_close_cancel(tmp_path):
     )
     assert cancel_resp.status == "not_found"
     assert cancel_ctx.code == grpc.StatusCode.NOT_FOUND
+
+
+def test_unprefixed_context_keys_are_logged_once_per_stream(tmp_path, caplog):
+    """Context keys without the opt. prefix are not options; the server says so once."""
+    svc, mid = _service(tmp_path, _SegModel())
+    _open(svc, "sessU", mid)
+    arr = np.zeros((1, 3, 2, 2), dtype=np.float32)
+    reqs = []
+    for tile_id in ("u1", "u2"):
+        tile = _tile(arr, tile_id, "sessU")
+        tile[0].context["return_confidence"] = "true"  # unprefixed: not an option
+        tile[0].context["batch_size"] = "8"  # the legacy key: not an option either
+        reqs += tile
+    with caplog.at_level(logging.WARNING, logger=server.logger.name):
+        responses = list(svc.StreamPredict(iter(reqs), _DummyContext()))
+    assert [r.metadata.get("error") for r in responses] == [None, None]
+    assert all(r.metadata["payload_format"] == "raw" for r in responses)  # no confidence
+    warnings = [r.getMessage() for r in caplog.records if "opt." in r.getMessage()]
+    assert warnings == [
+        "StreamPredict ignores context keys without the 'opt.' prefix: batch_size, "
+        "return_confidence (per-tile options are context['opt.<name>'])"
+    ]

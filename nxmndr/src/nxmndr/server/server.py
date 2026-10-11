@@ -23,7 +23,8 @@ Streaming (``StreamPredict``) contract v1:
   sessionless stream names ``model_id`` instead.
 - Every message of a tile carries ``context["tile_id"]``; the tile's first message
   may carry per-tile options as ``context["opt.<name>"]``. Effective options are the
-  session options updated by that tile's own options.
+  session options updated by that tile's own options. Other context keys are not
+  options; the server ignores them and logs each such key once per stream (WARNING).
 - Each tile gets exactly one response. Response metadata carries ``error``,
   ``error_code`` and ``error_scope`` on failure: ``tile`` scope fails one tile and the
   stream continues; ``stream`` scope ends the stream.
@@ -997,8 +998,13 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
             created_at=time.time(),
         )
 
-    def _start_tile(self, tile, context_map, book):
-        """Record a tile's first message; return (code, message) if the tile already failed."""
+    def _start_tile(self, tile, context_map, book, ignored_keys, corr_id):
+        """Record a tile's first message; return (code, message) if the tile already failed.
+
+        Context keys that are not options (no ``opt.`` prefix, and the legacy
+        ``batch_size``) are ignored; each one is logged once per stream
+        (``ignored_keys`` holds the keys this stream already logged).
+        """
         with book.lock:
             duplicate = tile.tile_id in book.seen_tiles
             book.seen_tiles.add(tile.tile_id)
@@ -1008,6 +1014,19 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
             decoded = dispatch.decode_tile_context(context_map)
         except dispatch.MalformedOptionsError as exc:
             return exc.code, str(exc)
+        ignored = set(decoded.unknown_keys)
+        if dispatch.CONTEXT_BATCH_SIZE in context_map:
+            ignored.add(dispatch.CONTEXT_BATCH_SIZE)
+        new_keys = sorted(ignored - ignored_keys)
+        if new_keys:
+            ignored_keys.update(new_keys)
+            self.logger.warning(
+                "StreamPredict ignores context keys without the %r prefix: %s "
+                "(per-tile options are context['opt.<name>'])",
+                dispatch.TILE_OPTION_PREFIX,
+                ", ".join(new_keys),
+                extra={"corr_id": corr_id},
+            )
         tile.options = decoded.options
         return None
 
@@ -1095,6 +1114,7 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
         session_id = ""
         outcome = "disconnected"  # until the request stream ends or a stream error is sent
         tile = None
+        ignored_keys = set()  # context keys without the opt. prefix, logged once per stream
         try:
             for req in request_iterator:
                 ctx = dict(req.context)
@@ -1175,7 +1195,7 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
                     tile = None
                 if tile is None:
                     tile = _TileBuffer(tile_id)
-                    failure = self._start_tile(tile, ctx, book)
+                    failure = self._start_tile(tile, ctx, book, ignored_keys, corr_id)
                     if failure is not None:
                         tile.reported = True
                         yield self._tile_error(book, session_id, corr_id, tile_id, *failure)
