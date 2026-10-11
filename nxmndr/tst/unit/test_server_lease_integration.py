@@ -9,12 +9,15 @@ branches could only test against an in-test fake.
 
 from __future__ import annotations
 
+import time
 from types import SimpleNamespace
 
 import pytest
 
+from nxmndr.inference import inference_pb2
 from nxmndr.models import sam as sam_support
 from nxmndr.server import dispatch, managers, server
+from tst.support.grpc_harness import wait_until
 from tst.unit.model_cache_test_utils import FakeClock
 
 
@@ -112,3 +115,50 @@ def test_sam_variant_factory_gets_the_record_auth_token(monkeypatch):
     assert get_variant(sam_support.SAM_VARIANT_TEXT) == ("sam3-model", "sam3-processor")
     assert get_variant(sam_support.SAM_VARIANT_GEOMETRY) == ("tracker-model", "tracker-processor")
     assert tokens == ["record-token"]
+
+
+class _Ctx:
+    def set_code(self, code):
+        raise AssertionError(f"unexpected status {code}")
+
+    def set_details(self, details):
+        pass
+
+
+def test_idle_sessions_expire_without_another_open_session(tmp_path):
+    clock = FakeClock()
+    manager = managers.ModelManager(None, capacity=1, session_ttl_s=10.0, clock=clock, loader=_record)
+    svc = server.InferenceService(model_cache_dir=tmp_path / "cache", model_manager=manager)
+    mid = manager.load(object(), key=managers.ModelCacheKey(format="onnx", source="a")).model_id
+    opened = svc.OpenSession(
+        inference_pb2.OpenSessionRequest(session_id="s1", spec=inference_pb2.ModelSpec(model_id=mid)),
+        _Ctx(),
+    )
+    assert opened.status == "ok" and manager.pin_count(mid) == 1
+    clock.advance(10.5)  # idle past the TTL, and no client calls OpenSession again
+    svc.start_session_expiry(0.01)
+    try:
+        assert wait_until(lambda: manager.session_state("s1") == "expired", timeout=5)
+        assert manager.pin_count(mid) == 0  # the cache slot is free again
+    finally:
+        svc.shutdown(grace=0)
+    assert not svc._expiry_thread.is_alive()
+
+
+def test_expiry_sweep_keeps_the_book_of_a_session_id_opened_again(tmp_path, monkeypatch):
+    svc = server.InferenceService(
+        model_cache_dir=tmp_path / "cache",
+        model_manager=managers.ModelManager(None, capacity=1, loader=_record),
+    )
+    stale = svc._new_book("s1", "m-old", {}, None, 0, 0)
+    stale.closed_seen_at = time.time() - svc._session_ttl_seconds - 1
+    svc._sessions["s1"] = stale
+    reopened = svc._new_book("s1", "m-new", {}, None, 0, 0)
+
+    def state(session_id):  # OpenSession of the same ID runs between the check and the prune
+        svc._sessions[session_id] = reopened
+        return "closed"
+
+    monkeypatch.setattr(svc, "_session_state", state)
+    svc._cleanup_stale_sessions()
+    assert svc._sessions["s1"] is reopened

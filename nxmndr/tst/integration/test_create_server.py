@@ -126,3 +126,12 @@ def test_control_calls_are_served_while_streams_outnumber_max_cores(tmp_path, mo
     finally:
         release.set()
         server.stop_server(srv, service, grace=1.0)
+
+
+def test_create_server_runs_the_session_expiry_sweep_until_stop_server(tmp_path):
+    srv, port, service = server.create_server(model_cache_dir=tmp_path / "cache", max_cores=1)
+    try:
+        assert service._expiry_thread is not None and service._expiry_thread.is_alive()
+    finally:
+        server.stop_server(srv, service, grace=0)
+    assert not service._expiry_thread.is_alive()

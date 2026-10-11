@@ -117,6 +117,9 @@ GRPC_OPTIONS = [
 # sized for concurrent calls, not by max_cores (which sizes the device plan and the
 # number of inference calls that run at once).
 GRPC_HANDLER_THREADS = 32
+# Seconds between the sweeps that expire sessions idle longer than the session TTL
+# (NXMNDR_SESSION_TTL_SECONDS); a session expires at most this much late.
+SESSION_EXPIRY_INTERVAL_SECONDS = 60.0
 
 
 def _shutdown_rpc_driver_if_needed():
@@ -322,7 +325,8 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
         # Session bookkeeping (limits, options, summary); lifecycle lives in model_manager.
         self._sessions: Dict[str, _SessionBook] = {}
         self._sessions_lock = threading.Lock()
-        self._last_session_cleanup = time.time()
+        self._expiry_stop = threading.Event()
+        self._expiry_thread: Optional[threading.Thread] = None
         self._default_max_inflight = int(os.environ.get("NXMNDR_STREAM_MAX_INFLIGHT", "16"))
         self._default_chunk_bytes = int(
             os.environ.get("NXMNDR_STREAM_MAX_CHUNK_BYTES", str(8 * 1024 * 1024))
@@ -337,11 +341,6 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
         Returns the number of sessions expired by this call.
         """
         now = time.time()
-        # Only run cleanup every 60 seconds at most
-        if now - self._last_session_cleanup < 60:
-            return 0
-        self._last_session_cleanup = now
-
         expired = self.model_manager.expire_sessions()
         for sid in expired:
             self.logger.info(f"Expired idle session: {sid}")
@@ -355,8 +354,31 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
                 book.closed_seen_at = now
             elif now - book.closed_seen_at > self._session_ttl_seconds:
                 with self._sessions_lock:
-                    self._sessions.pop(sid, None)
+                    # The sweep runs beside OpenSession: keep a book of the same ID
+                    # opened again since the snapshot above.
+                    if self._sessions.get(sid) is book:
+                        del self._sessions[sid]
         return len(expired)
+
+    def start_session_expiry(self, interval_s: float = SESSION_EXPIRY_INTERVAL_SECONDS) -> None:
+        """Expire idle sessions every ``interval_s`` seconds on a daemon thread until
+        ``shutdown``. An idle session pins its model in the cache, so expiry cannot wait
+        for the next OpenSession. A second call does nothing."""
+
+        if self._expiry_thread is not None:
+            return
+
+        def sweep():
+            while not self._expiry_stop.wait(interval_s):
+                try:
+                    self._cleanup_stale_sessions()
+                except Exception:
+                    self.logger.exception("session expiry sweep failed")
+
+        self._expiry_thread = threading.Thread(
+            target=sweep, name="nxmndr-session-expiry", daemon=True
+        )
+        self._expiry_thread.start()
 
     def _session_state(self, session_id: str) -> str:
         try:
@@ -1179,11 +1201,6 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
         corr_id = uuid.uuid4().hex[:8]
         self.logger.info("OpenSession called", extra={"corr_id": corr_id})
 
-        # Opportunistically clean up stale sessions
-        cleaned = self._cleanup_stale_sessions()
-        if cleaned:
-            self.logger.debug(f"Expired {cleaned} idle sessions", extra={"corr_id": corr_id})
-
         session_id = request.session_id or uuid.uuid4().hex
 
         def _fail(code, message, status="error"):
@@ -1424,7 +1441,11 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
         return inference_pb2.HealthResponse(ready=True, message="ok")
 
     def shutdown(self, grace: float | None = SERVER_STOP_GRACE_SECONDS) -> None:
-        """Close all sessions and dispose every model after running predictions drain."""
+        """Stop the session expiry sweep, then close all sessions and dispose every
+        model after running predictions drain."""
+        self._expiry_stop.set()
+        if self._expiry_thread is not None:
+            self._expiry_thread.join(timeout=SERVER_STOP_GRACE_SECONDS)
         self.model_manager.shutdown(drain_timeout_s=grace)
 
 
@@ -1445,7 +1466,8 @@ def create_server(
     The gRPC handler pool has ``GRPC_HANDLER_THREADS`` threads whatever ``max_cores``
     is, so control calls (``CancelSession``, ``Capabilities``, ``Health``) are served
     while streams are open; ``max_cores`` sizes the device plan and the number of
-    inference calls that run at once.
+    inference calls that run at once. Once the server is started, a sweep expires
+    idle sessions every ``SESSION_EXPIRY_INTERVAL_SECONDS`` until ``stop_server``.
 
     Returns:
             ``(server, bound_port, service)``: the started ``grpc.Server``, the port it
@@ -1467,6 +1489,7 @@ def create_server(
         service.shutdown(grace=0)
         raise
     server.start()
+    service.start_session_expiry(SESSION_EXPIRY_INTERVAL_SECONDS)
     return server, bound_port, service
 
 
@@ -1474,7 +1497,8 @@ def stop_server(server, service, *, grace: float | None = SERVER_STOP_GRACE_SECO
     """Stop a server from ``create_server``: gRPC first, then the model cache.
 
     New RPCs are refused and running ones get ``grace`` seconds (``server.stop``).
-    Then ``service.model_manager.shutdown(drain_timeout_s=grace)`` closes every
+    Then ``service.shutdown`` stops the session expiry sweep, and
+    ``service.model_manager.shutdown(drain_timeout_s=grace)`` closes every
     session, waits at most ``grace`` seconds for execution leases to drain and
     disposes every model. ``grace=None`` aborts running RPCs at once and waits for
     the leases without limit.
