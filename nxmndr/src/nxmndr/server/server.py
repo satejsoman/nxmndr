@@ -497,6 +497,16 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
         model_path = spec_msg.source or ""
         metadata_updates = {}
         artifact_sha = ""
+        # Uploaded bytes are saved on this host, but the PyTorch RPC worker opens the
+        # weights on its own host. Refused before anything is hashed or written.
+        rpc_worker_load = fmt_str == "pytorch" and not yolo
+        if spec_msg.artifact and rpc_worker_load and self.rpc_manager.worker_may_be_remote:
+            raise _LoadRequestError(
+                grpc.StatusCode.FAILED_PRECONDITION,
+                "this server's PyTorch RPC worker runs in external mode and may be on another "
+                "host, where uploaded artifact bytes saved on this host cannot be read; send "
+                "source with the weights path on the worker's host",
+            )
         if spec_msg.artifact:
             artifact_bytes = spec_msg.artifact
             artifact_sha = hashlib.sha256(artifact_bytes).hexdigest()

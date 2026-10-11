@@ -10,6 +10,7 @@ the lease API names stay importable from here (rebuild contract, chunk 1a).
 
 from __future__ import annotations
 
+import ipaddress
 import multiprocessing
 import os
 import socket
@@ -254,6 +255,18 @@ def _free_port(addr: str) -> int:
         return sock.getsockname()[1]
 
 
+def _is_loopback(addr: str) -> bool:
+    """True for a loopback IP or ``localhost``; False for any other address or host name."""
+
+    addr = addr.strip()
+    if addr.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(addr).is_loopback
+    except ValueError:
+        return False
+
+
 def _terminate(proc) -> None:
     """End a child process: wait, terminate, then kill, each bounded."""
 
@@ -439,6 +452,12 @@ class RpcWorkerManager:
         self._store = None  # the rendezvous TCPStore server, bound to self._addr
         self.startup_timeout_s = float(startup_timeout_s)
         self.device = str(device or "cpu")
+
+    @property
+    def worker_may_be_remote(self) -> bool:
+        """External mode on a non-loopback address: the worker may run on another host."""
+
+        return self._external and not _is_loopback(self._addr)
 
     # ---- start ------------------------------------------------------------
 

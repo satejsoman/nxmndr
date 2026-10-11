@@ -19,6 +19,7 @@
 - The RPC group listens on loopback unless MASTER_ADDR names another address.
 - An external worker's report connection stays open: when it closes, the worker counts
   as gone and the next load names it.
+- Uploaded PyTorch weights are refused when an external worker may be on another host.
 The real worker, rendezvous and routing run in tst/integration/test_rpc_pytorch_service.py.
 """
 
@@ -542,3 +543,44 @@ def test_a_disconnected_external_worker_fails_the_next_load_with_its_reason():
             manager.ensure_started()
     finally:
         ours.close()
+
+
+def test_an_external_worker_may_be_remote_only_on_a_non_loopback_address(monkeypatch):
+    monkeypatch.delenv("MASTER_ADDR", raising=False)
+    assert not managers.RpcWorkerManager(external_worker=True).worker_may_be_remote
+    for addr in ("127.0.0.1", "127.0.1.1", "localhost", "::1"):
+        manager = managers.RpcWorkerManager(master_addr=addr, external_worker=True)
+        assert not manager.worker_may_be_remote, addr
+    for addr in ("192.0.2.10", "0.0.0.0", "gpu-host"):
+        manager = managers.RpcWorkerManager(master_addr=addr, external_worker=True)
+        assert manager.worker_may_be_remote, addr
+    spawned = managers.RpcWorkerManager(master_addr="192.0.2.10", external_worker=False)
+    assert not spawned.worker_may_be_remote
+
+
+def test_uploaded_pytorch_weights_are_refused_when_the_worker_may_be_remote(monkeypatch, tmp_path):
+    import hashlib
+
+    from nxmndr.inference import inference_pb2
+    from nxmndr.server.server import InferenceService, _LoadRequestError
+    from tst.support import rpc_models
+
+    rpc_models.register()
+    spec = inference_pb2.ModelSpec(
+        format=inference_pb2.PYTORCH, model_class=rpc_models.ADD_CONST_CLASS, artifact=b"weights"
+    )
+    sha = hashlib.sha256(b"weights").hexdigest()
+    monkeypatch.setenv("NXMNDR_RPC_EXTERNAL_WORKER", "1")
+    monkeypatch.setenv("MASTER_ADDR", "192.0.2.10")
+    remote = InferenceService(model_cache_dir=tmp_path / "remote", max_cores=1)
+    with pytest.raises(_LoadRequestError) as refused:
+        remote._prepare_load(spec, "c1")
+    assert refused.value.code == grpc.StatusCode.FAILED_PRECONDITION
+    assert "send source" in str(refused.value)
+    assert not [p for p in (tmp_path / "remote").rglob("*") if sha in p.name]  # nothing written
+    onnx = inference_pb2.ModelSpec(format=inference_pb2.ONNX, artifact=b"weights")
+    assert remote._prepare_load(onnx, "c2").model_spec.model_path  # loads in the server
+
+    monkeypatch.delenv("MASTER_ADDR")  # loopback: the worker shares this host's files
+    local = InferenceService(model_cache_dir=tmp_path / "local", max_cores=1)
+    assert sha in local._prepare_load(spec, "c3").model_spec.model_path
