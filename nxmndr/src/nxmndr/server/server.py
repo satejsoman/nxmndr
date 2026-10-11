@@ -305,7 +305,6 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
             rpc_workers=self.rpc_manager,
         )
         self.logger = logger
-        self.rpc_worker = None  # deprecated in favor of rpc_manager
         artifact_root = None
         if model_cache_dir:
             expanded = os.path.expandvars(os.path.expanduser(str(model_cache_dir)))
@@ -415,10 +414,7 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
         self._expiry_thread.start()
 
     def _session_state(self, session_id: str) -> str:
-        try:
-            return self.model_manager.session_state(session_id)
-        except managers.UnknownSessionError:
-            return "unknown"
+        return self.model_manager.session_state(session_id)
 
     def _next_device(self):
         if not self._device_plan:
