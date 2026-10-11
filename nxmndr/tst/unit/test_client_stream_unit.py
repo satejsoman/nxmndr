@@ -156,6 +156,57 @@ def test_deterministic_rejections_are_not_retried():
     assert err.value.code == grpc.StatusCode.INVALID_ARGUMENT
 
 
+@pytest.mark.parametrize(
+    "code",
+    [
+        grpc.StatusCode.INTERNAL,
+        grpc.StatusCode.UNKNOWN,
+        grpc.StatusCode.DEADLINE_EXCEEDED,
+        grpc.StatusCode.RESOURCE_EXHAUSTED,
+    ],
+)
+def test_server_answers_and_deadlines_are_not_retried(code):
+    client = InferenceGrpcClient("localhost:0", max_attempts=3, backoff_seconds=0)
+    attempts = []
+
+    def call():
+        attempts.append(1)
+        raise _FakeRpcError(code, "inference_failed")
+
+    with pytest.raises(InferenceGrpcError) as err:
+        client._with_retry(call)
+    assert len(attempts) == 1
+    assert err.value.code == code
+
+
+def test_unavailable_is_retried_on_the_same_channel(monkeypatch):
+    made = []
+
+    class _Channel:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    def fake_create(self):
+        made.append(_Channel())
+        return made[-1]
+
+    monkeypatch.setattr(InferenceGrpcClient, "_create_channel", fake_create)
+    client = InferenceGrpcClient("localhost:0", max_attempts=3, backoff_seconds=0)
+    attempts = []
+
+    def call():
+        client._get_channel()
+        attempts.append(1)
+        raise _FakeRpcError(grpc.StatusCode.UNAVAILABLE, "connection refused")
+
+    with pytest.raises(InferenceGrpcError) as err:
+        client._with_retry(call)
+    assert len(attempts) == 3 and err.value.code == grpc.StatusCode.UNAVAILABLE
+    assert len(made) == 1 and not made[0].closed
+
+
 def test_cancel_before_iteration_sends_nothing(stubbed):
     client, stub = stubbed
     call = client.stream_predict(model_id="m", samples=[np.zeros(2)])

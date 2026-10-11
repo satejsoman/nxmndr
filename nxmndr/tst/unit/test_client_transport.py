@@ -44,7 +44,7 @@ def test_https_selects_a_secure_channel_with_default_roots(channels):
     client._get_channel()
     assert made == [("secure", "example.invalid:443", default_creds, GRPC_OPTIONS)]
 
-    client._reset_channel()  # a reconnect (control call retry or stream failure) stays TLS
+    client.close()  # a closed client reopens its channel with TLS on the next call
     client._get_channel()
     assert made[-1] == ("secure", "example.invalid:443", default_creds, GRPC_OPTIONS)
     assert all(kind == "secure" for kind, *_ in made)

@@ -54,19 +54,12 @@ _OPTION_NAME = re.compile(r"^[a-z][a-z0-9_]*$")
 # How often a ``cancel_fn`` callable is polled while a stream is blocked.
 CANCEL_POLL_SECONDS = 0.05
 
-# Deterministic rejections: retrying cannot succeed.
-_NON_RETRYABLE_CODES = frozenset(
-    {
-        grpc.StatusCode.INVALID_ARGUMENT,
-        grpc.StatusCode.NOT_FOUND,
-        grpc.StatusCode.ALREADY_EXISTS,
-        grpc.StatusCode.FAILED_PRECONDITION,
-        grpc.StatusCode.PERMISSION_DENIED,
-        grpc.StatusCode.UNAUTHENTICATED,
-        grpc.StatusCode.UNIMPLEMENTED,
-        grpc.StatusCode.CANCELLED,
-    }
-)
+# Unary calls are retried only on UNAVAILABLE, the code gRPC documents as transient
+# and fixed by retrying the failing call with a backoff (the server could not be
+# reached or stopped serving). With any other code the server ran the request and
+# answered (INTERNAL is a failed inference), or the deadline passed while it may
+# still be running, so a retry would run the request again.
+_RETRYABLE_CODES = frozenset({grpc.StatusCode.UNAVAILABLE})
 
 
 class InferenceGrpcError(RuntimeError):
@@ -246,7 +239,9 @@ class ModelRegistryEntry:
 class InferenceGrpcClient:
     """Simple wrapper around the nxmndr inference gRPC service.
 
-    Maintains a persistent channel with lazy reconnection on failure. The endpoint
+    Maintains one persistent channel, created at first use; gRPC reconnects it after
+    a failure and only ``close()`` closes it. A unary call is retried, up to
+    ``max_attempts`` times, only when it fails with UNAVAILABLE. The endpoint
     selects the transport (``parse_endpoint``): ``https://`` is TLS, with
     ``credentials`` if given, else ``grpc.ssl_channel_credentials()`` (default
     roots); ``credentials`` given with a plaintext endpoint also select TLS.
@@ -288,7 +283,7 @@ class InferenceGrpcClient:
         return self._stub
 
     def _reset_channel(self) -> None:
-        """Reset channel on failure for reconnection."""
+        """Close the channel; the next call opens a new one."""
         if self._channel is not None:
             try:
                 self._channel.close()
@@ -310,10 +305,10 @@ class InferenceGrpcClient:
             except grpc.RpcError as err:  # pragma: no cover - network dependent
                 last_err = err
                 _, code = _rpc_error_parts(err)
-                if code in _NON_RETRYABLE_CODES:
+                if code not in _RETRYABLE_CODES:
                     break
-                # Reset channel on connection errors for reconnection
-                self._reset_channel()
+                # The channel reconnects by itself; closing it would also end every
+                # other call (a running stream) on this client.
                 if attempt >= self._max_attempts:
                     break
                 time.sleep(self._backoff_seconds * attempt)
@@ -631,7 +626,6 @@ class InferenceGrpcClient:
             stub = self._get_stub()
             response = stub.ListModelRegistry(request, timeout=self._timeout)
         except grpc.RpcError as err:  # pragma: no cover - requires network
-            self._reset_channel()
             details = getattr(err, "details", None)
             message = details() if callable(details) else str(details or err)
             raise InferenceGrpcError(message) from err
@@ -665,7 +659,6 @@ class InferenceGrpcClient:
             stub = self._get_stub()
             response = stub.EvictModelRegistryEntry(request, timeout=self._timeout)
         except grpc.RpcError as err:  # pragma: no cover - requires network
-            self._reset_channel()
             details = getattr(err, "details", None)
             message = details() if callable(details) else str(details or err)
             raise InferenceGrpcError(message) from err
@@ -888,7 +881,6 @@ class StreamPredictCall:
                 raise self._request_error from err
             if self._cancelled:
                 return
-            self._client._reset_channel()  # Reset for reconnection on next call
             message, code = _rpc_error_parts(err)
             if self._on_error:
                 try:
