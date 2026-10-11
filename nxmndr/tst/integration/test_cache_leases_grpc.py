@@ -13,7 +13,7 @@ Also over gRPC: two clients that load an equal spec share one model ID, and one
 client's UnloadModel or overwrite does not take the model from the other; an
 UnloadModel while a session uses the model succeeds and the model is freed when the
 session closes; a LoadModel whose client is gone when the load finishes keeps no
-reference; and a local model file rewritten in place is loaded again.
+reference and frees no model; and a local model file rewritten in place is loaded again.
 """
 
 from __future__ import annotations
@@ -71,6 +71,22 @@ def _open(client, session_id, model_id):
     resp = client.open_session(session_id=session_id, spec=inference_pb2.ModelSpec(model_id=model_id))
     assert resp.status == "ok", resp.error
     return resp
+
+
+def _record_load_calls(monkeypatch):
+    """Wrap LoadModel to record each call's gRPC context and the reply it returns."""
+
+    contexts, replies = [], []
+    real = server.InferenceService.LoadModel
+
+    def recording(self, request, context):
+        contexts.append(context)
+        reply = real(self, request, context)
+        replies.append(reply)
+        return reply
+
+    monkeypatch.setattr(server.InferenceService, "LoadModel", recording)
+    return contexts, replies
 
 
 def _predict(client, session_id):
@@ -198,26 +214,62 @@ def test_a_load_whose_client_is_gone_keeps_no_reference(tmp_path, monkeypatch):
         gate.wait(30)
         return loader(*args)
 
-    contexts = []
-    real = server.InferenceService.LoadModel
-
-    def recording(self, request, context):
-        contexts.append(context)
-        return real(self, request, context)
-
-    monkeypatch.setattr(server.InferenceService, "LoadModel", recording)
+    contexts, replies = _record_load_calls(monkeypatch)
     with running_server(tmp_path, loader=gated_loader) as h, h.client() as c:
         with h.client(timeout=0.5) as short, pytest.raises(InferenceGrpcError) as err:
             _load(short, "double://slow")
         assert err.value.code == grpc.StatusCode.DEADLINE_EXCEEDED
         assert wait_until(lambda: contexts and not contexts[0].is_active())
         gate.set()  # the server finishes the load its client gave up on
-        records = loader.records["double://slow"]
-        assert wait_until(lambda: records and records[0].dispose_calls == 1)
-        assert h.manager.list_models() == {}
+        assert wait_until(lambda: replies)
+        assert replies[0].message == "the client is gone"
+        [record] = loader.records["double://slow"]
+        [gone] = h.manager.list_models()  # cached with no reference, like a closed session's
+        assert record.dispose_calls == 0
         mid = _load(c, "double://slow")  # the client's retry holds the only reference
+        assert mid == gone
         reply = c._get_stub().UnloadModel(inference_pb2.UnloadModelRequest(model_id=mid))
         assert reply.success and reply.message == f"unloaded {mid}"
+        assert record.dispose_calls == 1
+
+
+@pytest.mark.parametrize("session_open", [False, True], ids=["warm", "pinned"])
+def test_a_gone_load_that_hits_the_cache_does_not_free_the_model(
+    tmp_path, monkeypatch, session_open
+):
+    loader = _Loader({"double://warm": SegLogitsModel})
+    spec = inference_pb2.ModelSpec(
+        format=inference_pb2.ONNX, source="double://warm", task=inference_pb2.SEGMENTATION
+    )
+    contexts, replies = _record_load_calls(monkeypatch)
+    with running_server(tmp_path, loader=loader) as h, h.client() as c:
+        assert c.open_session(session_id="s1", spec=spec).status == "ok"
+        if not session_open:  # warm: resident with no session and no LoadModel reference
+            assert c.close_session("s1").status == "closed"
+        [record] = loader.records["double://warm"]
+        gate = threading.Event()
+        prepare = h.service._prepare_load
+
+        def gated_prepare(*args, **kwargs):
+            gate.wait(30)
+            return prepare(*args, **kwargs)
+
+        monkeypatch.setattr(h.service, "_prepare_load", gated_prepare)
+        with h.client(timeout=0.5) as short, pytest.raises(InferenceGrpcError) as err:
+            _load(short, "double://warm")
+        assert err.value.code == grpc.StatusCode.DEADLINE_EXCEEDED
+        assert wait_until(lambda: contexts and not contexts[0].is_active())
+        gate.set()  # the load hits the cache after its client is gone
+        assert wait_until(lambda: replies)
+        assert replies[0].message == "the client is gone"
+        if session_open:
+            assert c.close_session("s1").status == "closed"
+        [mid] = h.manager.list_models()
+        assert record.dispose_calls == 0
+        assert _load(c, "double://warm") == mid  # one reference: the gone load left none
+        reply = c._get_stub().UnloadModel(inference_pb2.UnloadModelRequest(model_id=mid))
+        assert reply.success and reply.message == f"unloaded {mid}"
+        assert record.dispose_calls == 1
 
 
 def test_overwrite_of_a_model_another_client_holds_is_refused(tmp_path):

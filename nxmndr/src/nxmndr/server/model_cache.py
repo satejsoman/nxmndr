@@ -18,9 +18,11 @@ Rules the implementation keeps:
   Each ``load`` adds a load reference to the record it returns and each ``unload``
   releases one. An ``unload`` that leaves no load reference disposes the record at
   once if it is not pinned, else when its last pin is released, unless a ``load``
-  adds a reference first. A record with a load reference is never overwritten. Load
-  references are not pins: LRU eviction ignores them, because a caller that never
-  unloads would otherwise hold its cache slot until the server stops.
+  adds a reference first. ``release_load`` takes back a reference whose caller never
+  got the model ID and never disposes the record or marks it to be freed. A record
+  with a load reference is never overwritten. Load references are not pins: LRU
+  eviction ignores them, because a caller that never unloads would otherwise hold
+  its cache slot until the server stops.
 * A distinct load at full capacity evicts the least recently used unpinned
   record. If every slot is pinned or reserved it raises ``CacheExhaustedError``
   before it loads or evicts anything.
@@ -953,6 +955,22 @@ class ModelCache:
             self._dispose_record(entry.record)
             logger.info("unloaded model %s", model_id)
         return outcome
+
+    def release_load(self, model_id: str) -> bool:
+        """Take back one load reference whose ``load`` result never reached its caller.
+
+        Unlike ``unload``, this never disposes the record or marks it to be freed: with
+        no load reference left, the record stays cached, as a record that only sessions
+        loaded does, until LRU eviction frees it. A pending free that the load cancelled
+        stays cancelled. False if ``model_id`` is not resident or holds no load reference.
+        """
+
+        with self._cond:
+            entry = self._records.get(model_id)
+            if entry is None or not entry.loads:
+                return False
+            entry.loads -= 1
+            return True
 
     def get(self, model_id: str) -> Optional[ModelRecord]:
         """Peek at a resident record. Does not pin it or change recency."""

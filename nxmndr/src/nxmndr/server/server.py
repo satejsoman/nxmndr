@@ -738,10 +738,13 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
             if callable(is_active) and not is_active():
                 # The client is gone (its deadline passed or it cancelled) and never gets
                 # this model_id, so no UnloadModel would release the reference the load
-                # added. A retry gets a reference of its own.
-                outcome = self.model_manager.unload(model_id)
+                # added. Take back only that reference: the full unload would also free a
+                # model this call did not load (a warm cache hit) or mark it to be freed
+                # when its sessions end. A retry gets a reference of its own.
+                self.model_manager.release_load(model_id)
                 self.logger.info(
-                    "LoadModel client is gone; released model_id=%s (%s)", model_id, outcome,
+                    "LoadModel client is gone; released its reference to model_id=%s",
+                    model_id,
                     extra={"corr_id": corr_id},
                 )
                 return inference_pb2.LoadModelResponse(
