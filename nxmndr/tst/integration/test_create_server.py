@@ -135,6 +135,42 @@ def test_control_calls_are_served_while_streams_outnumber_max_cores(tmp_path, mo
         server.stop_server(srv, service, grace=1.0)
 
 
+def test_a_large_max_cores_opens_a_stream_per_slot_and_still_serves_control_calls(
+    tmp_path, monkeypatch
+):
+    # 64 inference slots on a 64-CPU host: more than GRPC_HANDLER_THREADS, so a pool of
+    # that fixed size would be full with 32 streams, and Health would wait.
+    monkeypatch.setattr(server.os, "cpu_count", lambda: 64)
+    entered = []
+    real = server.InferenceService.StreamPredict
+
+    def counting(self, request_iterator, context):
+        entered.append(1)
+        yield from real(self, request_iterator, context)
+
+    monkeypatch.setattr(server.InferenceService, "StreamPredict", counting)
+    release = threading.Event()
+
+    def idle_requests():
+        release.wait(30)
+        return
+        yield
+
+    srv, port, service = server.create_server(model_cache_dir=tmp_path / "cache", max_cores=64)
+    try:
+        assert service._inference_slot_count == 64
+        with grpc.insecure_channel(f"127.0.0.1:{port}") as channel:
+            stub = inference_pb2_grpc.InferenceServiceStub(channel)
+            calls = [stub.StreamPredict(idle_requests()) for _ in range(64)]
+            assert wait_until(lambda: len(entered) == 64, timeout=10)  # all 64 run at once
+            assert stub.Health(inference_pb2.HealthRequest(), timeout=5).ready
+            release.set()
+            assert all(list(call) == [] for call in calls)
+    finally:
+        release.set()
+        server.stop_server(srv, service, grace=1.0)
+
+
 def test_create_server_runs_the_session_expiry_sweep_until_stop_server(tmp_path):
     srv, port, service = server.create_server(model_cache_dir=tmp_path / "cache", max_cores=1)
     try:

@@ -137,11 +137,25 @@ GRPC_OPTIONS = [
 STREAM_MESSAGE_HEADROOM_BYTES = 1024 * 1024
 # gRPC handler threads. Each StreamPredict holds one for its whole life, so the pool is
 # sized for concurrent calls, not by max_cores (which sizes the device plan and the
-# number of inference calls that run at once).
+# number of inference calls that run at once): this many, or the inference slots plus
+# GRPC_CONTROL_THREADS when that is more (grpc_handler_threads).
 GRPC_HANDLER_THREADS = 32
+# Handler threads beyond one per inference slot. Without them, as many streams as there
+# are slots would hold every thread, and Health, CancelSession and CloseSession would
+# wait for a stream to end. 8 is a fixed allowance, not a measured need: it serves the
+# short calls of several clients at once, and an idle thread costs only its stack.
+# Streams that wait for a slot or for their client's next message hold threads too, so
+# no pool size serves control calls while more streams are open than it has threads.
+GRPC_CONTROL_THREADS = 8
 # Seconds between the sweeps that expire sessions idle longer than the session TTL
 # (NXMNDR_SESSION_TTL_SECONDS); a session expires at most this much late.
 SESSION_EXPIRY_INTERVAL_SECONDS = 60.0
+
+
+def grpc_handler_threads(inference_slots: int) -> int:
+    """Threads of the gRPC handler pool of a server with this many inference slots."""
+
+    return max(GRPC_HANDLER_THREADS, inference_slots + GRPC_CONTROL_THREADS)
 
 
 def stream_max_chunk_bytes() -> int:
@@ -357,11 +371,10 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
             self.logger.info("Model cache directory: %s", self._model_cache_dir)
 
         # Inference calls that run at once, across Predict and every stream. The gRPC
-        # handler pool (GRPC_HANDLER_THREADS) is larger, so that control calls are served
+        # handler pool (grpc_handler_threads) is larger, so that control calls are served
         # while streams wait; this keeps model runs to min(max_cores, CPU count).
-        self._inference_slots = threading.BoundedSemaphore(
-            max(1, min(self._max_cores, os.cpu_count() or 1))
-        )
+        self._inference_slot_count = max(1, min(self._max_cores, os.cpu_count() or 1))
+        self._inference_slots = threading.BoundedSemaphore(self._inference_slot_count)
         # Session bookkeeping (limits, options, summary); lifecycle lives in model_manager.
         self._sessions: Dict[str, _SessionBook] = {}
         self._sessions_lock = threading.Lock()
@@ -1606,11 +1619,12 @@ def create_server(
             port: TCP port; 0 picks a free ephemeral port.
             model_cache_dir, max_cores: as for ``InferenceService``.
 
-    The gRPC handler pool has ``GRPC_HANDLER_THREADS`` threads whatever ``max_cores``
-    is, so control calls (``CancelSession``, ``Capabilities``, ``Health``) are served
-    while streams are open; ``max_cores`` sizes the device plan and the number of
-    inference calls that run at once. Once the server is started, a sweep expires
-    idle sessions every ``SESSION_EXPIRY_INTERVAL_SECONDS`` until ``stop_server``.
+    ``max_cores`` sizes the device plan and the number of inference calls that run at
+    once (the inference slots, at most the CPU count). The gRPC handler pool has
+    ``GRPC_HANDLER_THREADS`` threads, or one per slot plus ``GRPC_CONTROL_THREADS`` when
+    that is more, so control calls (``CancelSession``, ``Capabilities``, ``Health``) are
+    served while a stream runs in every slot. Once the server is started, a sweep
+    expires idle sessions every ``SESSION_EXPIRY_INTERVAL_SECONDS`` until ``stop_server``.
 
     Returns:
             ``(server, bound_port, service)``: the started ``grpc.Server``, the port it
@@ -1619,14 +1633,16 @@ def create_server(
     Raises:
             RuntimeError: the address cannot be bound (grpcio raises it).
     """
-    server = grpc.server(
-        futures.ThreadPoolExecutor(max_workers=GRPC_HANDLER_THREADS),
-        interceptors=[LoggingInterceptor()],
-        options=GRPC_OPTIONS,
-    )
     service = InferenceService(model_cache_dir=model_cache_dir, max_cores=max_cores)
-    inference_pb2_grpc.add_InferenceServiceServicer_to_server(service, server)
     try:
+        server = grpc.server(
+            futures.ThreadPoolExecutor(
+                max_workers=grpc_handler_threads(service._inference_slot_count)
+            ),
+            interceptors=[LoggingInterceptor()],
+            options=GRPC_OPTIONS,
+        )
+        inference_pb2_grpc.add_InferenceServiceServicer_to_server(service, server)
         bound_port = server.add_insecure_port(f"{host}:{port}")
     except BaseException:
         service.shutdown(grace=0)
