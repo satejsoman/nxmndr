@@ -10,7 +10,8 @@ prediction still running when its session closes keeps its record alive until th
 call returns, after which the record is disposed exactly once.
 
 Also over gRPC: two clients that load an equal spec share one model ID, and one
-client's UnloadModel or overwrite does not take the model from the other.
+client's UnloadModel or overwrite does not take the model from the other; and a
+local model file rewritten in place is loaded again.
 """
 
 from __future__ import annotations
@@ -180,3 +181,29 @@ def test_overwrite_of_a_model_another_client_holds_is_refused(tmp_path):
         result = b.predict(mid, CHIP, options={"task_type": "segmentation"})
         assert result.metadata.get("error") is None and h.manager.get(mid) is not None
         assert [r.dispose_calls for r in loader.records["double://shared"]] == [0]
+
+
+def test_rewritten_local_file_is_loaded_again(tmp_path):
+    import os
+
+    weights = tmp_path / "model.onnx"
+    weights.write_bytes(b"v1")
+    os.utime(weights, ns=(10**18, 10**18))
+    source = str(weights)
+    loader = _Loader({source: SegLogitsModel})
+    with running_server(tmp_path, loader=loader) as h, h.client() as c:
+        first = _load(c, source)
+        assert _load(c, source) == first  # unchanged file: cache hit
+        weights.write_bytes(b"v2")  # retrained into the same path
+        os.utime(weights, ns=(10**18, 10**18 + 1))
+        second = _load(c, source)
+        assert second != first and len(loader.records[source]) == 2
+        weights.write_bytes(b"v3")  # the plugin's path: OpenSession with the spec
+        os.utime(weights, ns=(10**18, 10**18 + 2))
+        spec = inference_pb2.ModelSpec(
+            format=inference_pb2.ONNX, source=source, task=inference_pb2.SEGMENTATION
+        )
+        opened = c.open_session(session_id="s-retrained", spec=spec)
+        assert opened.status == "ok" and opened.model_cache_hit is False
+        assert len(loader.records[source]) == 3
+        assert h.manager.get(second) is not None  # its holder keeps the earlier copy

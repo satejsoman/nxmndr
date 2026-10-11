@@ -31,6 +31,7 @@ from nxmndr.server.managers import (
     UnknownModelError,
     UnknownSessionError,
     cache_key_from_spec,
+    local_source_stamp,
 )
 from tst.unit.model_cache_test_utils import WAIT_S, key, make_manager, spec, wait_until
 
@@ -119,6 +120,37 @@ def test_uploaded_artifact_is_keyed_by_content():
     assert cache_key_from_spec(_proto(), artifact_sha256=digest.upper()) == by_bytes
     with pytest.raises(ValueError):
         cache_key_from_spec(_proto(), artifact_sha256="not-a-digest")
+
+
+def test_source_stamp_is_part_of_the_key_except_for_uploads():
+    assert cache_key_from_spec(_proto(), source_stamp="file:1:2") != cache_key_from_spec(_proto())
+    upload = _proto(artifact=b"onnx-bytes")
+    assert cache_key_from_spec(upload, source_stamp="file:1:2") == cache_key_from_spec(upload)
+
+
+def test_local_source_stamp_follows_file_and_directory_contents(tmp_path):
+    import os
+
+    assert local_source_stamp("") == local_source_stamp(str(tmp_path / "missing")) == ""
+    assert local_source_stamp("org/repo") == ""  # a hub repository ID, not a local path
+    weights = tmp_path / "w.pt"
+    weights.write_bytes(b"aa")
+    os.utime(weights, ns=(10**18, 10**18))
+    first = local_source_stamp(str(weights))
+    assert first and local_source_stamp(f" {weights} ") == first
+    weights.write_bytes(b"bb")  # retrained: same size, new modification time
+    os.utime(weights, ns=(10**18, 10**18 + 1))
+    assert local_source_stamp(str(weights)) not in ("", first)
+    snapshot = tmp_path / "snapshot"  # a Hugging Face snapshot directory
+    snapshot.mkdir()
+    (snapshot / "config.json").write_text("{}")
+    safetensors = snapshot / "model.safetensors"
+    safetensors.write_bytes(b"x")
+    os.utime(safetensors, ns=(10**18, 10**18))
+    before = local_source_stamp(str(snapshot))
+    assert before and local_source_stamp(str(snapshot)) == before
+    os.utime(safetensors, ns=(10**18, 10**18 + 1))
+    assert local_source_stamp(str(snapshot)) not in ("", before)
 
 
 def test_key_load_options_are_sorted_and_unique():

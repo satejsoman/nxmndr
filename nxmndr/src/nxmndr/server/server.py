@@ -509,7 +509,12 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
             device_plan = None
         else:
             raise _LoadRequestError(grpc.StatusCode.INVALID_ARGUMENT, "Unsupported spec type")
-        key = managers.cache_key_from_spec(spec_msg, artifact_sha256=artifact_sha)
+        # A local file or directory source is keyed by its size and modification time
+        # too, so a rewritten checkpoint is loaded again instead of served from the cache.
+        stamp = "" if artifact_sha else managers.local_source_stamp(spec_msg.source)
+        key = managers.cache_key_from_spec(
+            spec_msg, artifact_sha256=artifact_sha, source_stamp=stamp
+        )
         return _PreparedLoad(model_spec, key, model_metadata, device_plan, model_type)
 
     @staticmethod

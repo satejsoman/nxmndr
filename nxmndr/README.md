@@ -254,7 +254,7 @@ Use gRPC when:
 Service: `InferenceService`
 
 Endpoints:
-- `LoadModel(LoadModelRequest) -> LoadModelResponse` : Uploads or references a model artifact; returns `model_id`. Equal specs share one loaded model and one `model_id` (`effective_metadata` has `model_cache_hit=true`). `overwrite=true` loads a fresh copy only when no session, call or earlier `LoadModel` caller holds the resident one; otherwise it fails with `FAILED_PRECONDITION`.
+- `LoadModel(LoadModelRequest) -> LoadModelResponse` : Uploads or references a model artifact; returns `model_id`. Equal specs share one loaded model and one `model_id` (`effective_metadata` has `model_cache_hit=true`); a local file or directory `source` is loaded again after its size or modification time changes. `overwrite=true` loads a fresh copy only when no session, call or earlier `LoadModel` caller holds the resident one; otherwise it fails with `FAILED_PRECONDITION`.
 - `ListModels(ListModelsRequest) -> ListModelsResponse` : Enumerate loaded models.
 - `Predict(PredictRequest) -> PredictResponse` : Run a batch prediction (includes `model_id`).
 - `UnloadModel(UnloadModelRequest) -> UnloadModelResponse` : Releases one `LoadModel` reference. The server frees the model when every `LoadModel` caller has unloaded it and no session or call uses it; the last unload of a model in use fails with `FAILED_PRECONDITION`. The server keeps at most `NXMNDR_MODEL_CACHE_CAPACITY` models (default 10): a new model at full capacity evicts the least recently used one that no session or call uses, even if its `LoadModel` callers have not unloaded it. `Predict` with an evicted `model_id` fails with `NOT_FOUND`; `LoadModel` loads it again.

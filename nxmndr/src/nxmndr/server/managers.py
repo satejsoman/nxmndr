@@ -43,6 +43,7 @@ from .model_cache import (
     UnknownModelError,
     UnknownSessionError,
     cache_key_from_spec,
+    local_source_stamp,
 )
 
 logger = get_logger(__name__)
@@ -651,6 +652,7 @@ __all__ = [
     "CacheShutdownError",
     "ModelCacheKey",
     "cache_key_from_spec",
+    "local_source_stamp",
     "ModelRecord",
     "LoadResult",
     "SessionLease",

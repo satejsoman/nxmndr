@@ -41,6 +41,7 @@ import hmac
 import os
 import re
 import secrets
+import stat
 import threading
 import time
 import uuid
@@ -142,6 +143,7 @@ class ModelCacheKey:
     task: str = ""
     load_options: Tuple[Tuple[str, str], ...] = ()
     auth_scope: str = ""
+    source_stamp: str = ""
 
     def __post_init__(self) -> None:
         for name in (
@@ -152,6 +154,7 @@ class ModelCacheKey:
             "model_class",
             "task",
             "auth_scope",
+            "source_stamp",
         ):
             if not isinstance(getattr(self, name), str):
                 raise TypeError(f"ModelCacheKey.{name} must be a str")
@@ -182,7 +185,43 @@ def _auth_scope(token: str) -> str:
     return f"hmac-sha256:{digest[:32]}"
 
 
-def cache_key_from_spec(spec: Any, *, artifact_sha256: str = "") -> ModelCacheKey:
+def local_source_stamp(source: str) -> str:
+    """The size and modification time of a local file, or of each entry directly in a
+    local directory, as one string; "" when ``source`` names neither.
+
+    Part of the cache key (``source_stamp``), so a file rewritten in place, such as a
+    retrained checkpoint, is loaded again instead of served from the earlier copy.
+    Only metadata is read: hashing multi-gigabyte weights on every load would cost
+    about as much as the load. A directory is not walked recursively, which bounds the
+    cost for any path a client sends; a Hugging Face snapshot keeps its weights and
+    config at the top level. A rewrite that keeps both the size and the modification
+    time (a coarse filesystem clock, a copy that preserves the time) is not seen.
+    """
+
+    path = (source or "").strip()
+    if not path:
+        return ""
+    try:
+        info = os.stat(path)
+        names = sorted(os.listdir(path)) if stat.S_ISDIR(info.st_mode) else None
+    except (OSError, ValueError):  # ValueError: a NUL byte in the path
+        return ""
+    if names is None:
+        return f"file:{info.st_size}:{info.st_mtime_ns}" if stat.S_ISREG(info.st_mode) else ""
+    digest = hashlib.sha256()
+    for name in names:
+        try:
+            entry = os.stat(os.path.join(path, name))  # follows snapshot symlinks to blobs
+        except OSError:
+            continue
+        line = f"{name}\0{entry.st_size}\0{entry.st_mtime_ns}\n"
+        digest.update(line.encode("utf-8", "surrogateescape"))
+    return f"dir:{digest.hexdigest()[:32]}"
+
+
+def cache_key_from_spec(
+    spec: Any, *, artifact_sha256: str = "", source_stamp: str = ""
+) -> ModelCacheKey:
     """Derive the cache key of an ``inference_pb2.ModelSpec``.
 
     Fields read: ``format``, ``source``, ``artifact``, ``version`` (the revision),
@@ -190,7 +229,9 @@ def cache_key_from_spec(spec: Any, *, artifact_sha256: str = "") -> ModelCacheKe
     where it selects the hub entry point), the ``metadata`` entries ``num_classes`` and
     ``in_channels`` (PyTorch only, where they build a catalog model) and ``token``
     (only as an opaque scope). Uploaded artifact bytes are keyed by content:
-    ``source = "sha256:<hex>"``. Not part of the key, because the server does not use
+    ``source = "sha256:<hex>"``. Otherwise ``source_stamp`` (the caller's
+    ``local_source_stamp(source)``) is part of the key, so a rewritten local file gets
+    a new key. Not part of the key, because the server does not use
     them to load: ``model_id``, the friendly ``name`` of other formats,
     ``preprocessing``, ``postprocessing``, other ``metadata`` entries and
     ``artifact_mime_type``.
@@ -207,6 +248,7 @@ def cache_key_from_spec(spec: Any, *, artifact_sha256: str = "") -> ModelCacheKe
         source = f"sha256:{hashlib.sha256(artifact).hexdigest()}"
     else:
         source = (spec.source or "").strip()
+    stamp = "" if (artifact_sha256 or artifact) else source_stamp
     options: List[Tuple[str, str]] = []
     if spec.lazy_load:
         options.append(("lazy_load", "true"))
@@ -227,6 +269,7 @@ def cache_key_from_spec(spec: Any, *, artifact_sha256: str = "") -> ModelCacheKe
         task=_enum_name(spec, "task"),
         load_options=tuple(options),
         auth_scope=_auth_scope(spec.token or ""),
+        source_stamp=stamp,
     )
 
 
@@ -1131,6 +1174,7 @@ __all__ = [
     "CacheShutdownError",
     "ModelCacheKey",
     "cache_key_from_spec",
+    "local_source_stamp",
     "ModelRecord",
     "LoadResult",
     "SessionLease",
