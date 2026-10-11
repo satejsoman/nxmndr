@@ -417,9 +417,7 @@ def test_stop_does_not_wait_for_a_load_still_building_in_the_worker(tmp_path, se
 
 def test_the_rendezvous_store_listens_on_the_rpc_address_only(tmp_path, service_process):
     lan = _lan_address()
-    with socket.socket() as probe:
-        probe.bind(("0.0.0.0", 0))  # free on every interface
-        port = probe.getsockname()[1]
+    port = _free_port_pair("0.0.0.0")  # free on every interface; P + 1 goes unused here
     weights = rpc_models.save_add_const(tmp_path / "a.pt", 1.0)
     proc = service_process(env={"MASTER_PORT": str(port)})  # spawned worker, loopback default
     with proc.client() as client:
