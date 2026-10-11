@@ -152,7 +152,7 @@ The spawned worker builds every PyTorch model on the server's first GPU (the fir
 
 ### External Worker Mode (worker on another host)
 
-1. Start the server with `NXMNDR_RPC_EXTERNAL_WORKER=1`. It spawns no worker. `MASTER_ADDR` is the address it listens on (default `0.0.0.0`) and `MASTER_PORT` the rendezvous port (default `29500`).
+1. Start the server with `NXMNDR_RPC_EXTERNAL_WORKER=1`. It spawns no worker. `MASTER_ADDR` is the address it listens on and `MASTER_PORT` the rendezvous port (default `29500`). The default address is `127.0.0.1`, so only a worker on this host can join. For a worker on another host, set `MASTER_ADDR` to an address of this host that the worker can reach (or `0.0.0.0`), on a trusted network only (Network, below).
 2. On the worker host:
 
 ```bash
@@ -163,7 +163,7 @@ The worker waits until the server loads its first PyTorch model, reports on `MAS
 
 - Weights load on the worker host: the spec's `source` path must exist there (as for a remote nxmndr server). A client that uploads `artifact` bytes gets a path in the server's cache, which the worker host must also see.
 - The worker host needs nxmndr with the same torch version, and the model code: the module of a class registered with `register_pytorch_model` must import there, and a catalog model needs its family package.
-- Network: TCP between the hosts on `MASTER_PORT`, `MASTER_PORT + 1` and the ports gloo and TensorPipe open. Those transports pick an interface from the hostname; where it resolves to a loopback address (`::1` on the macOS test host; Debian-family hosts often map it to `127.0.1.1`), set `GLOO_SOCKET_IFNAME` and `TP_SOCKET_IFNAME` to the LAN interface on both hosts. `torch.distributed.rpc` has no authentication and runs pickled calls: use it only on a trusted network.
+- Network: TCP between the hosts on `MASTER_PORT`, `MASTER_PORT + 1` and the ports gloo and TensorPipe open. The server binds `MASTER_PORT` and `MASTER_PORT + 1` on `MASTER_ADDR` only (torch's own rendezvous store would listen on every interface). gloo and TensorPipe pick an interface from the hostname; where it resolves to a loopback address (`::1` on the macOS test host; Debian-family hosts often map it to `127.0.1.1`), set `GLOO_SOCKET_IFNAME` and `TP_SOCKET_IFNAME` to the LAN interface on both hosts. `torch.distributed.rpc` has no authentication and runs pickled calls, so anyone who can connect to these ports can run code in the server and in the worker: use a non-loopback `MASTER_ADDR` only on a trusted network. With a loopback `MASTER_ADDR` (the default, also for the spawned worker) on a host whose name resolves to a non-loopback address, set `GLOO_SOCKET_IFNAME` and `TP_SOCKET_IFNAME` to the loopback interface (`lo` on Linux, `lo0` on macOS) to keep those transports off the network.
 - One worker per server run. A server that dies without stopping its worker leaves it running: stop it and start a new one. A worker that dies disables PyTorch models until the server restarts.
 
 ### Torch RPC Execution Flow

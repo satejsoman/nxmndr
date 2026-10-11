@@ -18,7 +18,8 @@ the worker; a reload gets a new identity).
 
 The external-worker tests start the server with ``NXMNDR_RPC_EXTERNAL_WORKER=1`` and
 the worker as a separate ``python -m nxmndr.server.rpc_worker`` process, both on this
-host's non-loopback address, as a worker on a second machine would be.
+host's non-loopback address, as a worker on a second machine would be. The rendezvous
+store of the default server listens on loopback only, not on that address.
 """
 
 from __future__ import annotations
@@ -379,6 +380,23 @@ def test_a_load_that_times_out_leaves_no_model_in_the_worker(tmp_path, service_p
 
     stopped = proc.stop()
     assert stopped["children"] == [], stopped
+
+
+def test_the_rendezvous_store_listens_on_the_rpc_address_only(tmp_path, service_process):
+    lan = _lan_address()
+    with socket.socket() as probe:
+        probe.bind(("0.0.0.0", 0))  # free on every interface
+        port = probe.getsockname()[1]
+    weights = rpc_models.save_add_const(tmp_path / "a.pt", 1.0)
+    proc = service_process(env={"MASTER_PORT": str(port)})  # spawned worker, loopback default
+    with proc.client() as client:
+        client.load_model_result("", _spec(weights))
+    # torch's own store would listen on every interface, whatever MASTER_ADDR names.
+    with socket.create_connection(("127.0.0.1", port), timeout=5):
+        pass
+    with pytest.raises(ConnectionRefusedError):
+        socket.create_connection((lan, port), timeout=5).close()
+    proc.stop()
 
 
 def _lan_address() -> str:

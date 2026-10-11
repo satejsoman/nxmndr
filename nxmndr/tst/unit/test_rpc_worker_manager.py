@@ -16,6 +16,7 @@
 - A load that fails or times out in the server is abandoned in the worker, which drops
   the model when its build ends; the fingerprint is taken before the model moves.
 - After a stopped server, a later one in the process is refused with the reason.
+- The RPC group listens on loopback unless MASTER_ADDR names another address.
 The real worker, rendezvous and routing run in tst/integration/test_rpc_pytorch_service.py.
 """
 
@@ -478,3 +479,14 @@ def test_the_service_shutdown_stops_the_rpc_worker_after_the_cache(tmp_path, mon
     monkeypatch.setattr(service.rpc_manager, "shutdown", lambda: calls.append("rpc"))
     service.shutdown(grace=0)
     assert calls == ["cache", "rpc"]
+
+
+def test_the_rpc_group_listens_on_loopback_unless_an_address_is_given(monkeypatch):
+    monkeypatch.delenv("MASTER_ADDR", raising=False)
+    assert managers.RpcWorkerManager(external_worker=True)._addr == "127.0.0.1"
+    assert managers.RpcWorkerManager(external_worker=False)._addr == "127.0.0.1"
+    monkeypatch.setenv("MASTER_ADDR", "")  # set but empty: a bind on it takes every interface
+    assert managers.RpcWorkerManager(external_worker=True)._addr == "127.0.0.1"
+    assert managers.RpcWorkerManager(external_worker=False)._addr == "127.0.0.1"
+    monkeypatch.setenv("MASTER_ADDR", "192.0.2.10")
+    assert managers.RpcWorkerManager(external_worker=True)._addr == "192.0.2.10"

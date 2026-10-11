@@ -220,11 +220,15 @@ RPC_LOAD_TIMEOUT_SECONDS = 300.0
 RPC_STOP_TIMEOUT_SECONDS = 2.0
 # Aux resource name of a PyTorch record's model in the RPC worker.
 RPC_MODEL_RESOURCE = "pytorch_rpc_model"
+# The address the RPC group listens on (MASTER_ADDR) unless configured: loopback, so
+# only processes on this host can reach it. torch.distributed.rpc has no
+# authentication and unpickles every call, so a worker on another host needs an
+# explicit MASTER_ADDR (an address of this host that it can reach, or 0.0.0.0).
+RPC_DEFAULT_ADDR = "127.0.0.1"
 # External worker mode (NXMNDR_RPC_EXTERNAL_WORKER=1): the server does not spawn the
-# worker; one started with ``python -m nxmndr.server.rpc_worker``, possibly on another
-# host, reports to MASTER_PORT + 1 and joins the group at MASTER_ADDR:MASTER_PORT.
-# Defaults: all interfaces, and 29500, run_worker's and torch's usual MASTER_PORT.
-RPC_EXTERNAL_DEFAULT_ADDR = "0.0.0.0"
+# worker; one started with ``python -m nxmndr.server.rpc_worker`` reports to
+# MASTER_PORT + 1 and joins the group at MASTER_ADDR:MASTER_PORT. Default port: 29500,
+# run_worker's and torch's usual MASTER_PORT.
 RPC_EXTERNAL_DEFAULT_PORT = 29500
 
 
@@ -408,9 +412,10 @@ class RpcWorkerManager:
             flag = os.environ.get("NXMNDR_RPC_EXTERNAL_WORKER", "").strip().lower()
             external_worker = flag not in {"", "0", "false", "no", "off"}
         self._external = bool(external_worker)
-        default_addr = RPC_EXTERNAL_DEFAULT_ADDR if self._external else "127.0.0.1"
-        self._addr = master_addr or os.environ.get("MASTER_ADDR", default_addr)
+        # An empty MASTER_ADDR would bind every interface: it means the default.
+        self._addr = (master_addr or os.environ.get("MASTER_ADDR", "")).strip() or RPC_DEFAULT_ADDR
         self._port = int(master_port or os.environ.get("MASTER_PORT", "0") or 0)
+        self._store = None  # the rendezvous TCPStore server, bound to self._addr
         self.startup_timeout_s = float(startup_timeout_s)
         self.device = str(device or "cpu")
 
@@ -485,6 +490,20 @@ class RpcWorkerManager:
             _process_owner = self  # from here on this process has used its one attempt
             init_method = f"tcp://{addr}:{port}"
             try:
+                # torch's TCPStore server listens on every interface whatever init_method
+                # names; bind the rendezvous port on addr here and hand the socket to a
+                # multi-tenant TCPStore, which init_process_group and init_rpc then reuse.
+                listen_fd = socket.create_server((addr, port)).detach()
+                self._store = dist.TCPStore(
+                    addr,
+                    port,
+                    2,
+                    True,
+                    timedelta(seconds=timeout),
+                    wait_for_workers=False,
+                    multi_tenant=True,
+                    master_listen_fd=listen_fd,
+                )
                 dist.init_process_group(
                     backend="gloo",
                     rank=0,
@@ -501,6 +520,7 @@ class RpcWorkerManager:
                 self._error = f"{type(exc).__name__}: {exc}"
                 _terminate(proc)
                 self._leave_group(graceful=False)
+                self._store = None
                 raise RpcWorkerStartError(
                     f"the PyTorch RPC worker did not complete the rendezvous at {init_method} "
                     f"within {timeout:g} s: {self._error}"
@@ -669,6 +689,7 @@ class RpcWorkerManager:
                             "_rpc_stop failed; terminating the PyTorch RPC worker", exc_info=True
                         )
                 self._leave_group(graceful=alive)
+            self._store = None
         _terminate(proc)
 
     def shutdown(self):
