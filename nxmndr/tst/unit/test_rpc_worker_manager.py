@@ -12,7 +12,8 @@
 - A catalog model the worker cannot build is returned as a refusal, raised in the
   server as the ``CatalogError`` with its one-line message, and answered with
   INVALID_ARGUMENT (FAILED_PRECONDITION for a missing family package), never INTERNAL.
-  A registered class whose weights file does not load strictly is refused the same way.
+  A registered class whose weights file does not load strictly, for any reason (also a
+  missing file or a nested checkpoint), is refused the same way.
 - The spawned worker gets the first GPU of the server's device plan and the cuDNN policy.
 - A load that fails or times out in the server is abandoned in the worker, which drops
   the model when its build ends; the fingerprint is taken before the model moves.
@@ -562,6 +563,53 @@ def test_a_registered_class_loads_strictly_and_a_mismatch_is_refused(tmp_path, s
         assert "unit-strict" not in rpc_worker._rpc_status()["models"]
     finally:
         rpc_worker._rpc_unload("unit-strict")
+
+
+@pytest.mark.parametrize(
+    "case", ["nested", "nested_checkpoint", "extra_value", "unreadable", "missing", "load_error"]
+)
+def test_every_strict_load_failure_of_a_registered_class_is_a_one_line_refusal(tmp_path, case):
+    import argparse
+
+    import torch
+
+    class FailingAddConst(AddConst):
+        def load_state_dict(self, state, strict=True):
+            raise RuntimeError("cannot copy\nsecond line")
+
+    path, bias = tmp_path / "w.pt", torch.tensor(1.0)
+    files = {
+        "nested": {"state_dict": {"bias": bias}},
+        "nested_checkpoint": {"state_dict": {"bias": bias}, "epoch": 3},
+        "extra_value": {"bias": bias, "version": 2},
+        "unreadable": {"bias": bias, "hparams": argparse.Namespace(lr=0.1)},  # weights_only refuses
+        "load_error": {"bias": bias},
+    }
+    if case in files:
+        torch.save(files[case], str(path))
+    not_a_state_dict = (
+        f"AddConst: weights file {path} is not a state dict (a mapping of entry names to "
+        "tensors); it holds "
+    )
+    expected = {
+        "nested": not_a_state_dict + "['state_dict']",
+        "nested_checkpoint": not_a_state_dict + "['state_dict', 'epoch']",
+        "extra_value": not_a_state_dict + "['bias', 'version']",
+        "unreadable": f"AddConst: weights file {path} is not a PyTorch state dict (UnpicklingError",
+        "missing": f"AddConst: weights file {path} not found",
+        "load_error": f"weights file {path} does not load into {FailingAddConst.__qualname__}: "
+        "RuntimeError: cannot copy",
+    }[case]
+    model_class = FailingAddConst if case == "load_error" else AddConst
+    payload = {"model_class": model_class, "model_path": str(path), "name": "w"}
+    try:
+        reply = rpc_worker._rpc_load("unit-strict-file", payload)
+        assert set(reply) == {"model_id", "refused"}, reply
+        message = reply["refused"]["message"]
+        assert message.startswith(expected), message
+        assert "\n" not in message and reply["refused"]["unavailable"] is False
+    finally:
+        rpc_worker._rpc_unload("unit-strict-file")
 
 
 @pytest.mark.parametrize("state", ["stopped", "broken"])

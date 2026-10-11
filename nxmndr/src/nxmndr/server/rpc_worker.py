@@ -35,7 +35,6 @@ import socket
 import threading
 import time
 import traceback
-from collections.abc import Mapping
 from datetime import timedelta
 from pathlib import Path
 from typing import Optional
@@ -115,8 +114,7 @@ def _load_model(model_spec, device: str = "cpu"):
         model = model_class()
         # Loaded on the CPU, then moved once below with the model (as catalog models are),
         # rather than read onto the GPU, copied into CPU parameters and moved back.
-        state = torch.load(model_path, map_location="cpu", weights_only=True)
-        _load_state_strict(model, state, model_class, model_path)
+        _load_state_strict(model, model_class, model_path)
     else:
         raise TypeError(
             f"model_class {model_class!r} is not a PyTorch model class or a catalog name; the "
@@ -130,25 +128,34 @@ def _load_model(model_spec, device: str = "cpu"):
     return model, fingerprint
 
 
-def _load_state_strict(model, state, model_class, model_path) -> None:
-    """Load ``state`` into ``model`` with strict=True, as catalog models load.
+def _load_state_strict(model, model_class, model_path) -> None:
+    """Load the weights file ``model_path`` (on the CPU) into ``model`` with strict=True,
+    as catalog models load.
 
     A file that lacks entries would leave those layers randomly initialized and the
-    model would serve their output. A mismatch is a refusal: ``catalog.CatalogError``
-    with one line (the class, the first differing entry and the counts), which the
-    server answers with INVALID_ARGUMENT.
+    model would serve their output. Every failure is a refusal: ``catalog.CatalogError``
+    with one line, which the server answers with INVALID_ARGUMENT. It names the file
+    that is missing or that ``torch.load`` refuses, the file that is not a mapping of
+    entry names to tensors (such as a checkpoint that nests the state dict) with its
+    first keys, the first entry that differs from the model with the counts, or the
+    first line of any other error of ``load_state_dict``.
     """
 
     from ..models import catalog
 
     name = getattr(model_class, "__qualname__", str(model_class))
-    if isinstance(state, Mapping) and all(torch.is_tensor(v) for v in state.values()):
-        mismatch = catalog._mismatch(model.state_dict(), state)
-        if mismatch:
-            raise catalog.CatalogError(
-                f"weights file {model_path} does not match {name} (strict load): {mismatch}"
-            )
-    model.load_state_dict(state, strict=True)
+    state = catalog._load_state(name, model_path)
+    mismatch = catalog._mismatch(model.state_dict(), state)
+    if mismatch:
+        raise catalog.CatalogError(
+            f"weights file {model_path} does not match {name} (strict load): {mismatch}"
+        )
+    try:
+        model.load_state_dict(state, strict=True)
+    except Exception as exc:
+        raise catalog.CatalogError(
+            f"weights file {model_path} does not load into {name}: {catalog._first_line(exc)}"
+        ) from exc
 
 
 def configure_cudnn() -> None:
