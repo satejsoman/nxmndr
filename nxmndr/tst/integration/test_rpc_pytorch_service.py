@@ -354,6 +354,33 @@ def test_worker_start_failures_are_bounded_clean_up_and_allow_a_retry(tmp_path, 
     assert stopped["children"] == [], stopped
 
 
+def test_a_load_that_times_out_leaves_no_model_in_the_worker(tmp_path, service_process):
+    slow = rpc_models.save_add_const(tmp_path / "slow.pt", 1.0)
+    weights = rpc_models.save_add_const(tmp_path / "a.pt", 2.0)
+    proc = service_process()
+    with proc.client() as client:
+        proc.command("load_timeout 1")
+        with pytest.raises(InferenceGrpcError) as timed_out:
+            client.load_model_result("", _spec(slow, rpc_models.SLOW_ADD_CONST_CLASS))
+        assert "timeout" in str(timed_out.value), str(timed_out.value)
+        # The worker finishes the build it was given, then drops the model.
+        deadline = time.monotonic() + 30
+        while True:
+            worker = proc.command("status")["worker"]
+            if not worker["loading"] or time.monotonic() > deadline:
+                break
+            time.sleep(0.2)
+        assert worker["loading"] == [] and worker["models"] == {}, worker
+
+        proc.command("load_timeout 300")
+        model_id = client.load_model_result("", _spec(weights)).model_id
+        assert list(_worker_models(proc)) == [model_id]
+        np.testing.assert_array_equal(_predict(client, model_id), CHIP + 2)
+
+    stopped = proc.stop()
+    assert stopped["children"] == [], stopped
+
+
 def _lan_address() -> str:
     """This host's non-loopback IPv4 address (the default route's source), or skip."""
 

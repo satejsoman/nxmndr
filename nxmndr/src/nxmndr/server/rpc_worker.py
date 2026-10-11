@@ -11,7 +11,9 @@ never their names (``rpc_sync`` rejects a string).
 Models are routed by identity: the worker keeps a registry keyed by the model cache
 record's model ID. ``_rpc_load(model_id, spec)`` builds one model, ``_rpc_infer``
 runs exactly that model (``UnknownModelError`` if it is not loaded), ``_rpc_unload``
-frees it, ``_rpc_stop`` ends the worker. One ID never names two models.
+frees it, ``_rpc_stop`` ends the worker. One ID never names two models. A load the
+server stopped waiting for is abandoned (``_rpc_unload(model_id, True)``): torch does
+not cancel the call, so the worker drops that model when its build ends.
 
 A catalog model that cannot be built as requested (``nxmndr.models.catalog.CatalogError``:
 weights that do not match the class or its arguments, a missing family package) is
@@ -33,6 +35,7 @@ import time
 import traceback
 from datetime import timedelta
 from pathlib import Path
+from typing import Optional
 
 import torch
 import torch.distributed as dist
@@ -65,6 +68,7 @@ class _LoadedModel:
 _worker_state = {
     "models": {},  # model_id -> _LoadedModel
     "loading": set(),  # model IDs whose _rpc_load is running
+    "abandoned": set(),  # model IDs whose load the server gave up on (_rpc_unload)
     "load_calls": 0,  # _rpc_load calls served, refused ones included (_rpc_status)
     "spec": None,
     "initialized": False,
@@ -172,9 +176,14 @@ def _fingerprint(model) -> str:
     return "sha256:" + digest.hexdigest()
 
 
-def _register(model_id: str, model) -> dict:
+def _register(model_id: str, model) -> Optional[dict]:
+    """Keep ``model`` under ``model_id``; None if the server abandoned that load."""
+
     entry = _LoadedModel(model, _model_device(model), _fingerprint(model))
     with _models_lock:
+        if model_id in _worker_state["abandoned"]:  # the server gave up on this load
+            _worker_state["abandoned"].discard(model_id)
+            return None
         _worker_state["models"][model_id] = entry
     info = {"model_id": model_id, "device": entry.device, "fingerprint": entry.fingerprint}
     if hasattr(model, "catalog_info"):  # a catalog model: its family, class and arguments
@@ -213,12 +222,17 @@ def _rpc_load(model_id, spec, device=None):
     A catalog model that cannot be built is not loaded; the result is then
     ``{"model_id", "refused": {"message", "unavailable", "traceback"}}``, with the
     ``CatalogError`` message and whether its family package is missing.
+    A load the server abandoned (``_rpc_unload(model_id, True)``) before it arrived or
+    while it built keeps nothing; the result is then ``{"model_id", "abandoned": True}``.
     """
 
     if not isinstance(model_id, str) or not model_id:
         raise ValueError("model_id must be a non-empty string")
     with _models_lock:
         _worker_state["load_calls"] += 1
+        if model_id in _worker_state["abandoned"]:  # abandoned before this call arrived
+            _worker_state["abandoned"].discard(model_id)
+            return {"model_id": model_id, "abandoned": True}
         if model_id in _worker_state["models"] or model_id in _worker_state["loading"]:
             raise ValueError(f"model {model_id} is already loaded in this PyTorch RPC worker")
         _worker_state["loading"].add(model_id)
@@ -235,6 +249,12 @@ def _rpc_load(model_id, spec, device=None):
     finally:
         with _models_lock:
             _worker_state["loading"].discard(model_id)
+    if info is None:
+        device = _model_device(model)
+        del model
+        _release(device)
+        logger.info("Dropped model %s: the server gave up on its load", model_id)
+        return {"model_id": model_id, "abandoned": True}
     logger.info(
         "Loaded model %s (%s) on %s, %s",
         model_id, _spec_value(spec, "name") or "unnamed", info["device"], info["fingerprint"],
@@ -242,17 +262,31 @@ def _rpc_load(model_id, spec, device=None):
     return info
 
 
-def _rpc_unload(model_id):
-    """Free the model of ``model_id``. True if it was loaded."""
+def _release(device: str) -> None:
+    """Return cached CUDA memory after a model on ``device`` was dropped."""
+
+    if device.startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _rpc_unload(model_id, abandon=False):
+    """Free the model of ``model_id``. True if it was loaded.
+
+    ``abandon``: the server stopped waiting for the load of ``model_id``. If that load
+    is still building or has not arrived yet, ``_rpc_load`` drops its model. An ID
+    whose load had already failed stays in the abandoned set: one 32-character entry
+    per such attempt, until the worker ends with its server.
+    """
 
     with _models_lock:
         entry = _worker_state["models"].pop(model_id, None)
+        if entry is None and abandon:
+            _worker_state["abandoned"].add(model_id)
     if entry is None:
         return False
-    on_cuda = entry.device.startswith("cuda")
+    device = entry.device
     del entry
-    if on_cuda and torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    _release(device)
     logger.info("Unloaded model %s", model_id)
     return True
 
@@ -337,10 +371,12 @@ def _rpc_status():
             mid: {"device": entry.device, "fingerprint": entry.fingerprint}
             for mid, entry in state["models"].items()
         }
+        loading = sorted(state["loading"])
     return {
         "status": "ok" if state.get("rpc_initialized") else "initializing",
         "model_loaded": bool(models),
         "models": models,
+        "loading": loading,
         "load_calls": state.get("load_calls", 0),
         "stop_requested": state.get("stop_requested"),
         "pid": os.getpid(),

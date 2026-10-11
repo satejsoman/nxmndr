@@ -325,3 +325,72 @@ def test_the_server_gives_its_rpc_worker_the_first_gpu_of_its_device_plan(monkey
     monkeypatch.setattr(server.torch.cuda, "is_available", lambda: False)
     service = server.InferenceService(model_cache_dir=tmp_path / "cpu", max_cores=2)
     assert service.rpc_manager.device == "cpu"
+
+
+def test_a_load_that_fails_in_the_server_is_abandoned_in_the_worker(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_rpc_sync(to, func, args=(), kwargs=None, timeout=None):
+        calls.append((func, args, timeout))
+        if func is rpc_worker._rpc_load:
+            raise RuntimeError("RPC ran for more than set timeout (300000 ms)")
+        return False
+
+    monkeypatch.setattr(managers.torch_rpc, "rpc_sync", fake_rpc_sync)
+    manager, _ = _running_manager(monkeypatch)
+    spec = PytorchModelSpec(model_class=AddConst, model_path=str(tmp_path / "w.pt"), name="w")
+    with pytest.raises(RuntimeError, match="set timeout"):
+        manager.load("m1", spec)
+    assert [(func, args[0], timeout) for func, args, timeout in calls[:1]] == [
+        (rpc_worker._rpc_load, "m1", managers.RPC_LOAD_TIMEOUT_SECONDS)
+    ]
+    assert [(func, args) for func, args, _ in calls[1:]] == [(rpc_worker._rpc_unload, ("m1", True))]
+
+
+def test_a_load_abandoned_while_it_builds_drops_its_model(tmp_path):
+    import threading
+
+    import torch
+
+    from tst.support import rpc_models
+
+    path = rpc_models.save_add_const(tmp_path / "w.pt", 1.0)
+    payload = {"model_class": rpc_models.GatedAddConst, "model_path": path, "name": "w"}
+    rpc_models.GATED_STARTED.clear()
+    rpc_models.GATED_RELEASE.clear()
+    replies = []
+    thread = threading.Thread(target=lambda: replies.append(rpc_worker._rpc_load("unit-gated", payload)))
+    thread.start()
+    try:
+        assert rpc_models.GATED_STARTED.wait(timeout=30)
+        assert rpc_worker._rpc_status()["loading"] == ["unit-gated"]
+        assert rpc_worker._rpc_unload("unit-gated", True) is False  # still building
+    finally:
+        rpc_models.GATED_RELEASE.set()
+        thread.join(timeout=30)
+    try:
+        assert replies == [{"model_id": "unit-gated", "abandoned": True}]
+        status = rpc_worker._rpc_status()
+        assert "unit-gated" not in status["models"] and status["loading"] == []
+        # Nothing is left under the ID: a later load of it is served.
+        payload["model_class"] = AddConst
+        assert rpc_worker._rpc_load("unit-gated", payload)["device"] == "cpu"
+        assert rpc_worker._rpc_infer("unit-gated", torch.zeros(1), "cpu").tolist() == [1.0]
+    finally:
+        rpc_worker._rpc_unload("unit-gated")
+
+
+def test_a_load_abandoned_before_it_arrives_is_not_built(tmp_path):
+    from tst.support import rpc_models
+
+    path = rpc_models.save_add_const(tmp_path / "w.pt", 1.0)
+    payload = {"model_class": AddConst, "model_path": path, "name": "w"}
+    try:
+        assert rpc_worker._rpc_unload("unit-early", True) is False
+        assert rpc_worker._rpc_load("unit-early", payload) == {
+            "model_id": "unit-early",
+            "abandoned": True,
+        }
+        assert "unit-early" not in rpc_worker._rpc_status()["models"]
+    finally:
+        rpc_worker._rpc_unload("unit-early")

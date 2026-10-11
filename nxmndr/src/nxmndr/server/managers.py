@@ -202,10 +202,19 @@ class ModelManager(ModelCache):
 RPC_DRIVER_NAME = "driver"
 RPC_WORKER_NAME = "worker"
 # Bound on starting the PyTorch RPC worker, applied twice: to the child's readiness
-# handshake and to the torch rendezvous that follows it. 60 s is torch's default RPC
-# timeout (torch.distributed.rpc.constants.DEFAULT_RPC_TIMEOUT_SEC), the bound the RPC
-# group already applied to every call; a warm start took 0.5 s on macOS arm64.
+# handshake and to the torch rendezvous that follows it. It is also the RPC group's
+# default timeout, which applies to the calls that set none (unload, status); a load,
+# an inference call and the stop have their own bounds. 60 s is torch's default RPC
+# timeout (torch.distributed.rpc.constants.DEFAULT_RPC_TIMEOUT_SEC); a warm start took
+# 0.5 s on macOS arm64.
 RPC_STARTUP_TIMEOUT_SECONDS = 60.0
+# Bound on one model load in the worker (_rpc_load). It detects a hung worker; it does
+# not bound normal load latency. The largest catalog weights file (regnet_y_128gf,
+# 2.55 GB) built in 11 s on macOS arm64, and 300 s also covers reading it at 9 MB/s
+# from slow network storage. It is above the QGIS plugin's 120 s deadline for LoadModel
+# and OpenSession, so a slow load that is still progressing lands in the model cache for
+# the client's next attempt instead of being abandoned.
+RPC_LOAD_TIMEOUT_SECONDS = 300.0
 # Stopping the worker: the _rpc_stop call, the graceful RPC shutdown and each join
 # of the child get this long (the values the earlier stop() used).
 RPC_STOP_TIMEOUT_SECONDS = 2.0
@@ -528,7 +537,8 @@ class RpcWorkerManager:
         Returns the worker's ``{"model_id", "device", "fingerprint"}``. A catalog model
         the worker refused raises ``catalog.CatalogError`` (``CatalogUnavailableError``
         when its family package is missing) with the worker's one-line message; the
-        worker's traceback is logged here at DEBUG.
+        worker's traceback is logged here at DEBUG. A load that fails here, or takes
+        longer than ``RPC_LOAD_TIMEOUT_SECONDS``, is abandoned in the worker.
         """
 
         from ..models import catalog
@@ -549,7 +559,19 @@ class RpcWorkerManager:
         self.ensure_started()
         from .rpc_worker import _rpc_load
 
-        info = torch_rpc.rpc_sync(RPC_WORKER_NAME, _rpc_load, args=(model_id, payload))
+        try:
+            info = torch_rpc.rpc_sync(
+                RPC_WORKER_NAME,
+                _rpc_load,
+                args=(model_id, payload),
+                timeout=RPC_LOAD_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            # torch does not cancel a call that timed out: the build may still finish in
+            # the worker. Have the worker drop model_id, now or when its build ends; a
+            # retry gets a new model ID, so nothing else names it.
+            self.unload(model_id, abandon=True)
+            raise
         refused = info.get("refused") if isinstance(info, dict) else None
         if refused:
             logger.debug(
@@ -573,16 +595,21 @@ class RpcWorkerManager:
             RPC_WORKER_NAME, _rpc_infer, args=(model_id, tensor, device_hint), timeout=timeout
         )
 
-    def unload(self, model_id: str) -> bool:
-        """Free the worker's model ``model_id``. False if the worker or the model is gone."""
+    def unload(self, model_id: str, *, abandon: bool = False) -> bool:
+        """Free the worker's model ``model_id``. False if the worker or the model is gone.
+
+        ``abandon``: the load of ``model_id`` failed in this process; the worker also
+        drops the model if that load is still building there or has not arrived.
+        """
 
         if not self.is_alive():
             logger.info("PyTorch RPC worker not running; nothing to free for model %s", model_id)
             return False
         from .rpc_worker import _rpc_unload
 
+        args = (model_id, True) if abandon else (model_id,)
         try:
-            return bool(torch_rpc.rpc_sync(RPC_WORKER_NAME, _rpc_unload, args=(model_id,)))
+            return bool(torch_rpc.rpc_sync(RPC_WORKER_NAME, _rpc_unload, args=args))
         except Exception:
             logger.warning("freeing model %s in the PyTorch RPC worker failed", model_id, exc_info=True)
             return False

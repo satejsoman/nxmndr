@@ -9,6 +9,9 @@ classes and process targets by reference.
 ``AddConst`` returns its input plus a scalar ``bias`` read from the weights file, so
 two weights files give two models with distinguishable outputs from one class.
 ``SleepyAddConst`` first sleeps for the ``delay`` seconds in its weights file.
+``SlowAddConst`` takes 3 s to construct (a slow load); ``GatedAddConst`` sets
+``GATED_STARTED`` when its construction starts and waits for ``GATED_RELEASE``, so a
+test can act while a load is in progress.
 The ``*_worker`` functions replace ``RpcWorkerManager.worker_target`` to make the
 child fail before it is ready to join the RPC group.
 """
@@ -16,12 +19,16 @@ child fail before it is ready to join the RPC group.
 from __future__ import annotations
 
 import os
+import threading
 import time
 
 import torch
 
 ADD_CONST_CLASS = "nxmndr_test_add_const"
 SLEEPY_ADD_CONST_CLASS = "nxmndr_test_sleepy_add_const"
+SLOW_ADD_CONST_CLASS = "nxmndr_test_slow_add_const"
+GATED_STARTED = threading.Event()
+GATED_RELEASE = threading.Event()
 
 
 class AddConst(torch.nn.Module):
@@ -43,6 +50,19 @@ class SleepyAddConst(AddConst):
         return super().forward(x)
 
 
+class SlowAddConst(AddConst):
+    def __init__(self):
+        time.sleep(3.0)
+        super().__init__()
+
+
+class GatedAddConst(AddConst):
+    def __init__(self):
+        GATED_STARTED.set()
+        GATED_RELEASE.wait(timeout=30)
+        super().__init__()
+
+
 def save_add_const(path, bias: float) -> str:
     torch.save({"bias": torch.tensor(float(bias))}, str(path))
     return str(path)
@@ -58,6 +78,7 @@ def register() -> None:
 
     register_pytorch_model(ADD_CONST_CLASS, AddConst)
     register_pytorch_model(SLEEPY_ADD_CONST_CLASS, SleepyAddConst)
+    register_pytorch_model(SLOW_ADD_CONST_CLASS, SlowAddConst)
 
 
 def crashing_worker(master_addr, master_port, ready_port, startup_timeout_s, device="cpu"):

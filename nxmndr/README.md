@@ -148,7 +148,7 @@ nxmndr-server --host 0.0.0.0   # gRPC, and with --azure-proxy the HTTP proxy, on
 
 Used for remote execution of PyTorch models via `torch.distributed.rpc`. A worker process is spawned server-side for PyTorch specs, or started by hand, on the server's host or another one (external worker mode, below).
 
-The spawned worker builds every PyTorch model on the server's first GPU (the first entry of its device plan; CPU without CUDA) and applies the server's cuDNN policy (`NXMNDR_CUDNN`). One inference call in the worker (a unary `Predict` or one stream tile) may take up to 60 s; a slower call fails that request or tile.
+The spawned worker builds every PyTorch model on the server's first GPU (the first entry of its device plan; CPU without CUDA) and applies the server's cuDNN policy (`NXMNDR_CUDNN`). One inference call in the worker (a unary `Predict` or one stream tile) may take up to 60 s; a slower call fails that request or tile. A model load in the worker may take up to 300 s; a load that fails or times out in the server is dropped in the worker when its build ends.
 
 ### External Worker Mode (worker on another host)
 

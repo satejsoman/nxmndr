@@ -15,6 +15,8 @@ Then one reply per stdin command:
   model IDs with device and fingerprint), or the error that prevented it.
 - ``target real|crash|silent``: the child process target of the next worker start.
 - ``timeout <seconds>``: the startup timeout of the next worker start.
+- ``load_timeout <seconds>``: the bound on each later model load in the worker
+  (``managers.RPC_LOAD_TIMEOUT_SECONDS``).
 - ``stop`` (or end of input): ``stop_server``, then the RPC worker manager's
   ``shutdown``; replies with the live worker children afterwards and exits.
 """
@@ -79,6 +81,9 @@ def main() -> int:
         elif words[0] == "timeout":
             rpc.startup_timeout_s = float(words[1])
             _say({"timeout": rpc.startup_timeout_s})
+        elif words[0] == "load_timeout":
+            managers.RPC_LOAD_TIMEOUT_SECONDS = float(words[1])
+            _say({"load_timeout": managers.RPC_LOAD_TIMEOUT_SECONDS})
         elif words[0] == "stop":
             break
     stop_server(server, service, grace=5.0)
