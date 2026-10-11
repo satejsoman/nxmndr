@@ -81,6 +81,7 @@ mypy src/
 ## Documentation
 
 - [Server README](nxmndr/README.md) - Installation, API documentation, gRPC/Torch RPC details
+- [Changelog](nxmndr/CHANGELOG.md) - Breaking changes for clients and operators
 - [Azure OpenAI Setup](nxmndr/docs/azure_setup.md) - Azure proxy configuration
 - [ChatGPT Vision Guide](nxmndr/docs/chatgpt_vision.md) - Vision model integration
 

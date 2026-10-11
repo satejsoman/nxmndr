@@ -264,6 +264,8 @@ Endpoints:
 - `Capabilities` / `Health` : Introspection & readiness.
 - `StreamPredict` : Bidirectional streaming for tiled/chunked inference with session support.
 
+Breaking changes for clients and operators of the previous version: [CHANGELOG.md](CHANGELOG.md).
+
 ### Model Formats
 Supported enums: `PYTORCH`, `ONNX`, `HUGGINGFACE`, `TORCHHUB`.
 
