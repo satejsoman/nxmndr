@@ -347,6 +347,11 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
         self._expiry_stop = threading.Event()
         self._expiry_thread: Optional[threading.Thread] = None
         self._default_max_inflight = int(os.environ.get("NXMNDR_STREAM_MAX_INFLIGHT", "16"))
+        if self._default_max_inflight < 1:
+            # Every session would get this window, and clients refuse one below 1.
+            raise ValueError(
+                f"NXMNDR_STREAM_MAX_INFLIGHT must be >= 1, got {self._default_max_inflight}"
+            )
         self._default_chunk_bytes = int(
             os.environ.get("NXMNDR_STREAM_MAX_CHUNK_BYTES", str(8 * 1024 * 1024))
         )
@@ -1240,6 +1245,12 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
             )
 
         transport = request.transport
+        if transport.max_inflight < 0:
+            return _fail(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                f"transport.max_inflight {transport.max_inflight} must be >= 0 "
+                "(0 takes Capabilities stream_max_inflight)",
+            )
         max_inflight = min(
             transport.max_inflight or self._default_max_inflight, self._default_max_inflight
         )

@@ -99,6 +99,16 @@ def test_the_default_chunk_is_clamped_to_the_advertised_maximum(tmp_path, monkey
     assert int(caps["stream_max_chunk_bytes"]) < server.GRPC_MAX_MESSAGE_LENGTH
 
 
+@pytest.mark.parametrize("value", ["0", "-2"])
+def test_a_stream_max_inflight_below_one_is_refused_at_startup(tmp_path, monkeypatch, value):
+    monkeypatch.setenv("NXMNDR_STREAM_MAX_INFLIGHT", value)
+    with pytest.raises(ValueError, match="NXMNDR_STREAM_MAX_INFLIGHT"):
+        server.InferenceService(
+            model_cache_dir=tmp_path / "cache",
+            model_manager=managers.ModelManager(None, capacity=1, loader=_record),
+        )
+
+
 def test_sam_variant_factory_gets_the_record_auth_token(monkeypatch):
     """The SAM path reads ModelRecord.auth_token, not a token on the spec or in metadata."""
 

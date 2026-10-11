@@ -666,6 +666,17 @@ def test_inference_runs_at_most_max_cores_tiles_at_once(tmp_path):
         assert all(r[0].metadata.get("error") is None for r in results.values())
 
 
+def test_open_session_refuses_a_negative_max_inflight(tmp_path, loader):
+    with running_server(tmp_path, loader=loader) as h, h.client() as c:
+        mid = _load(c, "double://seg")
+        with pytest.raises(InferenceGrpcError) as err:
+            _open(c, "sess-negative", mid, max_inflight=-1)
+        assert err.value.code == grpc.StatusCode.INVALID_ARGUMENT
+        assert h.service._session_state("sess-negative") == "unknown"
+        assert h.manager.pin_count(mid) == 0
+        assert _open(c, "sess-default", mid, max_inflight=0).max_inflight == 16  # 0: the default
+
+
 def test_serve_stops_grpc_then_shuts_down_the_model_cache(tmp_path, loader, monkeypatch):
     from nxmndr.server import managers, server
 
