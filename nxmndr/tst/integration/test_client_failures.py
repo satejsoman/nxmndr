@@ -112,6 +112,37 @@ def test_a_failed_call_does_not_end_a_stream_on_the_same_client(tmp_path, loader
         assert errors == [] and [r.metadata["tile_id"] for r in got] == ["t0"]
 
 
+def test_failed_registry_calls_do_not_end_a_stream_on_the_same_client(
+    tmp_path, loader, gated, monkeypatch
+):
+    with running_server(tmp_path, loader=loader) as h, h.client() as c:
+        gated_id = _load(c, "double://gated")
+        call = c.stream_predict(model_id=gated_id, samples=[_chip()], tile_ids=["t0"])
+        got, errors = [], []
+
+        def consume():
+            try:
+                got.extend(call)
+            except Exception as exc:  # surfaced by the assertion below
+                errors.append(exc)
+
+        consumer = threading.Thread(target=consume)
+        consumer.start()
+        assert gated.entered.wait(10), "the stream's tile never started"
+
+        def broken_list(provider_id=None):
+            raise RuntimeError("registry store failed")
+
+        monkeypatch.setattr(h.service.registry_store, "list_entries", broken_list)
+        with pytest.raises(InferenceGrpcError):
+            c.list_model_registry()
+        with pytest.raises(InferenceGrpcError):
+            c.evict_model_registry_entry("no-such-entry")  # NOT_FOUND
+        gated.release.set()
+        consumer.join(10)
+        assert errors == [] and [r.metadata["tile_id"] for r in got] == ["t0"]
+
+
 def test_a_failed_stream_does_not_end_a_predict_on_the_same_client(tmp_path, loader, gated):
     with running_server(tmp_path, loader=loader) as h, h.client(max_attempts=3, backoff_seconds=0) as c:
         gated_id = _load(c, "double://gated")
