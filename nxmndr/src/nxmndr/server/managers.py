@@ -256,17 +256,22 @@ def _terminate(proc) -> None:
 
 
 def _run_rpc_worker(
-    master_addr: str, master_port: int, ready_port: int, startup_timeout_s: float
+    master_addr: str,
+    master_port: int,
+    ready_port: int,
+    startup_timeout_s: float,
+    device: str = "cpu",
 ) -> None:
     """Process target of the PyTorch RPC worker.
 
     Module level so the ``spawn`` start method can pickle it; a nested function
     cannot be pickled. The worker module is imported in the child only. The worker
-    starts with no model: the server loads each model by its model ID.
+    starts with no model: the server loads each model by its model ID, on ``device``.
     """
 
-    from .rpc_worker import run_worker
+    from .rpc_worker import configure_cudnn, run_worker
 
+    configure_cudnn()  # the server's cuDNN policy; a spawned child does not inherit it
     run_worker(
         RPC_WORKER_NAME,
         None,
@@ -276,6 +281,7 @@ def _run_rpc_worker(
         master_port=master_port,
         ready_port=ready_port,
         startup_timeout_s=startup_timeout_s,
+        device=device,
     )
 
 
@@ -364,6 +370,9 @@ class RpcWorkerManager:
     is spawned; the first phase waits for a worker started elsewhere to report to
     ``MASTER_PORT + 1`` (``_await_external``). A wait that times out raises
     ``RpcWorkerNotJoinedError`` and a later load waits again.
+
+    The spawned worker builds every model on ``device``. An external worker uses its
+    own ``--device``: the server's devices describe the server's host, not the worker's.
     """
 
     # The child's process target; tests replace it with a module-level function.
@@ -376,6 +385,7 @@ class RpcWorkerManager:
         master_port: Optional[int] = None,
         startup_timeout_s: float = RPC_STARTUP_TIMEOUT_SECONDS,
         external_worker: Optional[bool] = None,
+        device: str = "cpu",
     ):
         self._lock = threading.Lock()
         self._proc = None
@@ -389,6 +399,7 @@ class RpcWorkerManager:
         self._addr = master_addr or os.environ.get("MASTER_ADDR", default_addr)
         self._port = int(master_port or os.environ.get("MASTER_PORT", "0") or 0)
         self.startup_timeout_s = float(startup_timeout_s)
+        self.device = str(device or "cpu")
 
     # ---- start ------------------------------------------------------------
 
@@ -440,7 +451,7 @@ class RpcWorkerManager:
                 # spawn: the child must not inherit this process's gRPC and torch threads.
                 proc = multiprocessing.get_context("spawn").Process(
                     target=type(self).worker_target,
-                    args=(addr, port, listener.getsockname()[1], timeout),
+                    args=(addr, port, listener.getsockname()[1], timeout, self.device),
                     daemon=True,
                     name="nxmndr-pytorch-rpc-worker",
                 )

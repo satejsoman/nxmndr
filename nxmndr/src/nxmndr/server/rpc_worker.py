@@ -102,8 +102,10 @@ def _load_model(model_spec, device: str = "cpu"):
         model = catalog.build(model_class, model_path, _spec_value(model_spec, "catalog_args"))
     elif callable(model_class):
         model = model_class()
+        # Loaded on the CPU, then moved once below with the model (as catalog models are),
+        # rather than read onto the GPU, copied into CPU parameters and moved back.
         model.load_state_dict(
-            torch.load(model_path, map_location=target, weights_only=True), strict=False
+            torch.load(model_path, map_location="cpu", weights_only=True), strict=False
         )
     else:
         raise TypeError(
@@ -115,6 +117,37 @@ def _load_model(model_spec, device: str = "cpu"):
         model.to(target)
     model.eval()
     return model
+
+
+def configure_cudnn() -> None:
+    """Disable cuDNN when the bundled cuDNN cannot serve the attached GPUs.
+
+    torch >= 2.9 ships cuDNN >= 9.11, which has no kernels for SM < 7.5 (Volta and older);
+    convolutions then fail with "unable to find an engine". Falling back to the native CUDA
+    kernels keeps inference on the GPU. Override with NXMNDR_CUDNN=0|1.
+
+    ``nxmndr-server`` (``server.main``) calls it at startup, and so does each PyTorch
+    RPC worker: the setting is per process, and a spawned worker starts with torch's
+    default.
+    """
+    override = os.environ.get("NXMNDR_CUDNN")
+    if override is not None:
+        torch.backends.cudnn.enabled = override.strip() not in {"0", "false", "no", "off"}
+        logger.info("cuDNN %s by NXMNDR_CUDNN", "enabled" if torch.backends.cudnn.enabled else "disabled")
+        return
+    try:
+        if not torch.cuda.is_available():
+            return
+        compiled = torch._C._cudnn.getCompileVersion() if hasattr(torch._C, "_cudnn") else None
+        min_cc = min(torch.cuda.get_device_capability(i) for i in range(torch.cuda.device_count()))
+        if compiled and (compiled[0], compiled[1]) >= (9, 11) and min_cc < (7, 5):
+            torch.backends.cudnn.enabled = False
+            logger.warning(
+                "cuDNN %s does not support SM %d.%d GPUs; cuDNN disabled, using native CUDA kernels",
+                ".".join(str(v) for v in compiled), min_cc[0], min_cc[1],
+            )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("cuDNN capability check skipped: %s", exc)
 
 
 def _model_device(model) -> str:
@@ -460,6 +493,7 @@ def main(argv=None) -> int:
         parser.error(f"--device {args.device}: CUDA is not available on this host")
     if args.device == "mps" and not torch.backends.mps.is_available():
         parser.error("--device mps: MPS is not available on this host")
+    configure_cudnn()
     logger.info("waiting for the nxmndr server at %s:%d", args.master, args.port + 1)
     _join_server(args.master, args.port + 1, args.timeout)
     run_worker(

@@ -86,6 +86,7 @@ from ..models import catalog, ultralytics_yolo
 from ..models.sam import resolve_sam_capability
 from . import dispatch
 from . import managers
+from . import rpc_worker
 from .azure_openai_proxy import AzureOpenAIProxy, setup_azure_proxy_routes
 from .managers import RpcWorkerManager
 
@@ -106,7 +107,15 @@ else:
 logger = get_logger("nxmndr.server")
 
 GRPC_MAX_MESSAGE_LENGTH = 128 * 1024 * 1024  # 128MB ceiling for large tensor payloads
-RPC_INFER_TIMEOUT_SECONDS = 5.0  # Timeout for individual RPC inference calls
+# Bound on one inference call to the PyTorch RPC worker (a unary Predict or one stream
+# tile). 60 s is torch's default RPC timeout (torch.distributed.rpc.constants.
+# DEFAULT_RPC_TIMEOUT_SEC). torchvision regnet_y_128gf (2.4 GiB of weights) took 3.9 s
+# on a 1024x1024x3 chip with 12 CPU threads on macOS arm64, so about 40 s on the largest
+# tile the server accepts (128 MiB of float32). The tiles of a stream run one after
+# another, and the QGIS plugin cancels a stream after 120 s without a response, so a
+# stuck call fails its own tile, not the stream. A call that times out still runs to
+# its end in the worker.
+RPC_INFER_TIMEOUT_SECONDS = 60.0
 DEFAULT_MODEL_CACHE_CAPACITY = 10  # plan: LRU model cache capacity (NXMNDR_MODEL_CACHE_CAPACITY)
 SERVER_STOP_GRACE_SECONDS = 5.0  # grace for in-flight RPCs, then cache shutdown drains leases
 # Bind address of the gRPC server and the HTTP proxy unless --host names another:
@@ -194,6 +203,17 @@ class LoggingInterceptor(grpc.ServerInterceptor):
             _loggable_metadata(handler_call_details.invocation_metadata),
         )
         return continuation(handler_call_details)
+
+
+def _rpc_worker_device(device_plan) -> str:
+    """Where the spawned PyTorch RPC worker builds models: the plan's first GPU, else cpu.
+
+    One worker process holds every PyTorch model, so they share that device; the
+    per-call device hint does not move them (``rpc_worker._rpc_infer``).
+    """
+
+    first = device_plan[0] if device_plan else {}
+    return str(first.get("id", "cpu")) if first.get("type") == "gpu" else "cpu"
 
 
 def _no_rpc_model(model_id: str):
@@ -295,9 +315,24 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
         self._model_cache_capacity = int(
             os.environ.get("NXMNDR_MODEL_CACHE_CAPACITY", str(DEFAULT_MODEL_CACHE_CAPACITY))
         )
+        # Device planning: prefer GPUs up to max_cores, fall back to CPU threads otherwise.
+        self._device_plan = []
+        if torch.cuda.is_available():
+            gpu_count = torch.cuda.device_count()
+            selected = max(1, min(self._max_cores, gpu_count))
+            self._device_plan = [
+                {"type": "gpu", "ordinal": idx, "id": f"cuda:{idx}"} for idx in range(selected)
+            ]
+        else:
+            cpu_count = os.cpu_count() or 1
+            selected = max(1, min(self._max_cores, cpu_count))
+            self._device_plan = [
+                {"type": "cpu", "ordinal": idx, "id": f"cpu:{idx}"} for idx in range(selected)
+            ]
+        self._device_cursor = 0
         # Generic PyTorch models live in this manager's RPC worker; each cache record
         # owns its worker-side model (managers.RPC_MODEL_RESOURCE).
-        self.rpc_manager = RpcWorkerManager()
+        self.rpc_manager = RpcWorkerManager(device=_rpc_worker_device(self._device_plan))
         self.model_manager = model_manager or managers.ModelManager(
             self.provider,
             capacity=self._model_cache_capacity,
@@ -319,21 +354,6 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
             self.provider.config.inference.model_cache_dir = str(self._model_cache_dir)
             self.logger.info("Model cache directory: %s", self._model_cache_dir)
 
-        # Device planning: prefer GPUs up to max_cores, fall back to CPU threads otherwise.
-        self._device_plan = []
-        if torch.cuda.is_available():
-            gpu_count = torch.cuda.device_count()
-            selected = max(1, min(self._max_cores, gpu_count))
-            self._device_plan = [
-                {"type": "gpu", "ordinal": idx, "id": f"cuda:{idx}"} for idx in range(selected)
-            ]
-        else:
-            cpu_count = os.cpu_count() or 1
-            selected = max(1, min(self._max_cores, cpu_count))
-            self._device_plan = [
-                {"type": "cpu", "ordinal": idx, "id": f"cpu:{idx}"} for idx in range(selected)
-            ]
-        self._device_cursor = 0
         # Inference calls that run at once, across Predict and every stream. The gRPC
         # handler pool (GRPC_HANDLER_THREADS) is larger, so that control calls are served
         # while streams wait; this keeps model runs to min(max_cores, CPU count).
@@ -820,12 +840,18 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
                 infer=infer,
                 logger=self.logger,
             )
+        device_id, device_type = device_sel.get("id"), device_sel.get("type")
+        if backend == "pytorch":
+            # The RPC worker ran the model on the device it was built on, not on the
+            # plan's device picked above.
+            device_id = str((lease.record.metadata or {}).get("rpc_device") or "cpu")
+            device_type = "cpu" if device_id.startswith("cpu") else "gpu"
         result.metadata.update(
             {
                 "model_type": backend,
                 "model_id": lease.model_id,
-                "device_id": device_sel.get("id"),
-                "device_type": device_sel.get("type"),
+                "device_id": device_id,
+                "device_type": device_type,
             }
         )
         return result
@@ -1736,33 +1762,6 @@ async def run_unified_server(
         await runner.cleanup()
 
 
-def _configure_cudnn() -> None:
-    """Disable cuDNN when the bundled cuDNN cannot serve the attached GPUs.
-
-    torch >= 2.9 ships cuDNN >= 9.11, which has no kernels for SM < 7.5 (Volta and older);
-    convolutions then fail with "unable to find an engine". Falling back to the native CUDA
-    kernels keeps inference on the GPU. Override with NXMNDR_CUDNN=0|1.
-    """
-    override = os.environ.get("NXMNDR_CUDNN")
-    if override is not None:
-        torch.backends.cudnn.enabled = override.strip() not in {"0", "false", "no", "off"}
-        logger.info("cuDNN %s by NXMNDR_CUDNN", "enabled" if torch.backends.cudnn.enabled else "disabled")
-        return
-    try:
-        if not torch.cuda.is_available():
-            return
-        compiled = torch._C._cudnn.getCompileVersion() if hasattr(torch._C, "_cudnn") else None
-        min_cc = min(torch.cuda.get_device_capability(i) for i in range(torch.cuda.device_count()))
-        if compiled and (compiled[0], compiled[1]) >= (9, 11) and min_cc < (7, 5):
-            torch.backends.cudnn.enabled = False
-            logger.warning(
-                "cuDNN %s does not support SM %d.%d GPUs; cuDNN disabled, using native CUDA kernels",
-                ".".join(str(v) for v in compiled), min_cc[0], min_cc[1],
-            )
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("cuDNN capability check skipped: %s", exc)
-
-
 def main():
     """Main CLI entry point. Defaults to gRPC; Azure proxy HTTP server is opt-in."""
     import argparse
@@ -1817,7 +1816,7 @@ def main():
     logging.getLogger().setLevel(getattr(logging, args.log_level))
     logger.setLevel(getattr(logging, args.log_level))
 
-    _configure_cudnn()
+    rpc_worker.configure_cudnn()
 
     if args.azure_proxy:
         # Run both gRPC and HTTP servers

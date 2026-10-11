@@ -300,3 +300,28 @@ def test_the_ready_handshake_accepts_only_its_child_and_keeps_its_deadline():
     with pytest.raises(managers.RpcWorkerStartError, match="exited with code None"):
         managers.RpcWorkerManager._await_ready(proc, listener, 5.0)
     listener.close()
+
+
+def test_the_spawned_worker_applies_the_cudnn_policy_then_runs_on_its_device(monkeypatch):
+    calls = []
+    monkeypatch.setattr(rpc_worker, "configure_cudnn", lambda: calls.append(("cudnn",)))
+    monkeypatch.setattr(rpc_worker, "run_worker", lambda *a, **kw: calls.append(("run", a, kw)))
+    managers._run_rpc_worker("127.0.0.1", 1, 2, 3.0, "cuda:0")
+    assert [c[0] for c in calls] == ["cudnn", "run"]
+    assert calls[1][2]["device"] == "cuda:0" and calls[1][2]["ready_port"] == 2
+
+
+def test_the_server_gives_its_rpc_worker_the_first_gpu_of_its_device_plan(monkeypatch, tmp_path):
+    from nxmndr.server import server
+
+    assert server._rpc_worker_device([{"type": "gpu", "ordinal": 1, "id": "cuda:1"}]) == "cuda:1"
+    assert server._rpc_worker_device([{"type": "cpu", "ordinal": 0, "id": "cpu:0"}]) == "cpu"
+    assert server._rpc_worker_device([]) == "cpu"
+
+    monkeypatch.setattr(server.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(server.torch.cuda, "device_count", lambda: 2)
+    service = server.InferenceService(model_cache_dir=tmp_path / "gpu", max_cores=2)
+    assert service.rpc_manager.device == "cuda:0"
+    monkeypatch.setattr(server.torch.cuda, "is_available", lambda: False)
+    service = server.InferenceService(model_cache_dir=tmp_path / "cpu", max_cores=2)
+    assert service.rpc_manager.device == "cpu"

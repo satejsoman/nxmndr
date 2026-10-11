@@ -137,11 +137,11 @@ def service_process(tmp_path):
         proc.close()
 
 
-def _spec(path) -> inference_pb2.ModelSpec:
+def _spec(path, model_class=rpc_models.ADD_CONST_CLASS) -> inference_pb2.ModelSpec:
     return inference_pb2.ModelSpec(
         format=inference_pb2.PYTORCH,
         source=str(path),
-        model_class=rpc_models.ADD_CONST_CLASS,
+        model_class=model_class,
         name=Path(path).name,
     )
 
@@ -200,14 +200,21 @@ def test_first_generic_pytorch_open_session_starts_the_worker_and_serves_both_rp
         [model_id] = _pytorch_model_ids(client)
         models = _worker_models(proc)
         assert list(models) == [model_id]
-        assert models[model_id]["device"] == "cpu"
+        # The spawned worker builds on the first GPU of the server's device plan.
+        assert models[model_id]["device"] == ("cuda:0" if torch.cuda.is_available() else "cpu")
 
         tiles = _stream(client, "s-first", [CHIP, CHIP * 2], "t")
         np.testing.assert_array_equal(tiles[0], CHIP + 1)
         np.testing.assert_array_equal(tiles[1], CHIP * 2 + 1)
-        unary = _predict(client, model_id)
+        result = client.predict(model_id, CHIP)
+        unary = _array(result.output, result.shape, result.dtype)
         assert unary.dtype == np.float32
         np.testing.assert_array_equal(unary, CHIP + 1)
+        # The metadata names the device that ran the model: the worker's.
+        assert result.metadata["device_id"] == models[model_id]["device"], result.metadata
+        assert result.metadata["device_type"] == (
+            "gpu" if torch.cuda.is_available() else "cpu"
+        ), result.metadata
         # Predict records the record's metadata: it names the worker's model.
         [entry] = [e for e in client.list_model_registry() if e.model_id == model_id]
         assert entry.metadata["rpc_fingerprint"] == models[model_id]["fingerprint"]
@@ -215,6 +222,19 @@ def test_first_generic_pytorch_open_session_starts_the_worker_and_serves_both_rp
 
     stopped = proc.stop()
     assert stopped["state"] == "stopped" and stopped["children"] == [], stopped
+
+
+def test_a_tile_that_runs_longer_than_five_seconds_is_served(tmp_path, service_process):
+    weights = rpc_models.save_sleepy_add_const(tmp_path / "sleepy.pt", 1.0, delay=6.0)
+    proc = service_process()
+    with proc.client() as client:
+        model_id = client.load_model_result(
+            "", _spec(weights, rpc_models.SLEEPY_ADD_CONST_CLASS)
+        ).model_id
+        np.testing.assert_array_equal(_predict(client, model_id), CHIP + 1)
+
+    stopped = proc.stop()
+    assert stopped["children"] == [], stopped
 
 
 def test_two_models_route_by_identity_across_sessions_eviction_and_reload(tmp_path, service_process):

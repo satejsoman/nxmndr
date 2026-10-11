@@ -17,7 +17,7 @@ from pathlib import Path
 MARKER_ENV = "NXMNDR_TEST_RPC_MARKER"
 
 
-def marker_worker(master_addr, master_port, ready_port, startup_timeout_s):
+def marker_worker(master_addr, master_port, ready_port, startup_timeout_s, device="cpu"):
     Path(os.environ[MARKER_ENV]).write_text(
         f"pid={os.getpid()} ready_port={ready_port}", encoding="utf-8"
     )

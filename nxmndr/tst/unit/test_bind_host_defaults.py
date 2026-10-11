@@ -43,7 +43,7 @@ def test_nxmndr_server_binds_grpc_on_loopback_unless_host_is_given(monkeypatch):
 
     monkeypatch.setattr(server, "create_server", create_server)
     monkeypatch.setattr(server, "stop_server", lambda *_a, **_k: None)
-    monkeypatch.setattr(server, "_configure_cudnn", lambda: None)
+    monkeypatch.setattr(server.rpc_worker, "configure_cudnn", lambda: None)
     for argv in (["nxmndr-server"], ["nxmndr-server", "--host", "0.0.0.0", "--grpc-port", "50999"]):
         monkeypatch.setattr(sys, "argv", argv)
         server.main()

@@ -148,6 +148,8 @@ nxmndr-server --host 0.0.0.0   # gRPC, and with --azure-proxy the HTTP proxy, on
 
 Used for remote execution of PyTorch models via `torch.distributed.rpc`. A worker process is spawned server-side for PyTorch specs, or started by hand, on the server's host or another one (external worker mode, below).
 
+The spawned worker builds every PyTorch model on the server's first GPU (the first entry of its device plan; CPU without CUDA) and applies the server's cuDNN policy (`NXMNDR_CUDNN`). One inference call in the worker (a unary `Predict` or one stream tile) may take up to 60 s; a slower call fails that request or tile.
+
 ### External Worker Mode (worker on another host)
 
 1. Start the server with `NXMNDR_RPC_EXTERNAL_WORKER=1`. It spawns no worker. `MASTER_ADDR` is the address it listens on (default `0.0.0.0`) and `MASTER_PORT` the rendezvous port (default `29500`).
@@ -175,7 +177,7 @@ High-level lifecycle:
 	- Environment variables `MASTER_ADDR` / `MASTER_PORT` identify the rendezvous endpoint.
 	- A minimal readiness sentinel file is written immediately so the driver can proceed (acts only as a process-start signal, not model-ready guarantee).
 2. Model load (worker)
-	- Worker constructs model from `PytorchModelSpec` and loads state dict to CPU (or GPU if later extended).
+	- Worker constructs model from `PytorchModelSpec` and loads its state dict on CPU.
 3. RPC initialization (worker)
 	- Worker calls `rpc.init_rpc(worker_name, rank=1, world_size=2, backend=TensorPipe)` using an explicit `TensorPipeRpcBackendOptions(init_method=tcp://host:port)`.
 	- This explicit init method prevents deprecated implicit ProcessGroup creation.
@@ -218,7 +220,7 @@ File / Symbol | Role
 
 ### Known Limitations / Future Work
 
-- The spawned worker builds models on CPU; an external worker uses its `--device`.
+- The spawned worker builds every model on the server's first GPU (CPU without CUDA); PyTorch models are not spread over several GPUs. An external worker uses its `--device`.
 - No batching / streaming; each call is a single `rpc_sync` invocation.
 - Error metadata is plain exceptions; could wrap into structured envelopes.
 - Readiness file could be replaced with a pipe/queue IPC for cleaner startup semantics.

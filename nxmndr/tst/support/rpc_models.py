@@ -8,6 +8,7 @@ classes and process targets by reference.
 
 ``AddConst`` returns its input plus a scalar ``bias`` read from the weights file, so
 two weights files give two models with distinguishable outputs from one class.
+``SleepyAddConst`` first sleeps for the ``delay`` seconds in its weights file.
 The ``*_worker`` functions replace ``RpcWorkerManager.worker_target`` to make the
 child fail before it is ready to join the RPC group.
 """
@@ -20,6 +21,7 @@ import time
 import torch
 
 ADD_CONST_CLASS = "nxmndr_test_add_const"
+SLEEPY_ADD_CONST_CLASS = "nxmndr_test_sleepy_add_const"
 
 
 class AddConst(torch.nn.Module):
@@ -31,8 +33,23 @@ class AddConst(torch.nn.Module):
         return x + self.bias
 
 
+class SleepyAddConst(AddConst):
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("delay", torch.zeros(()))
+
+    def forward(self, x):
+        time.sleep(float(self.delay))
+        return super().forward(x)
+
+
 def save_add_const(path, bias: float) -> str:
     torch.save({"bias": torch.tensor(float(bias))}, str(path))
+    return str(path)
+
+
+def save_sleepy_add_const(path, bias: float, delay: float) -> str:
+    torch.save({"bias": torch.tensor(float(bias)), "delay": torch.tensor(float(delay))}, str(path))
     return str(path)
 
 
@@ -40,15 +57,16 @@ def register() -> None:
     from nxmndr.models import register_pytorch_model
 
     register_pytorch_model(ADD_CONST_CLASS, AddConst)
+    register_pytorch_model(SLEEPY_ADD_CONST_CLASS, SleepyAddConst)
 
 
-def crashing_worker(master_addr, master_port, ready_port, startup_timeout_s):
+def crashing_worker(master_addr, master_port, ready_port, startup_timeout_s, device="cpu"):
     """Exits with code 3 before it reports ready (a broken worker environment)."""
 
     os._exit(3)
 
 
-def silent_worker(master_addr, master_port, ready_port, startup_timeout_s):
+def silent_worker(master_addr, master_port, ready_port, startup_timeout_s, device="cpu"):
     """Never reports ready (a hung import); exits only when its parent is gone."""
 
     parent = os.getppid()

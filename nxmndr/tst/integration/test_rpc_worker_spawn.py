@@ -7,7 +7,7 @@
 "Can't pickle local object". The manager always uses the ``spawn`` context: the
 child must not inherit the server's gRPC and torch threads, as ``fork`` would do.
 The worker's arguments are plain values (no model spec: models are loaded later by
-model ID). The full start, with the real rendezvous, runs in
+model ID; the device it builds them on). The full start, with the real rendezvous, runs in
 tst/integration/test_rpc_pytorch_service.py.
 """
 
@@ -62,7 +62,9 @@ def test_worker_target_and_arguments_pickle_for_spawn(monkeypatch, no_torch_grou
     _RecordedProcess.made.clear()
     _RecordedContext.methods.clear()
     monkeypatch.setattr(managers.multiprocessing, "get_context", _RecordedContext)
-    manager = managers.RpcWorkerManager(master_addr="127.0.0.1", master_port=29555, startup_timeout_s=7.0)
+    manager = managers.RpcWorkerManager(
+        master_addr="127.0.0.1", master_port=29555, startup_timeout_s=7.0, device="cuda:0"
+    )
     with pytest.raises(managers.RpcWorkerStartError, match="before it was ready"):
         manager.ensure_started()
 
@@ -71,8 +73,9 @@ def test_worker_target_and_arguments_pickle_for_spawn(monkeypatch, no_torch_grou
     payload = bytes(ForkingPickler.dumps((proc.target, proc.args, proc.kwargs)))
     target, args, kwargs = pickle.loads(payload)
     assert target is managers._run_rpc_worker
-    addr, port, ready_port, timeout = args
+    addr, port, ready_port, timeout, device = args
     assert (addr, port, timeout) == ("127.0.0.1", 29555, 7.0) and isinstance(ready_port, int)
+    assert device == "cuda:0"  # the worker builds its models on the server's device
     assert manager._state == "idle"  # the torch rendezvous was never entered: a retry may start again
 
 
