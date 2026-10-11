@@ -7,12 +7,14 @@ from __future__ import annotations
 
 import logging
 import socket
+import threading
 
 import grpc
 import pytest
 
 from nxmndr.inference import inference_pb2, inference_pb2_grpc
 from nxmndr.server import managers, server
+from tst.support.grpc_harness import wait_until
 
 pytestmark = pytest.mark.integration
 
@@ -91,3 +93,36 @@ def test_create_server_raises_when_the_port_is_taken(tmp_path):
         taken.listen()
         with pytest.raises(RuntimeError):
             server.create_server(port=taken.getsockname()[1], model_cache_dir=tmp_path / "c")
+
+
+def test_control_calls_are_served_while_streams_outnumber_max_cores(tmp_path, monkeypatch):
+    entered = []
+    real = server.InferenceService.StreamPredict
+
+    def counting(self, request_iterator, context):
+        entered.append(1)
+        yield from real(self, request_iterator, context)
+
+    monkeypatch.setattr(server.InferenceService, "StreamPredict", counting)
+    release = threading.Event()
+
+    def idle_requests():  # a client that sends nothing yet: its stream holds a handler thread
+        release.wait(30)
+        return
+        yield
+
+    srv, port, service = server.create_server(model_cache_dir=tmp_path / "cache", max_cores=1)
+    try:
+        with grpc.insecure_channel(f"127.0.0.1:{port}") as channel:
+            stub = inference_pb2_grpc.InferenceServiceStub(channel)
+            calls = [stub.StreamPredict(idle_requests()) for _ in range(2)]
+            assert wait_until(lambda: len(entered) == 2, timeout=5)  # both streams run at once
+            assert stub.Health(inference_pb2.HealthRequest(), timeout=5).ready
+            with pytest.raises(grpc.RpcError) as err:
+                stub.CancelSession(inference_pb2.CancelSessionRequest(session_id="none"), timeout=5)
+            assert err.value.code() == grpc.StatusCode.NOT_FOUND  # served, not DEADLINE_EXCEEDED
+            release.set()
+            assert [list(call) for call in calls] == [[], []]
+    finally:
+        release.set()
+        server.stop_server(srv, service, grace=1.0)

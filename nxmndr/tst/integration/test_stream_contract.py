@@ -577,6 +577,56 @@ def test_capabilities_advertise_stream_context_and_limits(tmp_path, loader):
         assert err.value.code == grpc.StatusCode.INVALID_ARGUMENT
 
 
+class _PeakModel:
+    """Counts the predictions running at once; each blocks until ``release`` is set."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.running = 0
+        self.peak = 0
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def predict(self, arr, return_embeddings=False):
+        with self.lock:
+            self.running += 1
+            self.peak = max(self.peak, self.running)
+        self.entered.set()
+        self.release.wait(10)
+        with self.lock:
+            self.running -= 1
+        return np.array(arr, copy=True)
+
+
+def test_inference_runs_at_most_max_cores_tiles_at_once(tmp_path):
+    # The harness has 8 handler threads, so only the server's own inference bound
+    # keeps the second session's tile out of the model while the first one runs.
+    peak = _PeakModel()
+    loader = CountingLoader({"double://peak": lambda: (peak, "onnx")})
+    with running_server(tmp_path, loader=loader, max_cores=1) as h, h.client() as c:
+        mid = _load(c, "double://peak", task="")
+        results = {}
+
+        def run(sid):
+            _open(c, sid, mid)
+            results[sid] = list(
+                c.stream_predict(session_id=sid, samples=[np.zeros(4, np.uint8)], tile_ids=["t"])
+            )
+
+        threads = [threading.Thread(target=run, args=(sid,)) for sid in ("s1", "s2")]
+        for t in threads:
+            t.start()
+        assert peak.entered.wait(10)
+        time.sleep(0.5)  # time for the second tile to reach the model if nothing bounds it
+        assert peak.peak == 1
+        peak.release.set()
+        for t in threads:
+            t.join(10)
+        assert peak.peak == 1
+        assert sorted(results) == ["s1", "s2"]
+        assert all(r[0].metadata.get("error") is None for r in results.values())
+
+
 def test_serve_stops_grpc_then_shuts_down_the_model_cache(tmp_path, loader, monkeypatch):
     from nxmndr.server import managers, server
 

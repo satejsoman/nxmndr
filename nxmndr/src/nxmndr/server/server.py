@@ -113,6 +113,10 @@ GRPC_OPTIONS = [
     ("grpc.max_send_message_length", GRPC_MAX_MESSAGE_LENGTH),
     ("grpc.max_receive_message_length", GRPC_MAX_MESSAGE_LENGTH),
 ]
+# gRPC handler threads. Each StreamPredict holds one for its whole life, so the pool is
+# sized for concurrent calls, not by max_cores (which sizes the device plan and the
+# number of inference calls that run at once).
+GRPC_HANDLER_THREADS = 32
 
 
 def _shutdown_rpc_driver_if_needed():
@@ -309,6 +313,12 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
                 {"type": "cpu", "ordinal": idx, "id": f"cpu:{idx}"} for idx in range(selected)
             ]
         self._device_cursor = 0
+        # Inference calls that run at once, across Predict and every stream. The gRPC
+        # handler pool (GRPC_HANDLER_THREADS) is larger, so that control calls are served
+        # while streams wait; this keeps model runs to min(max_cores, CPU count).
+        self._inference_slots = threading.BoundedSemaphore(
+            max(1, min(self._max_cores, os.cpu_count() or 1))
+        )
         # Session bookkeeping (limits, options, summary); lifecycle lives in model_manager.
         self._sessions: Dict[str, _SessionBook] = {}
         self._sessions_lock = threading.Lock()
@@ -748,15 +758,16 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
                 return output
             return model_obj.predict(array, return_embeddings=return_embeddings)
 
-        result = dispatch.run_prediction(
-            lease,
-            image=input_array,
-            options=options,
-            device_id=device_id,
-            torch_device=torch_device,
-            infer=infer,
-            logger=self.logger,
-        )
+        with self._inference_slots:
+            result = dispatch.run_prediction(
+                lease,
+                image=input_array,
+                options=options,
+                device_id=device_id,
+                torch_device=torch_device,
+                infer=infer,
+                logger=self.logger,
+            )
         result.metadata.update(
             {
                 "model_type": backend,
@@ -1431,6 +1442,11 @@ def create_server(
             port: TCP port; 0 picks a free ephemeral port.
             model_cache_dir, max_cores: as for ``InferenceService``.
 
+    The gRPC handler pool has ``GRPC_HANDLER_THREADS`` threads whatever ``max_cores``
+    is, so control calls (``CancelSession``, ``Capabilities``, ``Health``) are served
+    while streams are open; ``max_cores`` sizes the device plan and the number of
+    inference calls that run at once.
+
     Returns:
             ``(server, bound_port, service)``: the started ``grpc.Server``, the port it
             is bound to and its ``InferenceService``. Stop it with ``stop_server``.
@@ -1438,10 +1454,8 @@ def create_server(
     Raises:
             RuntimeError: the address cannot be bound (grpcio raises it).
     """
-    cpu_count = os.cpu_count() or 1
-    server_workers = max(1, min(int(max_cores or 4), cpu_count))
     server = grpc.server(
-        futures.ThreadPoolExecutor(max_workers=server_workers),
+        futures.ThreadPoolExecutor(max_workers=GRPC_HANDLER_THREADS),
         interceptors=[LoggingInterceptor()],
         options=GRPC_OPTIONS,
     )
