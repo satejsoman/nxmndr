@@ -65,7 +65,9 @@ ULTRALYTICS_FORMATS = ("pytorch", "onnx")
 ULTRALYTICS_BACKEND = "ultralytics"
 # The only YOLO task that yields instance masks.
 SEGMENT_TASK = "segment"
-# Per-request option (default true), as the plugin's ``model_info["drop_group_masks"]``.
+# Per-request option (default true): drop group masks, which contain two or more other
+# instances (such as a whole-region mask) and are not instances themselves; false keeps
+# every mask the model returned.
 OPTION_DROP_GROUP_MASKS = "drop_group_masks"
 # Per-request detection options passed to ``YOLO.predict`` and their defaults (module
 # docstring): confidence and NMS IoU thresholds (decimals in [0, 1]) and the maximum
