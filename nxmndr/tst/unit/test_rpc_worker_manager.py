@@ -566,7 +566,17 @@ def test_a_registered_class_loads_strictly_and_a_mismatch_is_refused(tmp_path, s
 
 
 @pytest.mark.parametrize(
-    "case", ["nested", "nested_checkpoint", "extra_value", "unreadable", "missing", "load_error"]
+    "case",
+    [
+        "nested",
+        "nested_checkpoint",
+        "extra_value",
+        "not_a_mapping",
+        "value_not_a_tensor",
+        "unreadable",
+        "missing",
+        "load_error",
+    ],
 )
 def test_every_strict_load_failure_of_a_registered_class_is_a_one_line_refusal(tmp_path, case):
     import argparse
@@ -582,19 +592,23 @@ def test_every_strict_load_failure_of_a_registered_class_is_a_one_line_refusal(t
         "nested": {"state_dict": {"bias": bias}},
         "nested_checkpoint": {"state_dict": {"bias": bias}, "epoch": 3},
         "extra_value": {"bias": bias, "version": 2},
+        "not_a_mapping": [bias],
+        "value_not_a_tensor": {"bias": 1.0},  # names match; load_state_dict refuses the value
         "unreadable": {"bias": bias, "hparams": argparse.Namespace(lr=0.1)},  # weights_only refuses
         "load_error": {"bias": bias},
     }
     if case in files:
         torch.save(files[case], str(path))
-    not_a_state_dict = (
-        f"AddConst: weights file {path} is not a state dict (a mapping of entry names to "
-        "tensors); it holds "
-    )
+    mismatch = f"weights file {path} does not match AddConst (strict load): "
     expected = {
-        "nested": not_a_state_dict + "['state_dict']",
-        "nested_checkpoint": not_a_state_dict + "['state_dict', 'epoch']",
-        "extra_value": not_a_state_dict + "['bias', 'version']",
+        "nested": mismatch + "missing bias (first of 2 differing entries: 1 missing, 1 unexpected)",
+        "nested_checkpoint": mismatch
+        + "missing bias (first of 3 differing entries: 1 missing, 2 unexpected)",
+        "extra_value": mismatch + "unexpected version (first of 1 differing entries: 1 unexpected)",
+        "not_a_mapping": f"AddConst: weights file {path} is not a state dict (a mapping of entry "
+        "names to values); it holds list",
+        "value_not_a_tensor": f"weights file {path} does not load into AddConst: RuntimeError: "
+        'While copying the parameter named "bias", expected torch.Tensor',
         "unreadable": f"AddConst: weights file {path} is not a PyTorch state dict (UnpicklingError",
         "missing": f"AddConst: weights file {path} not found",
         "load_error": f"weights file {path} does not load into {FailingAddConst.__qualname__}: "
@@ -610,6 +624,58 @@ def test_every_strict_load_failure_of_a_registered_class_is_a_one_line_refusal(t
         assert "\n" not in message and reply["refused"]["unavailable"] is False
     finally:
         rpc_worker._rpc_unload("unit-strict-file")
+
+
+@pytest.mark.parametrize("kind", ["extra_state", "quantized"])
+def test_a_registered_class_loads_its_own_state_dict_with_values_that_are_not_tensors(
+    tmp_path, kind
+):
+    import torch
+
+    class ExtraStateAddConst(AddConst):  # get_extra_state() is a dict in its state_dict()
+        def __init__(self):
+            super().__init__()
+            self.version = 0
+
+        def get_extra_state(self):
+            return {"version": self.version}
+
+        def set_extra_state(self, state):
+            self.version = state["version"]
+
+    if kind == "quantized" and torch.backends.quantized.engine == "none":
+        engines = [e for e in torch.backends.quantized.supported_engines if e != "none"]
+        if not engines:
+            pytest.skip("this torch build has no quantized engine")
+        # torch cannot select "none" again, so the engine stays set; no other test uses one.
+        torch.backends.quantized.engine = engines[0]
+
+    class QuantizedLinear(torch.ao.nn.quantized.Linear):  # a dtype and a tuple of packed params
+        def __init__(self):
+            super().__init__(4, 3)
+
+    saved = ExtraStateAddConst() if kind == "extra_state" else QuantizedLinear()
+    if kind == "extra_state":
+        saved.version = 7
+        with torch.no_grad():
+            saved.bias.fill_(2.0)
+    else:
+        weight = torch.arange(12, dtype=torch.float32).reshape(3, 4) / 10
+        saved.set_weight_bias(
+            torch.quantize_per_tensor(weight, 0.1, 0, torch.qint8), torch.ones(3)
+        )
+    path = tmp_path / "w.pt"
+    torch.save(saved.state_dict(), str(path))
+    assert any(not torch.is_tensor(value) for value in saved.state_dict().values())
+    payload = {"model_class": type(saved), "model_path": str(path), "name": "w"}
+    try:
+        info = rpc_worker._rpc_load("unit-own-state", payload)
+        assert "refused" not in info, info
+        assert info["fingerprint"] == rpc_worker._fingerprint(saved)  # every entry loaded
+        if kind == "extra_state":
+            assert rpc_worker._worker_state["models"]["unit-own-state"].model.version == 7
+    finally:
+        rpc_worker._rpc_unload("unit-own-state")
 
 
 @pytest.mark.parametrize("state", ["stopped", "broken"])

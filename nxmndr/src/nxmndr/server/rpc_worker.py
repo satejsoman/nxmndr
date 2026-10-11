@@ -136,15 +136,17 @@ def _load_state_strict(model, model_class, model_path) -> None:
     model would serve their output. Every failure is a refusal: ``catalog.CatalogError``
     with one line, which the server answers with INVALID_ARGUMENT. It names the file
     that is missing or that ``torch.load`` refuses, the file that is not a mapping of
-    entry names to tensors (such as a checkpoint that nests the state dict) with its
-    first keys, the first entry that differs from the model with the counts, or the
-    first line of any other error of ``load_state_dict``.
+    entry names (with its type or first keys), the first entry that differs from the
+    model with the counts (a checkpoint that nests the state dict lacks every entry), or
+    the first error of ``load_state_dict``. Values that are not tensors are accepted
+    when ``load_state_dict`` accepts them: the class's own ``state_dict()`` can hold
+    ``get_extra_state()`` or a quantized layer's packed parameters.
     """
 
     from ..models import catalog
 
     name = getattr(model_class, "__qualname__", str(model_class))
-    state = catalog._load_state(name, model_path)
+    state = catalog._load_state(name, model_path, tensors_only=False)
     mismatch = catalog._mismatch(model.state_dict(), state)
     if mismatch:
         raise catalog.CatalogError(
@@ -217,18 +219,38 @@ def _to_cpu(value):
 
 
 def _fingerprint(model) -> str:
-    """sha256 of the model class and every state-dict entry (name, dtype, shape, bytes)."""
+    """sha256 of the model class and every state-dict entry (name, dtype, shape, bytes).
+
+    An entry that is not a tensor (``get_extra_state()``, a quantized layer's packed
+    parameters) adds the tensors inside its lists, tuples and dicts and the repr of
+    every other value.
+    """
 
     digest = hashlib.sha256()
     cls = type(model)
     digest.update(f"{cls.__module__}.{cls.__qualname__}".encode("utf-8"))
     digest.update(str(getattr(model, "catalog_name", "")).encode("utf-8"))
-    for name, tensor in model.state_dict().items():
-        value = tensor.detach().cpu().contiguous()
-        digest.update(f"|{name}|{value.dtype}|{tuple(value.shape)}|".encode("utf-8"))
-        if value.numel():
-            digest.update(value.reshape(-1).view(torch.uint8).numpy().tobytes())
+    for name, value in model.state_dict().items():
+        _digest_entry(digest, name, value)
     return "sha256:" + digest.hexdigest()
+
+
+def _digest_entry(digest, name: str, value) -> None:
+    if torch.is_tensor(value):
+        tensor = value.detach().cpu()
+        if tensor.is_quantized:  # a byte view of it does not hold its values
+            tensor = tensor.dequantize()
+        tensor = tensor.contiguous()
+        digest.update(f"|{name}|{value.dtype}|{tuple(tensor.shape)}|".encode("utf-8"))
+        if tensor.numel():
+            digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
+    elif isinstance(value, (list, tuple, dict)):
+        digest.update(f"|{name}|{type(value).__name__}|{len(value)}|".encode("utf-8"))
+        items = value.items() if isinstance(value, dict) else enumerate(value)
+        for key, item in items:
+            _digest_entry(digest, f"{name}[{key!r}]", item)
+    else:
+        digest.update(f"|{name}|{value!r}|".encode("utf-8"))
 
 
 def _register(model_id: str, model, fingerprint: str) -> Optional[dict]:

@@ -454,6 +454,8 @@ def _dimension(shapes: Mapping, keys, axis: int) -> Optional[int]:
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
 # torch.load(weights_only=True) states why it refused a file on the line that starts so.
 _WEIGHTS_ONLY_REASON = "WeightsUnpickler error:"
+# load_state_dict states its errors on the lines after this header line.
+_LOAD_STATE_DICT_HEADER = "Error(s) in loading state_dict for "
 
 
 def _first_line(exc: BaseException) -> str:
@@ -461,10 +463,13 @@ def _first_line(exc: BaseException) -> str:
 
     The reason is the first sentence of torch's ``WeightsUnpickler error:`` line when
     there is one (a file that holds other pickled objects than tensors), else the first
-    line of the message.
+    line of the message after ``load_state_dict``'s header line, which names only the
+    class.
     """
 
     lines = [line.strip() for line in _ANSI_ESCAPE.sub("", str(exc)).splitlines() if line.strip()]
+    if len(lines) > 1 and lines[0].startswith(_LOAD_STATE_DICT_HEADER):
+        lines = lines[1:]
     reason = next(
         (
             line[len(_WEIGHTS_ONLY_REASON):].split(". ", 1)[0].strip()
@@ -476,7 +481,16 @@ def _first_line(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {reason}" if reason else type(exc).__name__
 
 
-def _load_state(model_class: str, weights_path) -> Mapping:
+def _load_state(model_class: str, weights_path, *, tensors_only: bool = True) -> Mapping:
+    """Read the state dict at ``weights_path`` onto the CPU, or raise a one-line
+    ``CatalogError``.
+
+    A catalog model's state dict maps entry names to tensors. The ``state_dict()`` of a
+    registered class can also hold other values, such as ``get_extra_state()`` or the
+    packed parameters of a quantized layer; with ``tensors_only=False`` only the names
+    are checked here, and ``load_state_dict`` decides whether the values load.
+    """
+
     try:
         state = torch.load(str(weights_path), map_location="cpu", weights_only=True)
     except FileNotFoundError as exc:
@@ -487,12 +501,14 @@ def _load_state(model_class: str, weights_path) -> Mapping:
             f"({_first_line(exc)})"
         ) from exc
     if not isinstance(state, Mapping) or not all(
-        isinstance(key, str) and torch.is_tensor(value) for key, value in state.items()
+        isinstance(key, str) and (torch.is_tensor(value) or not tensors_only)
+        for key, value in state.items()
     ):
         keys = list(state)[:5] if isinstance(state, Mapping) else type(state).__name__
+        values = "tensors" if tensors_only else "values"
         raise CatalogError(
             f"{model_class}: weights file {weights_path} is not a state dict (a mapping of "
-            f"entry names to tensors); it holds {keys}"
+            f"entry names to {values}); it holds {keys}"
         )
     return state
 
@@ -501,7 +517,8 @@ def _mismatch(model_state: Mapping, state: Mapping) -> str:
     """The first entry that keeps ``state`` from loading strictly and the count of all, or "".
 
     Entries are taken in this order: missing from the file (in the model's order), not
-    in the model (in the file's order), then present in both with another shape.
+    in the model (in the file's order), then tensors in both with another shape. Other
+    values in both are left to ``load_state_dict``.
     """
 
     missing = [f"missing {key}" for key in model_state if key not in state]
@@ -509,7 +526,10 @@ def _mismatch(model_state: Mapping, state: Mapping) -> str:
     shapes = [
         f"shape mismatch {key} file {list(state[key].shape)} model {list(value.shape)}"
         for key, value in model_state.items()
-        if key in state and tuple(state[key].shape) != tuple(value.shape)
+        if key in state
+        and torch.is_tensor(value)
+        and torch.is_tensor(state[key])
+        and tuple(state[key].shape) != tuple(value.shape)
     ]
     differing = missing + unexpected + shapes
     if not differing:
