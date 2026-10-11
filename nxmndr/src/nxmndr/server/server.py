@@ -292,7 +292,7 @@ class _TileBuffer:
 
 
 class _StreamEnd(Exception):
-    """Internal: the stream ends after the given stream-scope response."""
+    """Internal: the stream ends, after the given stream-scope response if not None."""
 
     def __init__(self, response, *, status=None, details=""):
         super().__init__(details)
@@ -822,8 +822,12 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
             return "rpc_worker_not_available"
         return None
 
-    def _dispatch(self, lease, input_array, options) -> "dispatch.DispatchResult":
-        """Run the shared dispatcher on the next device of the plan."""
+    def _dispatch(self, lease, input_array, options, before_run=None) -> "dispatch.DispatchResult":
+        """Run the shared dispatcher on the next device of the plan.
+
+        ``before_run`` is called once the call holds an inference slot, before the model
+        runs; an exception from it gives the slot up without running the model.
+        """
         device_sel = self._next_device()
         device_id = device_sel.get("id", "cpu")
         torch_device = device_id if torch.cuda.is_available() else "cpu"
@@ -844,6 +848,8 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
             return model_obj.predict(array, return_embeddings=return_embeddings)
 
         with self._inference_slots:
+            if before_run is not None:
+                before_run()
             result = dispatch.run_prediction(
                 lease,
                 image=input_array,
@@ -1059,12 +1065,17 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
         tile.data.extend(chunk)
         return None
 
-    def _run_tile(self, lease, book, session_id, tile, corr_id):
-        """Dispatch one complete tile and return its response (success or tile error)."""
+    def _run_tile(self, lease, book, session_id, tile, corr_id, before_run=None):
+        """Dispatch one complete tile and return its response (success or tile error).
+
+        ``before_run`` is as for ``_dispatch``; a ``_StreamEnd`` from it propagates.
+        """
         try:
             input_array = dispatch.decode_input(bytes(tile.data), tile.shape, tile.dtype)
             options = dispatch.effective_tile_options(book.options, tile.options)
-            result = self._dispatch(lease, input_array, options)
+            result = self._dispatch(lease, input_array, options, before_run)
+        except _StreamEnd:
+            raise
         except dispatch.DispatchError as exc:
             return self._tile_error(book, session_id, corr_id, tile.tile_id, exc.code, str(exc))
         except Exception as exc:
@@ -1084,6 +1095,18 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
         response.shape.extend(result.shape)
         response.dtype = result.dtype
         return response
+
+    def _check_tile_may_run(self, context, book, session_id, corr_id):
+        """Raise ``_StreamEnd`` if a complete tile must not run: with no response if the
+        client is gone, after the session-closed error if its session is not open."""
+        is_active = getattr(context, "is_active", None)
+        if callable(is_active) and not is_active():
+            raise _StreamEnd(None)  # the client is gone: do not run inference for nobody
+        if session_id:
+            try:
+                self.model_manager.touch_session(session_id)
+            except (managers.SessionClosedError, managers.UnknownSessionError):
+                raise _StreamEnd(self._session_closed_error(book, session_id, corr_id)) from None
 
     def _check_session_open(self, book, session_id, corr_id):
         """None while the session is open, else the stream-scope error to send."""
@@ -1210,18 +1233,22 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
 
                 if req.end_of_sequence:
                     if not tile.reported:
-                        is_active = getattr(context, "is_active", None)
-                        if callable(is_active) and not is_active():
-                            return  # the client is gone: do not run inference for nobody
-                        if session_id:
-                            try:
-                                self.model_manager.touch_session(session_id)
-                            except (managers.SessionClosedError, managers.UnknownSessionError):
-                                # Closed or cancelled after the check above: no dispatch.
+                        try:
+                            self._check_tile_may_run(context, book, session_id, corr_id)
+                            # Checked again once the tile holds an inference slot: the
+                            # wait for a slot can outlast the session or the client.
+                            response = self._run_tile(
+                                lease, book, session_id, tile, corr_id,
+                                before_run=lambda: self._check_tile_may_run(
+                                    context, book, session_id, corr_id
+                                ),
+                            )
+                        except _StreamEnd as end:
+                            if end.response is not None:
                                 outcome = "failed"
-                                yield self._session_closed_error(book, session_id, corr_id)
-                                return
-                        yield self._run_tile(lease, book, session_id, tile, corr_id)
+                                yield end.response
+                            return
+                        yield response
                     tile = None
 
             if tile is not None and not tile.reported:
@@ -1436,7 +1463,8 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
         if cancelled and book is not None:
             with book.lock:
                 book.errors.append(request.reason or "client_cancelled")
-        # The active stream of this session stops before its next message or dispatch.
+        # The active stream of this session stops before its next message or dispatch,
+        # also when its tile waits for an inference slot.
         return inference_pb2.CancelSessionResponse(status="cancelled" if cancelled else state)
 
     # ---- Helpers ----

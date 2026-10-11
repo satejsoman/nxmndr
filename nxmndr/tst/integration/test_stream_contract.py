@@ -666,6 +666,75 @@ def test_inference_runs_at_most_max_cores_tiles_at_once(tmp_path):
         assert all(r[0].metadata.get("error") is None for r in results.values())
 
 
+class _SlotSpy:
+    """Wraps the service's inference semaphore; counts the calls that reached it."""
+
+    def __init__(self, inner):
+        self.inner = inner
+        self.lock = threading.Lock()
+        self.entered = 0
+
+    def __enter__(self):
+        with self.lock:
+            self.entered += 1
+        return self.inner.__enter__()
+
+    def __exit__(self, *exc):
+        return self.inner.__exit__(*exc)
+
+
+@pytest.mark.parametrize("ending", ["cancel_session", "client_cancel"])
+def test_a_tile_waiting_for_the_inference_slot_does_not_run_after_its_stream_ends(
+    tmp_path, loader, gated, ending
+):
+    chip = np.ones((4, 4, 3), np.float32)
+    with (
+        running_server(tmp_path, loader=loader, max_cores=1) as h,
+        h.client() as c,
+        h.client() as control,
+    ):
+        slots = h.service._inference_slots = _SlotSpy(h.service._inference_slots)
+        contexts = {}
+        real_check = h.service._check_tile_may_run
+
+        def recording_check(context, book, session_id, corr_id):
+            contexts[session_id] = context
+            return real_check(context, book, session_id, corr_id)
+
+        h.service._check_tile_may_run = recording_check
+        mid = _load(c, "double://gated", task="")
+        _open(c, "s-running", mid)
+        _open(c, "s-queued", mid)
+        got_running, got_queued, errors = [], [], []
+        running = c.stream_predict(session_id="s-running", samples=[chip], tile_ids=["t0"])
+        threads = [threading.Thread(target=_consume, args=(running, got_running, errors))]
+        threads[0].start()
+        assert gated.entered.wait(10)  # s-running's tile holds the only inference slot
+        queued = c.stream_predict(session_id="s-queued", samples=[chip], tile_ids=["t0"])
+        threads.append(threading.Thread(target=_consume, args=(queued, got_queued, errors)))
+        threads[1].start()
+        assert wait_until(lambda: slots.entered == 2)  # s-queued's tile waits for the slot
+        if ending == "cancel_session":
+            assert control.cancel_session("s-queued", reason="user").status == "cancelled"
+        else:
+            queued.cancel()
+            assert wait_until(lambda: not contexts["s-queued"].is_active())
+        gated.release.set()
+        for t in threads:
+            t.join(10)
+        assert gated.calls == 1  # the queued tile never reached the model
+        assert errors == [] and [r.metadata.get("error") for r in got_running] == [None]
+        if ending == "cancel_session":
+            assert [r.metadata.get("error_code") for r in got_queued] == ["cancelled"]
+            assert got_queued[0].metadata["error_scope"] == "stream"
+            assert control.close_session("s-queued").summary.ok_tiles == 0
+        else:
+            assert got_queued == []
+            assert wait_until(lambda: h.service._session_state("s-queued") == "disconnected")
+        assert control.close_session("s-running").summary.ok_tiles == 1
+        assert wait_until(lambda: h.manager.pin_count(mid) == 0)
+
+
 def test_open_session_refuses_a_negative_max_inflight(tmp_path, loader):
     with running_server(tmp_path, loader=loader) as h, h.client() as c:
         mid = _load(c, "double://seg")
