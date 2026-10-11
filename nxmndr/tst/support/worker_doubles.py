@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
 
-"""Model doubles for a separate worker process (wave2-chunk-3.md [6](5); plan chunk 7).
+"""Model doubles for a separate worker process.
 
 Plugin integration tests run a real nxmndr gRPC server in the isolated worker
 environment and drive it from QGIS over OpenSession / StreamPredict / CloseSession.

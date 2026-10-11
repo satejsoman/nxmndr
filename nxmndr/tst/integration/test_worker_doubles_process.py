@@ -7,7 +7,7 @@ A separate Python process installs the doubles and runs ``create_server`` with i
 default InferenceService, ModelManager and loaders; this process is only a client,
 as QGIS is. Prompted SAM and Ultralytics YOLO sessions stream through the new
 ``tiles=`` client API, and the process's counters show each model and SAM variant
-loaded once (wave2-chunk-3.md [6](5)).
+loaded once.
 """
 
 from __future__ import annotations

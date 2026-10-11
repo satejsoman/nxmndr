@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
 
-"""Client additions over real gRPC (wave2-chunk-3.md [6](3) and [6](4)).
+"""The client's tile iterable and LoadModel result over real gRPC.
 
 ``stream_predict(tiles=...)`` takes one iterable of ``(tile_id, sample, options)``,
 and ``load_model_result`` returns LoadModel's effective metadata so the host can

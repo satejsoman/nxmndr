@@ -3,9 +3,9 @@
 
 """StreamPredict servicer called in-process (no transport).
 
-Rewritten for the rebuild: models enter through the ModelManager lease API, a
-session must come from OpenSession (no fabricated sessions), chunk counts are not
-limited, and limit failures are tile-scope.
+Models enter through the ModelManager lease API, a session must come from
+OpenSession (no fabricated sessions), chunk counts are not limited, and limit
+failures are tile-scope.
 """
 
 import logging

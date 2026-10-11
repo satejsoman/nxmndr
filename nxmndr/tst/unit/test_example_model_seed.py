@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
 
-"""The example model export is deterministic under a seed (plan r2 item 22)."""
+"""The example model export is deterministic under a seed."""
 
 from __future__ import annotations
 

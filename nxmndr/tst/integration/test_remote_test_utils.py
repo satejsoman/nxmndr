@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
 
-"""Test-server hygiene (plan r2 item 23; wave-1 chunk 7 requests [1], chunk 1 [4b]).
+"""Test-server hygiene.
 
 The helper is not collectable, binds loopback only, ignores inherited
 NXMNDR_REMOTE_HOST/PORT unless NXMNDR_TEST_USE_REMOTE_SERVER=1, and keeps the

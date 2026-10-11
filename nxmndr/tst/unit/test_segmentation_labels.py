@@ -1,12 +1,13 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
 
-"""Segmentation label maps never wrap or truncate (wave4-chunk-7-final.md interface request [4]).
+"""Segmentation label maps never wrap or truncate.
 
 ``prepare_segmentation_mask`` (and its confidence variant) cast predictions to ``uint16``
 labels. A value outside ``[0, 65535]`` or a fractional value is refused instead of being
-cast (the plugin harness saw an identity output of 65536 come back as label 0); the
-dispatcher then returns the prediction unchanged as a ``raw`` result with a warning.
+cast (a model that returned its input unchanged produced 65536, which a plain cast
+turned into label 0); the dispatcher then returns the prediction unchanged as a
+``raw`` result with a warning.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ SEGMENTATION = {"task_type": "segmentation"}
 
 
 @pytest.mark.parametrize("prediction", [
-    np.array([[0.0, 65536.0]], dtype=np.float32),  # the identity output the harness saw
+    np.array([[0.0, 65536.0]], dtype=np.float32),  # identity output; a uint16 cast wraps it to 0
     np.array([[0, 65536]], dtype=np.int64),
     np.array([[-1, 2]], dtype=np.int32),
     np.array([[0.0, 2.5]], dtype=np.float32),

@@ -1,10 +1,10 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
 
-"""Wave-1 interface requests between chunk 1 (server.py) and chunk 1a (managers.py).
+"""What server.py relies on from the ModelManager in managers.py.
 
-Each test confirms one request against the real ModelManager, which the wave-1
-branches could only test against an in-test fake.
+Each test checks one part of that interface against the real ModelManager, not an
+in-test fake.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ def _record(model_spec, key, metadata, device_plan):
 
 
 def test_loader_first_positional_argument_is_the_model_spec():
-    """Chunk 1 request (a): loader(model_spec, key, metadata, device_plan), positional."""
+    """The loader is called as loader(model_spec, key, metadata, device_plan), positionally."""
 
     seen = []
 
@@ -55,7 +55,7 @@ def test_loader_first_positional_argument_is_the_model_spec():
 
 @pytest.mark.parametrize("reason", managers.SESSION_CLOSE_REASONS)
 def test_session_state_is_open_then_the_close_reason_then_unknown(reason):
-    """Chunk 1 request (b): 'open', the tombstone reason while it lives, else 'unknown'."""
+    """session_state: 'open', then the close reason while its tombstone lives, then 'unknown'."""
 
     clock = FakeClock()
     manager = managers.ModelManager(None, capacity=2, session_ttl_s=10.0, clock=clock, loader=_record)
@@ -83,7 +83,7 @@ def test_model_manager_capacity_and_ttl_come_from_the_environment(tmp_path, monk
     monkeypatch.delenv("NXMNDR_MODEL_CACHE_CAPACITY")
     monkeypatch.delenv("NXMNDR_SESSION_TTL_SECONDS")
     svc = server.InferenceService(model_cache_dir=tmp_path / "cache")
-    assert svc.model_manager.stats().capacity == 10  # plan default
+    assert svc.model_manager.stats().capacity == 10  # server.DEFAULT_MODEL_CACHE_CAPACITY
     assert svc.model_manager._ttl == 3600.0
 
 

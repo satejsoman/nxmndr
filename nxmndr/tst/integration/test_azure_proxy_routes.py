@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
 
-"""The OpenAI / Azure OpenAI proxy over loopback HTTP (wave2-chunk-5.md [5]).
+"""The OpenAI / Azure OpenAI proxy over loopback HTTP.
 
 A client calls the proxy's client-facing image-edit route, built with
 ``proxy_routes.proxy_url`` as the plugin's worker handler will, with no credential.

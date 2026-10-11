@@ -3,10 +3,8 @@
 
 """Bounded LRU cache of loaded models with session and execution leases.
 
-This module implements the chunk 1a lease API frozen in the rebuild contracts
-(docs/rebuild/CONTRACTS.md section 3 on branch rebuild/chunk-0). The server imports
-these names from ``nxmndr.server.managers``; ``ModelManager`` there adds the default
-model loader. This module imports only the standard library.
+The server imports these names from ``nxmndr.server.managers``; ``ModelManager``
+there adds the default model loader. This module imports only the standard library.
 
 Rules the implementation keeps:
 
@@ -31,7 +29,7 @@ Rules the implementation keeps:
 Sessions come only from ``open_session``. ``acquire_execution(session_id=...)``
 with an ID that was never opened raises ``UnknownSessionError`` and creates
 nothing, so the server rejects a ``StreamPredict`` that names an unknown session
-(plan item 14; contracts decision 8) instead of fabricating a session.
+instead of fabricating a session.
 """
 
 from __future__ import annotations

@@ -117,7 +117,7 @@ GRPC_MAX_MESSAGE_LENGTH = 128 * 1024 * 1024  # 128MB ceiling for large tensor pa
 # stuck call fails its own tile, not the stream. A call that times out still runs to
 # its end in the worker.
 RPC_INFER_TIMEOUT_SECONDS = 60.0
-DEFAULT_MODEL_CACHE_CAPACITY = 10  # plan: LRU model cache capacity (NXMNDR_MODEL_CACHE_CAPACITY)
+DEFAULT_MODEL_CACHE_CAPACITY = 10  # LRU model cache slots; NXMNDR_MODEL_CACHE_CAPACITY overrides
 SERVER_STOP_GRACE_SECONDS = 5.0  # grace for in-flight RPCs, then cache shutdown drains leases
 # Bind address of the gRPC server and the HTTP proxy unless --host names another:
 # this machine only. Every gRPC client is trusted (it can make the server run code

@@ -438,7 +438,7 @@ def test_close_unknown_session_returns_false_and_checks_reason():
 
 
 def test_stream_without_open_session_is_rejected_not_fabricated():
-    """Plan item 14: StreamPredict naming a never-opened session gets no lease."""
+    """StreamPredict naming a never-opened session gets no lease; none is fabricated."""
 
     manager, _, _ = make_manager()
     manager.load(spec(), key=key("A"))

@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
 
-"""Model input contract (server.py docstring, "Model input"; wave2-chunk-3.md [6](2)).
+"""Model input contract (the "Model input" section of the server.py module docstring).
 
 The model receives each chip exactly as sent, and ModelSpec.preprocessing and
 postprocessing are refused instead of silently ignored.

@@ -4,10 +4,10 @@
 """StreamPredict v1 contract over a real loopback gRPC transport.
 
 Model doubles enter through the ModelManager loader hook; everything above them
-(server, shared dispatcher, client) is production code. Covers plan chunk 1 items:
-per-tile options (1), cancellation of a blocked stream (2), fragmented tiles and
-the client window (3), dtype overrides (7), unknown sessions (14), per-tile vs
-per-stream failures (18), session binding, and lease/pinning behavior.
+(server, shared dispatcher, client) is production code. Covers per-tile options,
+cancellation of a blocked stream, fragmented tiles and the client window, dtype
+overrides, unknown sessions, per-tile vs per-stream failures, session binding, and
+lease/pinning behavior.
 """
 
 from __future__ import annotations
@@ -104,7 +104,7 @@ def _consume(call, sink, errors):
         errors.append(exc)
 
 
-# --------------------------------------------------------------- options (item 1)
+# --------------------------------------------------------------- options
 
 
 def test_mixed_per_tile_options_apply_to_their_tile_only(tmp_path, loader):
@@ -208,7 +208,7 @@ def test_reserved_and_unprefixed_context_keys_are_not_options(tmp_path, loader):
             assert resp.metadata.get("error") is None
 
 
-# ---------------------------------------------------------- cancellation (item 2)
+# ---------------------------------------------------------- cancellation
 
 
 def test_cancel_before_first_response_releases_blocked_caller(tmp_path, loader, gated):
@@ -284,7 +284,7 @@ def test_cancel_session_stops_stream_before_next_dispatch(tmp_path, loader, gate
         assert wait_until(lambda: h.manager.pin_count(mid) == 0)
 
 
-# ----------------------------------------------------- limits (items 3 and 18)
+# ----------------------------------------------------- limits
 
 
 def test_fragmented_tiles_are_not_rejected_by_chunk_count(tmp_path, loader):
@@ -437,7 +437,7 @@ def test_malformed_payload_and_duplicate_tile_are_tile_scope(tmp_path, loader):
         assert all(r.metadata.get("error_scope") in (None, "tile") for r in resps)
 
 
-# ------------------------------------------------------------------ dtype (item 7)
+# ------------------------------------------------------------------ dtype
 
 
 def test_dtype_override_casts_bytes_or_is_rejected(tmp_path, loader):
@@ -460,7 +460,7 @@ def test_dtype_override_casts_bytes_or_is_rejected(tmp_path, loader):
             )
 
 
-# ------------------------------------------------ sessions and leases (item 14)
+# ------------------------------------------------ sessions and leases
 
 
 def test_stream_with_unknown_session_is_rejected_not_fabricated(tmp_path, loader):

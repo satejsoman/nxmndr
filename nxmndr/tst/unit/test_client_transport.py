@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
 
-"""The endpoint's scheme selects the client's transport (wave-5 review W5).
+"""The endpoint's scheme selects the client's transport.
 
 Intercepted channel factories, no network: ``https://`` opens a secure channel
 with the default root certificates (or the given credentials) on the host's port,

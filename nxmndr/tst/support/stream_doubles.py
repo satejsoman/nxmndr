@@ -202,7 +202,10 @@ class FakeHFSamModel:
 
 
 class NamedLikeSamModel(SegLogitsModel):
-    """A non-SAM model whose name, path and ID all contain 'sam' (plan item 15)."""
+    """A non-SAM model whose name, path and ID all contain 'sam'.
+
+    SAM routing must come from the loaded model's capability, never from its name.
+    """
 
     def __init__(self):
         super().__init__()

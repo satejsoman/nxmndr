@@ -10,11 +10,11 @@ spawned worker, joins its RPC group and calls ``_rpc_load``/``_rpc_infer``/
 ``_rpc_unload`` with the function objects. The model is ``AddConst`` (input plus
 the scalar in its weights file), so each model's output names the model.
 
-Covers the wave-5 review: W2 (the first OpenSession starts the worker; startup
-failures are bounded and clean up the child), W3 (unary Predict and StreamPredict
-run through the real RPC invocation) and W4 (two models loaded at once route by
-identity under concurrent pinned sessions; eviction and unload free the model in
-the worker; a reload gets a new identity).
+Covers worker startup (the first OpenSession starts the worker; startup failures
+are bounded and clean up the child), unary Predict and StreamPredict through the real
+RPC invocation, and two models loaded at once (they route by identity under
+concurrent pinned sessions; eviction and unload free the model in the worker; a
+reload gets a new identity).
 
 The external-worker tests start the server with ``NXMNDR_RPC_EXTERNAL_WORKER=1`` and
 the worker as a separate ``python -m nxmndr.server.rpc_worker`` process. Two put both

@@ -1,8 +1,9 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
 
-"""nxmndr.server.proxy_routes: route constants, identity and upstream shapes
-(wave2-chunk-5.md [5]). Standard library only, so a client imports it cheaply."""
+"""nxmndr.server.proxy_routes: route constants, identity and upstream shapes.
+
+Standard library only, so a client imports it cheaply."""
 
 from __future__ import annotations
 

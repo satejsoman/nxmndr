@@ -151,7 +151,7 @@ def export(target_dir: str | Path | None = None, seed: int | None = None):
 
     ``seed``: when given, ``torch.manual_seed(seed)`` runs before the model is
     constructed, so the weights (and the export input) are the same on every run
-    and lane (plan r2 item 22). tst/conftest.py pins it.
+    and every machine. tst/conftest.py pins it.
     """
     base_dir = Path(target_dir) if target_dir is not None else cwd
     base_dir.mkdir(parents=True, exist_ok=True)

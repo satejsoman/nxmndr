@@ -4,10 +4,10 @@
 """RpcWorkerManager and the PyTorch record, without a real RPC group.
 
 - Every ``rpc_sync`` call passes the worker function object, never its name
-  (wave-5 review W3: PyTorch rejects a string with "function should be callable").
-- A failed ``_rpc_stop`` is logged, then the child is terminated (W3).
+  (PyTorch rejects a string with "function should be callable").
+- A failed ``_rpc_stop`` is logged, then the child is terminated.
 - A generic PyTorch record owns its worker-side model as an aux resource: disposing
-  the record frees that model exactly once (W4).
+  the record frees that model exactly once.
 - A catalog model the worker cannot build is returned as a refusal, raised in the
   server as the ``CatalogError`` with its one-line message, and answered with
   INVALID_ARGUMENT (FAILED_PRECONDITION for a missing family package), never INTERNAL.

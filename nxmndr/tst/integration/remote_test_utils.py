@@ -13,7 +13,8 @@ from nxmndr.inference import inference_pb2_grpc
 
 DEFAULT_CONNECT_TIMEOUT = 30
 # RemoteTestServer reuses the server named by NXMNDR_REMOTE_HOST/PORT only when this
-# is "1"; otherwise it always starts its own loopback server (plan r2 item 23).
+# is "1"; otherwise it always starts its own loopback server, so variables left in the
+# shell cannot point the tests at another server.
 REMOTE_OPT_IN_ENV = "NXMNDR_TEST_USE_REMOTE_SERVER"
 
 logger = logging.getLogger(__name__)

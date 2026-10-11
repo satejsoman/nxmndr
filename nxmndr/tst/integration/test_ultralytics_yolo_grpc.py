@@ -6,9 +6,7 @@
 The server is ``create_server`` with its own InferenceService and ModelManager (default
 loader ``build_model_record``, capacity from ``NXMNDR_MODEL_CACHE_CAPACITY``). Only
 ``ultralytics.YOLO`` is replaced, by ``tst.support.ultralytics_double``, so the
-adapter, the registry loader, the model cache and its leases are all under test
-(plan chunk 7 reuse table: "Model doubles should enter through the real
-ModelManager/load path").
+adapter, the registry loader, the model cache and its leases are all under test.
 """
 
 from __future__ import annotations

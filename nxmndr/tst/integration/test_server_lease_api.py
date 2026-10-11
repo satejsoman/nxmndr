@@ -3,11 +3,11 @@
 
 """server.py on the real ModelManager, over a real loopback gRPC transport.
 
-Chunk 1a's requests to chunk 1 that need the server: the model token reaches the
-SAM variant loader through ModelRecord.auth_token and never the record metadata or
-the registry file (plan bug 21); the Hugging Face revision is normalized like the
-cache key; a session closed between the open check and the tile dispatch fails the
-stream instead of raising out of touch_session.
+Cases that need the server: the model token reaches the SAM variant loader through
+ModelRecord.auth_token and never the record metadata or the registry file (the
+registry is written to disk from that metadata); the Hugging Face revision is
+normalized like the cache key; a session closed between the open check and the tile
+dispatch fails the stream instead of raising out of touch_session.
 """
 
 from __future__ import annotations

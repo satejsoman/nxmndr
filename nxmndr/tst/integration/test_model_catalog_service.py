@@ -143,7 +143,7 @@ def _softmax(logits):
     return exp / exp.sum()
 
 
-# ------------------------------------------------------------ (a), (e): resnet18
+# ------------------------------------------------------------ resnet18
 
 
 @pytest.fixture(scope="module")
@@ -226,7 +226,7 @@ def test_a_class_vector_with_return_confidence(server, resnet18):
         _unload(client, model_id)
 
 
-# ------------------------------------------------------------------- (b): unet
+# ------------------------------------------------------------------- unet
 
 
 @needs_torchgeo
@@ -254,7 +254,7 @@ def test_torchgeo_unet_streams_label_maps(server, tmp_path):
         assert client.close_session("s-unet").status == "closed"
 
 
-# ------------------------------------------------------------ (c): Capabilities
+# ------------------------------------------------------------ Capabilities
 
 
 def test_capabilities_list_the_catalog_of_the_server_environment(server):
@@ -331,7 +331,7 @@ def test_a_fixed_size_class_runs_at_its_size_and_refuses_other_chips(server, tmp
         _unload(client, model_id)
 
 
-# ------------------------------------------------------------ (d): load errors
+# ------------------------------------------------------------ load errors
 
 
 def _wrong_classes_message(path):

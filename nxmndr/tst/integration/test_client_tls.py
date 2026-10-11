@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
 
-"""The canonical client over a real local TLS server, and over plaintext loopback (W5).
+"""The canonical client over a real local TLS server, and over plaintext loopback.
 
 A throwaway CA and leaf certificates are generated in the test with
 ``cryptography`` (a requirement of azure-identity in the backend's ``server``

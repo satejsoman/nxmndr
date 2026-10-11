@@ -12,8 +12,9 @@ given. The server never assigns instance IDs: the host gives each instance a
 job-unique ID. Within one chip the order is the model's order after group-mask
 removal.
 
-Ported from the plugin's former in-QGIS path (nxmndr-qgis ``inference/backends.py``,
-``_predict_tile_yolo``, rebuild baseline ``b4b2abb``):
+Ported from the YOLO path that the QGIS plugin ran inside QGIS before inference moved
+to a separate worker process (nxmndr-qgis ``src/inference/backends.py``,
+``_predict_tile_yolo``):
 
 - Chip conversion (``preprocess``): a 2-D chip is one band; one band is repeated to
   three; bands after the third are dropped; two bands are refused. Data that is not
@@ -22,7 +23,7 @@ Ported from the plugin's former in-QGIS path (nxmndr-qgis ``inference/backends.p
   passed in the order received.
 - ``YOLO.predict(chip, verbose=False, retina_masks=True, conf=..., iou=..., max_det=...)``.
   A YOLO build that rejects ``retina_masks`` (``TypeError``) is called again without it.
-  ``conf``, ``iou`` and ``max_det`` are per-request options (the pre-rebuild plugin read
+  ``conf``, ``iou`` and ``max_det`` are per-request options (the in-QGIS path read
   them from ``model_info``). Their defaults are those of the DelineateAnything run in
   the Anaximander paper's case study: a detection confidence threshold of 0.1, and
   Ultralytics' own predict defaults for the other two, which that run left unchanged

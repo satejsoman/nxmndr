@@ -222,7 +222,7 @@ def test_misaligned_tile_ids_are_an_explicit_error(stubbed):
         list(client.stream_predict(model_id="m", samples=[np.zeros(2)] * 2, tile_options=[{}]))
 
 
-# ------------------------------------------ one tile iterable (wave2-chunk-3.md [6](3))
+# ------------------------------------------ one tile iterable
 
 
 def _stream_both_ways(client, stub, chips, ids, opts):
@@ -268,7 +268,7 @@ def test_tiles_cannot_be_mixed_with_the_aligned_iterables(stubbed):
         list(client.stream_predict(model_id="m", tiles=[("a", np.zeros(2), None), ("b", np.zeros(2))]))
 
 
-# ------------------------------------------ LoadModel effective metadata ([6](4))
+# ------------------------------------------ LoadModel effective metadata
 
 
 class _LoadStub:

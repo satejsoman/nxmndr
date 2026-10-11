@@ -44,10 +44,10 @@ does not match is a :class:`CatalogError` that names the class, its arguments, t
 first differing entry and the count of all. Every ``CatalogError`` message is one line.
 
 Input and output: the built model is a :class:`CatalogModel`. It takes the chip as
-the server sends it (``[H, W, C]`` float32, no scaling or normalization; CONTRACTS.md
-2.4) as one image ``[1, C, H, W]`` and returns one tensor (the ``out`` entry of a
-torchvision segmentation model). ``nxmndr.server.dispatch.catalog_output`` turns that
-tensor into a result family.
+the server sends it (``[H, W, C]`` float32, no scaling or normalization; see "Model
+input" in the ``nxmndr.server.server`` module docstring) as one image ``[1, C, H, W]``
+and returns one tensor (the ``out`` entry of a torchvision segmentation model).
+``nxmndr.server.dispatch.catalog_output`` turns that tensor into a result family.
 
 Fixed input sizes (:func:`input_size`, :func:`list_input_sizes`; the server's
 Capabilities entry ``pytorch_model_input_sizes``): some served models take one square

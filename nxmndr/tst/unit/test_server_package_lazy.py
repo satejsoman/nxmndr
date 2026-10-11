@@ -3,7 +3,7 @@
 
 """Importing nxmndr.server or one of its submodules does not import server.py.
 
-Wave-1 chunk 1 request [3]: an eager package __init__ made every importer of
+An eager package __init__ made every importer of
 nxmndr.server.managers (such as the spawned PyTorch RPC worker) load the whole
 server stack.
 """

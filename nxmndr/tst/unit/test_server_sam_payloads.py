@@ -3,9 +3,9 @@
 
 """Unary Predict payload handling, called in-process.
 
-Rewritten for the rebuild: SAM routing comes from the loaded model's capability
-(never its name), prompts use the flat v1 encoding (points ``[[x, y], ...]`` with
-matching 0/1 labels, one box), and malformed prompts are INVALID_ARGUMENT.
+SAM routing comes from the loaded model's capability (never its name), prompts use
+the flat v1 encoding (points ``[[x, y], ...]`` with matching 0/1 labels, one box),
+and malformed prompts are INVALID_ARGUMENT.
 """
 
 import json

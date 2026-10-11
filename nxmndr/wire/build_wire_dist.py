@@ -23,10 +23,11 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 SRC = HERE.parent / "src"
 
-# The host import surface frozen in the rebuild contracts (HOST_WIRE_MODULES),
-# plus the generated stub types and the schema they were generated from, plus the
-# Hugging Face Hub search helpers and the model-file constants they use
-# (wave2-chunk-4.md [7]: the plugin can import one search implementation).
+# The modules the QGIS plugin may import on its host side (HOST_WIRE_MODULES in
+# tst/unit/test_wire_imports.py, which imports them with the ML runtime blocked), plus
+# the generated stub types and the schema they were generated from. The host list
+# includes the Hugging Face Hub search helpers and the model-file constants they use,
+# so the plugin and the server can share one search implementation.
 WIRE_FILES = (
     "nxmndr/__init__.py",
     "nxmndr/client.py",

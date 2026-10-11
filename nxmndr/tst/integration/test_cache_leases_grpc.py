@@ -3,11 +3,11 @@
 
 """Model cache leases through the real server, client and gRPC transport.
 
-The two real-gRPC cases of the plan's chunk 1a Done list: with a tiny capacity,
-a model pinned by an open session stays resident and usable while other models
-load and evict each other, and becomes evictable after its last lease ends; and a
-prediction still running when its session closes keeps its record alive until the
-call returns, after which the record is disposed exactly once.
+Two cases over the real gRPC transport: with a tiny capacity, a model pinned by an
+open session stays resident and usable while other models load and evict each
+other, and becomes evictable after its last lease ends; and a prediction still
+running when its session closes keeps its record alive until the call returns,
+after which the record is disposed exactly once.
 
 Also over gRPC: two clients that load an equal spec share one model ID, and one
 client's UnloadModel or overwrite does not take the model from the other; and a

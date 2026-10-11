@@ -5,7 +5,8 @@
 
 This module extracts logic from server/server.py to improve separation of concerns.
 The bounded model cache and its session/execution leases live in ``model_cache``;
-the lease API names stay importable from here (rebuild contract, chunk 1a).
+this module re-exports the lease API names because ``server.py`` uses them as
+``managers.<name>``.
 """
 
 from __future__ import annotations

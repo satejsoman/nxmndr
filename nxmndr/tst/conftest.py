@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 # Seed of the exported example model, so its weights are the same on every run
-# and lane (plan r2 item 22).
+# and every machine.
 EXAMPLE_MODEL_SEED = 0
 
 
@@ -36,6 +36,6 @@ def _isolated_nxmndr_cache(tmp_path, monkeypatch):
     """Keep every server's registry file and model artifacts in the test's tmp_path.
 
     Without this, InferenceService writes ~/.cache/nxmndr/model_registry.json and
-    downloads into ~/.cache/nxmndr/models (wave-1 chunk 1 request [4b]).
+    downloads into ~/.cache/nxmndr/models, the developer's real cache.
     """
     monkeypatch.setenv("NXMNDR_CACHE_DIR", str(tmp_path / "nxmndr-cache"))
