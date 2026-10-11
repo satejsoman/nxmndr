@@ -647,6 +647,9 @@ class ModelCache:
         """
 
         victims: List[ModelRecord] = []
+        freed: List[ModelRecord] = []
+        handoff: Optional[Tuple[str, bool, bool]] = None
+        refusal: Optional[ModelCacheError] = None
         with self._cond:
             while True:
                 self._check_running()
@@ -688,15 +691,24 @@ class ModelCache:
                     entry = self._records[pending.model_id]
                     entry.handoffs -= 1
                     self._records.move_to_end(pending.model_id)
-                    if session_id is not None:
-                        existing = self._session_precheck(session_id, key=key)
-                        if existing is not None:
-                            return existing.model_id, True, True
-                        self._bind_session(session_id, entry)
-                    else:
+                    if session_id is None:
                         entry.loads += 1
                         entry.unloaded = False
-                    return pending.model_id, False, False
+                        return pending.model_id, False, False
+                    try:
+                        existing = self._session_precheck(session_id, key=key)
+                    except ModelCacheError as exc:
+                        refusal = exc
+                    else:
+                        if existing is None:
+                            self._bind_session(session_id, entry)
+                            return pending.model_id, False, False
+                        handoff = (existing.model_id, True, True)
+                    # This waiter leaves without pinning the record. Its handoff kept an
+                    # unload that came in the meantime from freeing the record, so free
+                    # it now (outside the lock), as the release of a last pin would.
+                    self._take_unloaded(entry, freed)
+                    break
                 if len(self._records) + len(self._loading) >= self._capacity:
                     victim = self._lru_evictable()
                     if victim is None:
@@ -715,8 +727,13 @@ class ModelCache:
                 self._loading[key] = pending
                 break
 
+        self._dispose_unloaded(freed)
         for victim_record in victims:
             self._dispose_record(victim_record)
+        if refusal is not None:
+            raise refusal
+        if handoff is not None:
+            return handoff
 
         clean, token = _split_secrets(metadata)
         clean["model_id"] = model_id

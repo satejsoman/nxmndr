@@ -20,6 +20,7 @@ from nxmndr.server.managers import (
     CacheShutdownError,
     ModelLoadError,
     SessionClosedError,
+    SessionConflictError,
 )
 from tst.unit.model_cache_test_utils import (
     WAIT_S,
@@ -137,6 +138,61 @@ def test_concurrent_retry_of_one_session_id_pins_once():
     assert (open_lease.reused, retry_lease.reused) == (False, True)
     assert open_lease.model_id == retry_lease.model_id
     assert manager.pin_count(open_lease.model_id) == 1 and len(loader.calls) == 1
+
+
+class _HoldOneWaiter(threading.Condition):
+    """A cache condition variable that holds one named thread once, after it wakes.
+
+    The held thread has released the lock, so other threads change the cache before
+    it resumes: the order that a waiter slow to get the lock back meets.
+    """
+
+    def __init__(self, thread_name):
+        super().__init__(threading.Lock())
+        self.thread_name = thread_name
+        self.held = threading.Event()
+        self.resume = threading.Event()
+
+    def wait(self, timeout=None):
+        woke = super().wait(timeout)
+        if threading.current_thread().name == self.thread_name and not self.held.is_set():
+            self.held.set()
+            self.release()
+            try:
+                self.resume.wait(WAIT_S)
+            finally:
+                self.acquire()
+        return woke
+
+
+@pytest.mark.parametrize("ending", ["closed", "conflict"])
+def test_a_session_waiter_that_does_not_bind_frees_a_record_unloaded_during_its_handoff(ending):
+    manager, loader, _ = make_manager()
+    manager._cond = hold = _HoldOneWaiter("waiter")
+    loader.gate = threading.Event()
+    runner = _Runner()
+    runner.start("first", lambda: manager.load(spec(), key=key("A")))
+    assert loader.entered.wait(WAIT_S)
+    runner.start("waiter", lambda: manager.open_session("s1", model_spec=spec(), key=key("A")))
+    wait_until(lambda: pending_waiters(manager, key("A")) == 1, "the session open to wait")
+    loader.gate.set()
+    wait_until(lambda: "first" in runner.results and hold.held.is_set(), "the load to finish")
+    model_id = runner.results["first"][1].model_id
+    # The handoff the waiter has not picked up keeps the record from being freed.
+    assert manager.unload(model_id) == "pending"
+    if ending == "closed":  # another open of s1 binds the record and closes again
+        manager.open_session("s1", model_id=model_id)
+        assert manager.close_session("s1", reason="closed")
+    else:  # another open of s1 binds another model
+        manager.open_session("s1", model_spec=spec(), key=key("B"))
+    hold.resume.set()
+    runner.join()
+    kind, exc = runner.results["waiter"]
+    expected = SessionClosedError if ending == "closed" else SessionConflictError
+    assert kind == "error" and isinstance(exc, expected)
+    [record] = [r for r in loader.records if r.model_id == model_id]
+    assert manager.get(model_id) is None and record.dispose_calls == 1
+    assert _violations(loader) == []
 
 
 def test_failed_load_rolls_back_for_the_loader_and_every_waiter():
