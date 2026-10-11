@@ -136,6 +136,8 @@ For this reason, the servers listen on `127.0.0.1` (this machine only) by defaul
 ssh -N -L 50051:127.0.0.1:50051 user@server-host   # then connect to 127.0.0.1:50051
 ```
 
+Loopback and the tunnel keep out other hosts, not other accounts on the server host: every local user of that host can connect to a loopback port. On a host shared with other users, run the server only if you trust every account on it; otherwise run it on a host where only you and users you trust can log in.
+
 To listen on the network, give the address explicitly. Do this only on a network where you trust every host that can reach the port:
 
 ```bash
