@@ -88,7 +88,7 @@ from ..models.sam import resolve_sam_capability
 from . import dispatch
 from . import managers
 from . import rpc_worker
-from .azure_openai_proxy import AzureOpenAIProxy, setup_azure_proxy_routes
+from .azure_openai_proxy import AzureOpenAIProxy, http_bind_host, setup_azure_proxy_routes
 from .managers import RpcWorkerManager
 
 # The model cache and session/execution lease API (ModelManager, cache_key_from_spec
@@ -1617,6 +1617,17 @@ class InferenceService(inference_pb2_grpc.InferenceServiceServicer):
             self.rpc_manager.shutdown()
 
 
+def grpc_bind_address(host: str, port: int) -> str:
+    """``host:port`` as grpcio binds it: an IPv6 address in brackets.
+
+    One ``--host`` feeds the gRPC server and the HTTP server, and aiohttp refuses the
+    brackets that grpcio needs, so either spelling (``::`` or ``[::]``) is accepted.
+    """
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    return f"{host}:{port}"
+
+
 def create_server(
     host: str = DEFAULT_BIND_HOST,
     port: int = 0,
@@ -1627,7 +1638,8 @@ def create_server(
     """Build, bind and start the gRPC inference server without blocking.
 
     Args:
-            host: address to bind; loopback by default. An IPv6 address needs brackets.
+            host: address to bind; loopback by default. An IPv6 address may be given
+                with or without brackets.
             port: TCP port; 0 picks a free ephemeral port.
             model_cache_dir, max_cores: as for ``InferenceService``.
 
@@ -1655,7 +1667,7 @@ def create_server(
             options=GRPC_OPTIONS,
         )
         inference_pb2_grpc.add_InferenceServiceServicer_to_server(service, server)
-        bound_port = server.add_insecure_port(f"{host}:{port}")
+        bound_port = server.add_insecure_port(grpc_bind_address(host, port))
     except BaseException:
         service.shutdown(grace=0)
         raise
@@ -1843,7 +1855,7 @@ async def run_unified_server(
     runner = web.AppRunner(app)
     await runner.setup()
 
-    site = web.TCPSite(runner, host, port)
+    site = web.TCPSite(runner, http_bind_host(host), port)
     await site.start()
 
     logger.info("Unified server started successfully")
@@ -1879,7 +1891,8 @@ def main():
         default=DEFAULT_BIND_HOST,
         help="Address the gRPC server, and with --azure-proxy the HTTP proxy, bind to "
         f"(default: {DEFAULT_BIND_HOST}, this machine only). 0.0.0.0 accepts other machines: "
-        "every client can then make the server run code it supplies (README, Security).",
+        "every client can then make the server run code it supplies (README, Security). "
+        "An IPv6 address may be given with or without brackets (:: or [::]).",
     )
     parser.add_argument(
         "--azure-proxy",

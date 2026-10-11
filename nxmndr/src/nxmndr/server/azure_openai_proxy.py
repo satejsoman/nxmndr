@@ -774,6 +774,13 @@ def create_app() -> web.Application:
     return app
 
 
+def http_bind_host(host: str) -> str:
+    """``host`` as aiohttp binds it: without the brackets of an IPv6 address."""
+    if host.startswith("[") and host.endswith("]"):
+        return host[1:-1]
+    return host
+
+
 async def run_server(host: str = "127.0.0.1", port: int = 8080):
     """
     Run the Azure OpenAI proxy server.
@@ -790,7 +797,7 @@ async def run_server(host: str = "127.0.0.1", port: int = 8080):
     runner = web.AppRunner(app)
     await runner.setup()
 
-    site = web.TCPSite(runner, host, port)
+    site = web.TCPSite(runner, http_bind_host(host), port)
     await site.start()
 
     logger.info("Server started successfully")

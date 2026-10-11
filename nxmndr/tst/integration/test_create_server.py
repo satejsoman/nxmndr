@@ -5,12 +5,15 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 import socket
 import threading
 
 import grpc
 import pytest
+from aiohttp import web
 
 from nxmndr.inference import inference_pb2, inference_pb2_grpc
 from nxmndr.server import managers, server
@@ -28,6 +31,23 @@ def _accepts(host, port):
         except OSError:
             return False
         return True
+
+
+def _ipv6_loopback_available():
+    if not socket.has_ipv6:
+        return False
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as sock:
+            sock.bind(("::1", 0))
+    except OSError:
+        return False
+    return True
+
+
+def _free_ipv6_port():
+    with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as sock:
+        sock.bind(("::", 0))
+        return sock.getsockname()[1]
 
 
 class _SpyServer:
@@ -100,6 +120,43 @@ def test_create_server_raises_when_the_port_is_taken(tmp_path):
         taken.listen()
         with pytest.raises(RuntimeError):
             server.create_server(port=taken.getsockname()[1], model_cache_dir=tmp_path / "c")
+
+
+@pytest.mark.skipif(not _ipv6_loopback_available(), reason="no IPv6 loopback on this host")
+@pytest.mark.parametrize("host", ["::", "[::]"])
+def test_one_ipv6_host_binds_both_the_grpc_server_and_the_http_server(host, tmp_path, monkeypatch):
+    # nxmndr-server passes one --host to both servers. grpcio needs an IPv6 address
+    # in brackets and aiohttp refuses the brackets, so either spelling must reach both.
+    srv, port, service = server.create_server(
+        host, 0, model_cache_dir=tmp_path / "cache", max_cores=1
+    )
+    try:
+        assert _accepts("::1", port)
+    finally:
+        server.stop_server(srv, service, grace=0)
+
+    async def bare_app(**_kwargs):
+        return web.Application()
+
+    monkeypatch.setattr(server, "create_unified_web_app", bare_app)
+    http_port = _free_ipv6_port()
+
+    async def http_server_accepts():
+        task = asyncio.create_task(server.run_unified_server(host, http_port))
+        try:
+            for _ in range(100):
+                if task.done():
+                    task.result()  # raises the bind error
+                if _accepts("::1", http_port):
+                    return True
+                await asyncio.sleep(0.05)
+            return False
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    assert asyncio.run(http_server_accepts())
 
 
 def test_control_calls_are_served_while_streams_outnumber_max_cores(tmp_path, monkeypatch):
