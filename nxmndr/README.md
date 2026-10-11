@@ -136,7 +136,7 @@ For this reason, the servers listen on `127.0.0.1` (this machine only) by defaul
 ssh -N -L 50051:127.0.0.1:50051 user@server-host   # then connect to 127.0.0.1:50051
 ```
 
-Loopback and the tunnel keep out other hosts, not other accounts on the server host: every local user of that host can connect to a loopback port. On a host shared with other users, run the server only if you trust every account on it; otherwise run it on a host where only you and users you trust can log in.
+Loopback and the tunnel keep out other hosts, not other accounts on the server host: every local user of that host can connect to a loopback port. The same holds on the client machine: `ssh -L` opens the forwarded port on its loopback, so every local user of the client machine can use the tunnel while it is open. On a host shared with other users, run the server or the tunnel only if you trust every account on it; otherwise run it on a host where only you and users you trust can log in.
 
 To listen on the network, give the address explicitly. Do this only on a network where you trust every host that can reach the port:
 
@@ -144,7 +144,7 @@ To listen on the network, give the address explicitly. Do this only on a network
 nxmndr-server --host 0.0.0.0   # gRPC, and with --azure-proxy the HTTP proxy, on every interface
 ```
 
-`python -m nxmndr server`, `python -m nxmndr grpc` and `python -m nxmndr.server.azure_openai_proxy` take the same `--host` option. The gRPC server uses plaintext; for TLS, put a TLS endpoint in front of it. The PyTorch RPC worker has the same trust requirement (External Worker Mode, below).
+`python -m nxmndr server`, `python -m nxmndr grpc` and `python -m nxmndr.server.azure_openai_proxy` take the same `--host` option. With `--host ::` (or `[::]`) the gRPC server listens on IPv4 and IPv6, but the HTTP proxy listens on IPv6 only, so IPv4 clients reach the gRPC server and not the proxy. The gRPC server uses plaintext; for TLS, put a TLS endpoint in front of it. The PyTorch RPC worker has the same trust requirement (External Worker Mode, below).
 
 ## Torch RPC (Experimental)
 
