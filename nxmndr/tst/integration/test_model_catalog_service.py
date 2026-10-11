@@ -62,13 +62,27 @@ CATALOG_KEYS = ("model_family", "model_class", "num_classes", "in_channels")
 
 @pytest.fixture(scope="module")
 def server(tmp_path_factory):
-    proc = ServiceProcess(tmp_path_factory.mktemp("catalog-server"), "--capacity", "2")
+    # A module-scoped fixture is set up before the function-scoped autouse
+    # _isolated_nxmndr_cache (tst/conftest.py), so the process gets its own cache
+    # directory here; else it writes the developer's ~/.cache/nxmndr.
+    cache_dir = tmp_path_factory.mktemp("catalog-cache")
+    proc = ServiceProcess(
+        tmp_path_factory.mktemp("catalog-server"),
+        "--capacity",
+        "2",
+        env={"NXMNDR_CACHE_DIR": str(cache_dir)},
+    )
+    proc.cache_dir = cache_dir
     yield proc
     try:
         stopped = proc.stop()
         assert stopped["children"] == [], stopped
     finally:
         proc.close()
+
+
+def test_the_server_process_keeps_its_cache_in_the_test_directory(server):
+    assert (server.cache_dir / "models").is_dir()
 
 
 def _spec(path, model_class, task=inference_pb2.TASK_TYPE_UNSPECIFIED, **metadata):
